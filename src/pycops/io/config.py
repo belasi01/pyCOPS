@@ -26,8 +26,14 @@ _PER_INSTRUMENT_KEYS = (
     "linear.fit.max.delta.depth.optics",
 )
 
+def _to_float(value: str) -> float:
+    # "NA" is R's missing-value sentinel, e.g. for a linear-fit threshold that
+    # doesn't apply to the surface (Ed0) instrument.
+    return float("nan") if value.strip().upper() == "NA" else float(value)
+
+
 _CASTERS = {
-    "numeric": lambda values: [float(v) for v in values],
+    "numeric": lambda values: [_to_float(v) for v in values],
     "logical": lambda values: [v.strip().upper() == "TRUE" for v in values],
     "character": lambda values: [v.strip() for v in values],
 }

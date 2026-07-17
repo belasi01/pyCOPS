@@ -27,6 +27,21 @@ def test_read_init_cops_per_instrument_vectors(tmp_path):
     assert params["delta.capteur.optics"] == {"Ed0": 0.0, "EdZ": -0.05, "LuZ": 0.238, "EuZ": 0.238}
 
 
+def test_read_init_cops_na_sentinel_in_numeric_vector(tmp_path):
+    # Real deployments use R's "NA" sentinel for a threshold that doesn't apply
+    # to the surface (Ed0) instrument, e.g. linear.fit.Rsquared.threshold.optics.
+    content = INIT_COPS_DAT + "linear.fit.Rsquared.threshold.optics;numeric; NA, 0.5, 0.6,0.6\n"
+    path = tmp_path / "init.cops.dat"
+    path.write_text(content)
+
+    params = read_init_cops(path)
+
+    thresholds = params["linear.fit.Rsquared.threshold.optics"]
+    assert thresholds["Ed0"] != thresholds["Ed0"]  # NaN
+    assert thresholds["EdZ"] == 0.5
+    assert thresholds["LuZ"] == 0.6
+
+
 def test_read_info_cops(tmp_path):
     path = tmp_path / "info.cops.dat"
     path.write_text(INFO_COPS_DAT)
