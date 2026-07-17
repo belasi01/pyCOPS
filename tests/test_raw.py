@@ -97,3 +97,20 @@ def test_read_cast_attrs(tmp_path):
     assert ds.attrs["is_urc_format"] is True
     assert ds.attrs["instruments"] == ["Ed0", "EdZ", "LuZ", "EuZ"]
     assert ds.attrs["gps_file"].endswith("GPS_190817.tsv")
+
+
+def test_read_cast_omits_instrument_absent_from_file(tmp_path):
+    # Many real deployments only carry Ed0/EdZ/LuZ, with no EuZ sensor at all.
+    header = "DateTime,Ed0320 (uW/(cm2 nm)),LuZ320 (uW/(sr cm2 nm)),LuZTemp (degC)"
+    rows = [
+        "08/17/2019 22:08:59,2.25,4.22e-05,9.39",
+        "08/17/2019 22:09:00,2.26,4.23e-05,9.40",
+    ]
+    path = tmp_path / "WISE_CAST_001_190817_220856_URC.csv"
+    path.write_text("\n".join([header, *rows]) + "\n")
+
+    ds = read_cast(path, number_of_fields_before_date=3)
+
+    assert "EuZ" not in ds.data_vars
+    assert "wavelength_EuZ" not in ds.dims
+    assert ds.attrs["instruments"] == ["Ed0", "LuZ"]

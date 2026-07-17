@@ -100,6 +100,9 @@ def _split_instruments(
 
     for instr in instruments:
         instr_cols = [c for c in df.columns if c.startswith(instr)]
+        if not instr_cols:
+            # Instrument not present on this deployment (e.g. no EuZ sensor).
+            continue
         consumed.extend(instr_cols)
         suffixes = [c[len(instr) :].lstrip(":") for c in instr_cols]
 
