@@ -36,13 +36,18 @@ DATA_ROWS = (
 )
 
 
-def write_urc_cast(tmp_path, with_header_block=False):
+def _write_cast_file(tmp_path, filename, with_header_block=False):
     lines = list(DATA_ROWS)
     content = "\n".join([HEADER_ROW, *lines]) + "\n"
     if with_header_block:
         content = "Start of Header\ninstrument config dump\nEnd of Header\n" + content
-    path = tmp_path / "WISE_CAST_001_190817_220856_URC.csv"
+    path = tmp_path / filename
     path.write_text(content)
+    return path
+
+
+def write_urc_cast(tmp_path, with_header_block=False):
+    path = _write_cast_file(tmp_path, "WISE_CAST_001_190817_220856_URC.csv", with_header_block)
     (tmp_path / "GPS_190817.tsv").write_text("dummy gps content\n")
     return path
 
@@ -81,3 +86,27 @@ WISE_CAST_001_190817_220856_URC.csv;-68.11626;49.24872;0;x;x;x;x;;;;
 WISE_CAST_002_190817_221224_URC.csv;-68.11626;49.24872;NA;x;x;x;x;;;;
 WISE_CAST_003_190817_221636_URC.csv;-68.11626;49.24872;0.2;0,90;0.1,0.05,0.1,0;10,10,5,5;40,60,80,80;dark_001.csv
 """
+
+# Only covers casts 001 and 002 on purpose, to exercise the "missing row
+# defaults to kept/normal" fallback in discover_deployment() for cast 003.
+SELECT_COPS_DAT = """\
+WISE_CAST_001_190817_220856_URC.csv;1;Rrs.0p;NA
+WISE_CAST_002_190817_221224_URC.csv;0;Rrs.0p.linear;NA
+"""
+
+
+def write_deployment(tmp_path, with_select=True):
+    """Write a small synthetic COPS deployment folder: init/info/select + 3 casts."""
+    (tmp_path / "init.cops.dat").write_text(INIT_COPS_DAT)
+    (tmp_path / "info.cops.dat").write_text(INFO_COPS_DAT)
+    if with_select:
+        (tmp_path / "select.cops.dat").write_text(SELECT_COPS_DAT)
+
+    for filename in (
+        "WISE_CAST_001_190817_220856_URC.csv",
+        "WISE_CAST_002_190817_221224_URC.csv",
+        "WISE_CAST_003_190817_221636_URC.csv",
+    ):
+        _write_cast_file(tmp_path, filename)
+
+    return tmp_path
