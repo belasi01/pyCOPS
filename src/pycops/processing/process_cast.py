@@ -24,6 +24,14 @@ from pycops.processing.rrs import RrsResult, compute_rrs
 
 _DEPTH_PROFILED_INSTRUMENTS = ("EdZ", "LuZ", "EuZ")
 
+# select.cops.dat's "method" column names which Rrs a researcher already vetted
+# as the right one for a given cast (see discovery.CastSelection.method) --
+# some casts fit better with the LOESS surface value, others with the linear
+# one (e.g. a non-monotonic depth start near the surface fails the linear
+# fit's Kolmogorov-Smirnov gate but the LOESS fit tolerates it fine).
+_METHOD_LOESS = "Rrs.0p"
+_METHOD_LINEAR = "Rrs.0p.linear"
+
 
 @dataclass(frozen=True)
 class CastResult:
@@ -34,6 +42,8 @@ class CastResult:
     instrument_fits: dict[str, InstrumentFit]
     rrs_loess: RrsResult | None  # from LuZ's LOESS-fitted surface value, if LuZ present
     rrs_linear: RrsResult | None  # from LuZ's linear-fitted surface value, if LuZ present
+    rrs_method: str | None  # select.cops.dat's method for this cast, if known
+    recommended_rrs: RrsResult | None  # rrs_loess or rrs_linear per rrs_method, whichever is available
 
 
 def process_cast(ds: xr.Dataset, init: dict[str, object]) -> CastResult:
@@ -44,6 +54,12 @@ def process_cast(ds: xr.Dataset, init: dict[str, object]) -> CastResult:
     ``init.cops.dat`` dict from :func:`pycops.io.config.read_init_cops`.
     Instruments the R package's ``instruments.optics`` lists but that aren't
     actually in ``ds`` (e.g. no EuZ sensor on that deployment) are skipped.
+
+    If ``ds`` came from :func:`~pycops.io.discovery.read_deployment_casts`, its
+    ``rrs_method`` attr (from ``select.cops.dat``) picks ``recommended_rrs``
+    between ``rrs_loess`` and ``rrs_linear``, falling back to whichever is
+    available if the preferred one is missing (e.g. no LuZ) or ``None`` (the
+    surface fit failed for every wavelength).
     """
     ed0_fit = fit_ed0_for_cast(ds, init)
 
@@ -59,10 +75,16 @@ def process_cast(ds: xr.Dataset, init: dict[str, object]) -> CastResult:
             luz_fit.surface_linear.value_at_surface, ed0_fit.value_at_0, indice_water, rau_fresnel
         )
 
+    rrs_method = ds.attrs.get("rrs_method")
+    preferred, fallback = (rrs_loess, rrs_linear) if rrs_method == _METHOD_LOESS else (rrs_linear, rrs_loess)
+    recommended_rrs = preferred if preferred is not None else fallback
+
     return CastResult(
         waves=ds["wavelength"].values,
         ed0_fit=ed0_fit,
         instrument_fits=instrument_fits,
         rrs_loess=rrs_loess,
         rrs_linear=rrs_linear,
+        rrs_method=rrs_method,
+        recommended_rrs=recommended_rrs,
     )

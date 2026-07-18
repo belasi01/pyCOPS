@@ -107,6 +107,40 @@ def test_process_cast_rrs_none_without_luz():
     assert set(result.instrument_fits) == {"EdZ"}
 
 
+def test_process_cast_recommends_linear_by_default():
+    ds = _make_dataset()
+    result = process_cast(ds, _make_init())
+
+    assert result.rrs_method is None
+    np.testing.assert_array_equal(result.recommended_rrs.rrs_0p, result.rrs_linear.rrs_0p)
+
+
+def test_process_cast_recommends_loess_when_select_cops_dat_says_so():
+    ds = _make_dataset()
+    ds.attrs["rrs_method"] = "Rrs.0p"
+    result = process_cast(ds, _make_init())
+
+    assert result.rrs_method == "Rrs.0p"
+    np.testing.assert_array_equal(result.recommended_rrs.rrs_0p, result.rrs_loess.rrs_0p)
+
+
+def test_process_cast_recommends_linear_when_select_cops_dat_says_so():
+    ds = _make_dataset()
+    ds.attrs["rrs_method"] = "Rrs.0p.linear"
+    result = process_cast(ds, _make_init())
+
+    np.testing.assert_array_equal(result.recommended_rrs.rrs_0p, result.rrs_linear.rrs_0p)
+
+
+def test_process_cast_recommended_rrs_none_without_luz():
+    ds = _make_dataset(include_edz=True)
+    ds = ds.drop_vars("LuZ")
+    ds.attrs["rrs_method"] = "Rrs.0p"
+    result = process_cast(ds, _make_init())
+
+    assert result.recommended_rrs is None
+
+
 def test_process_cast_rrs_linear_matches_manual_compute_rrs():
     ds = _make_dataset()
     init = _make_init()
