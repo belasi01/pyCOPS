@@ -10,6 +10,8 @@ named ``<instrument><name>`` (e.g. ``LuZDepth``, ``Ed0Roll``).
 
 from __future__ import annotations
 
+import re
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +21,9 @@ import pandas as pd
 import xarray as xr
 
 DEFAULT_INSTRUMENTS = ("Ed0", "EdZ", "LuZ", "EuZ")
+
+_DATE_RE = re.compile(r"^\d{6}$")
+_TIME_RE = re.compile(r"^(?:\d{4}|\d{6})$")
 
 
 @dataclass(frozen=True)
@@ -32,23 +37,115 @@ class CastFileInfo:
     gps_file: Path | None
 
 
-def parse_cast_filename(path: str | Path, number_of_fields_before_date: int) -> CastFileInfo:
+def _is_plausible_date_token(token: str) -> bool:
+    """Does ``token`` look like a ``YYMMDD`` date (loose range checks, not calendar-exact)?"""
+    if not _DATE_RE.match(token):
+        return False
+    month, day = int(token[2:4]), int(token[4:6])
+    return 1 <= month <= 12 and 1 <= day <= 31
+
+
+def _is_plausible_time_token(token: str) -> bool:
+    """Does ``token`` look like an ``HHMM`` or ``HHMMSS`` time?"""
+    if not _TIME_RE.match(token):
+        return False
+    hour, minute = int(token[:2]), int(token[2:4])
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return False
+    if len(token) == 6:
+        return 0 <= int(token[4:6]) <= 59
+    return True
+
+
+def _find_date_time_candidates(parts: list[str]) -> list[int]:
+    """Indices ``i`` where ``parts[i]``/``parts[i + 1]`` look like a date/time pair."""
+    return [
+        i
+        for i in range(len(parts) - 1)
+        if _is_plausible_date_token(parts[i]) and _is_plausible_time_token(parts[i + 1])
+    ]
+
+
+def _resolve_date_time_position(parts: list[str], filename: str, number_of_fields_before_date: int | None) -> int:
+    """Find which token in ``parts`` is the date, auto-detecting from the filename's shape.
+
+    ``number_of_fields_before_date`` (from ``init.cops.dat``, already adjusted for ``_SB_``)
+    is used only as an optional cross-check/tie-breaker -- real deployments sometimes have a
+    wrong value for the files sitting next to it, so a plausible date/time token pair actually
+    found in the filename always wins over a configured position that doesn't match one.
+    """
+    candidates = _find_date_time_candidates(parts)
+    hint = None
+    if number_of_fields_before_date is not None and 0 <= number_of_fields_before_date < len(parts) - 1:
+        hint = number_of_fields_before_date
+
+    if not candidates:
+        raise ValueError(
+            f"could not find a YYMMDD/HHMM(SS) date-time token pair in {filename!r} "
+            f"(tokens={parts!r}); expected a 6-digit date token immediately followed by "
+            f"a 4- or 6-digit time token"
+        )
+
+    if len(candidates) == 1:
+        detected = candidates[0]
+        if hint is not None and hint != detected:
+            warnings.warn(
+                f"{filename}: number.of.fields.before.date points at token {hint} "
+                f"({parts[hint]!r}), but token {detected} ({parts[detected]!r}, followed by "
+                f"{parts[detected + 1]!r}) is the one that actually looks like a date/time -- "
+                f"using the detected position. This deployment's init.cops.dat "
+                f"number.of.fields.before.date looks wrong for this file.",
+                stacklevel=3,
+            )
+        return detected
+
+    if hint in candidates:
+        return hint
+
+    raise ValueError(
+        f"ambiguous date-time position in {filename!r}: multiple token pairs look plausible "
+        f"({[(i, parts[i], parts[i + 1]) for i in candidates]!r}); pass a "
+        f"number_of_fields_before_date matching one of these positions to disambiguate"
+    )
+
+
+def _extract_legacy_cast_number(parts: list[str], time_idx: int) -> str:
+    """Best-effort cast number for non-URC (legacy) file names, from the tail after the time token.
+
+    The last purely-numeric tail token is usually the cast number (e.g. ``..._data_001.tsv``);
+    falls back to the first tail token if none is numeric, rather than raising -- this field is
+    informational only.
+    """
+    tail = list(parts[time_idx + 1 :])
+    if not tail:
+        return ""
+    tail[-1] = Path(tail[-1]).stem  # strip the extension from the final token only
+    numeric_tail = [t for t in tail if t.isdigit()]
+    return numeric_tail[-1] if numeric_tail else tail[0]
+
+
+def parse_cast_filename(path: str | Path, number_of_fields_before_date: int | None = None) -> CastFileInfo:
     """Extract the cast date/time, cast number, and matching GPS file from a file name.
 
-    ``number_of_fields_before_date`` comes from the ``init.cops.dat`` file of the
-    deployment and tells how many ``_``-separated tokens precede the ``YYMMDD``
-    date token in the file name (e.g. 3 for ``WISE_CAST_001_190817_220856_URC.csv``).
+    The date/time token position is auto-detected from the filename's shape (a plausible
+    ``YYMMDD`` token immediately followed by a plausible ``HHMM``/``HHMMSS`` token), since real
+    deployments' filename shapes vary a lot (from 1 to 6 ``_``-separated tokens before the date
+    across projects) and their ``init.cops.dat`` ``number.of.fields.before.date`` is sometimes
+    simply wrong for the files next to it. ``number_of_fields_before_date`` is an optional
+    cross-check/tie-breaker, not authoritative -- see :func:`_resolve_date_time_position`.
     BioShade casts are named with ``_SB_`` instead of ``_CAST_NNN_`` (e.g.
-    ``hudsonbay_SB_180605_192518_URC.csv``) -- one fewer token before the date --
-    and are detected and adjusted for automatically.
+    ``hudsonbay_SB_180605_192518_URC.csv``) -- one fewer token before the date -- and are
+    detected and adjusted for automatically.
     """
     path = Path(path)
     parts = path.name.split("_")
     is_urc = "URC." in path.name
 
-    n = number_of_fields_before_date
-    if "_SB_" in path.name:
-        n -= 1
+    hint = number_of_fields_before_date
+    if hint is not None and "_SB_" in path.name:
+        hint -= 1
+    n = _resolve_date_time_position(parts, path.name, hint)
+
     date_token = parts[n]
     time_token = parts[n + 1]
     # File names encode time as HHMM or HHMMSS; only HH and MM are used, matching
@@ -56,10 +153,10 @@ def parse_cast_filename(path: str | Path, number_of_fields_before_date: int) -> 
     date = datetime.strptime(f"{date_token[:6]}{time_token[:4]}", "%y%m%d%H%M")
 
     if is_urc:
-        cast_number = parts[n - 1]
+        cast_number = parts[n - 1] if n > 0 else ""
         gps_stem = f"GPS_{date_token}"
     else:
-        cast_number = parts[n + 2]
+        cast_number = _extract_legacy_cast_number(parts, n + 1)
         gps_stem = "_".join(parts[: n + 2]) + "_gps"
 
     matches = sorted(path.parent.glob(f"{gps_stem}*"))
@@ -159,7 +256,7 @@ def _all_waves_equal(spectral: dict[str, tuple[np.ndarray, np.ndarray]]) -> bool
 def read_cast(
     path: str | Path,
     instruments: tuple[str, ...] = DEFAULT_INSTRUMENTS,
-    number_of_fields_before_date: int = 3,
+    number_of_fields_before_date: int | None = None,
 ) -> xr.Dataset:
     """Read one raw C-OPS cast file (CSV or TSV) into an ``xarray.Dataset``.
 
@@ -169,7 +266,10 @@ def read_cast(
     gets its own ``wavelength_<instr>`` dim. Ancillary channels (roll, pitch,
     depth, temperature) become ``<instrument>_<name>`` variables on ``time``,
     and unmatched columns (GPS/BioShade fields, raw timestamps) are kept as-is.
-    BioShade casts (``_SB_`` in the file name) only carry an Ed0 sensor, so
+    ``number_of_fields_before_date`` is an optional cross-check hint for the
+    file name's date/time position (auto-detected otherwise) -- see
+    :func:`parse_cast_filename`. BioShade casts (``_SB_`` in the file name)
+    only carry an Ed0 sensor, so
     ``instruments`` is forced to ``("Ed0",)`` for them regardless of what's
     passed in.
     """

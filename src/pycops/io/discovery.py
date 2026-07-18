@@ -7,6 +7,7 @@ Port of the file-discovery half of ``process.cops.R``.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -106,27 +107,58 @@ def discover_deployment(directory: str | Path) -> Deployment:
     return Deployment(directory=directory, init=init, casts=casts)
 
 
-def read_deployment_casts(deployment: Deployment, only_kept: bool = True) -> dict[str, xr.Dataset]:
+@dataclass(frozen=True)
+class CastReadFailure:
+    """One cast that failed to parse/read; captured instead of aborting the whole batch."""
+
+    file: str
+    path: Path
+    error: str  # f"{type(exc).__name__}: {exc}"
+
+
+@dataclass(frozen=True)
+class DeploymentCastsResult:
+    """Return value of :func:`read_deployment_casts`: successes plus any per-cast failures."""
+
+    datasets: dict[str, xr.Dataset]
+    failures: list[CastReadFailure]
+
+
+def read_deployment_casts(deployment: Deployment, only_kept: bool = True) -> DeploymentCastsResult:
     """Read every (kept) cast of a :class:`Deployment` into an ``xarray.Dataset``.
 
     Each dataset is annotated with its ``info.cops.dat`` position, chlorophyll/
     absorption-source flag, and ``select.cops.dat`` QC flag/method as attrs,
-    keyed by cast file name.
+    keyed by cast file name. A cast that fails to read (e.g. an unparseable
+    file name, given how much raw file-naming conventions vary across ~15
+    years of deployments) doesn't abort the rest of the batch: it's recorded
+    in the result's ``failures`` list with a warning instead.
     """
     instruments = tuple(deployment.init["instruments.optics"])
     n_fields = int(deployment.init["number.of.fields.before.date"])
 
     records = deployment.kept_casts() if only_kept else deployment.casts
-    datasets = {}
+    datasets: dict[str, xr.Dataset] = {}
+    failures: list[CastReadFailure] = []
     for record in records:
-        ds = read_cast(record.path, instruments=instruments, number_of_fields_before_date=n_fields)
-        ds.attrs.update(
-            longitude=record.info.longitude,
-            latitude=record.info.latitude,
-            chl_flag=record.info.chl_flag,
-            qc_flag=record.selection.flag,
-            rrs_method=record.selection.method,
-        )
+        try:
+            ds = read_cast(record.path, instruments=instruments, number_of_fields_before_date=n_fields)
+            ds.attrs.update(
+                longitude=record.info.longitude,
+                latitude=record.info.latitude,
+                chl_flag=record.info.chl_flag,
+                qc_flag=record.selection.flag,
+                rrs_method=record.selection.method,
+            )
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad: isolate one bad cast from the rest
+            error = f"{type(exc).__name__}: {exc}"
+            warnings.warn(
+                f"{deployment.directory.name}: failed to read cast {record.info.file!r} ({error}); "
+                f"skipping and continuing",
+                stacklevel=2,
+            )
+            failures.append(CastReadFailure(file=record.info.file, path=record.path, error=error))
+            continue
         datasets[record.info.file] = ds
 
-    return datasets
+    return DeploymentCastsResult(datasets=datasets, failures=failures)

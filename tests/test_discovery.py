@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from conftest import write_deployment
+from conftest import write_deployment, write_deployment_with_bad_cast
 from pycops.io.discovery import discover_deployment, read_deployment_casts
 
 
@@ -58,13 +58,14 @@ def test_read_deployment_casts_only_kept(tmp_path):
     write_deployment(tmp_path)
     deployment = discover_deployment(tmp_path)
 
-    datasets = read_deployment_casts(deployment)
+    result = read_deployment_casts(deployment)
 
-    assert set(datasets) == {
+    assert set(result.datasets) == {
         "WISE_CAST_001_190817_220856_URC.csv",
         "WISE_CAST_003_190817_221636_URC.csv",
     }
-    ds = datasets["WISE_CAST_001_190817_220856_URC.csv"]
+    assert result.failures == []
+    ds = result.datasets["WISE_CAST_001_190817_220856_URC.csv"]
     assert ds.attrs["longitude"] == -68.11626
     assert ds.attrs["latitude"] == 49.24872
     assert ds.attrs["chl_flag"] == 0.0
@@ -77,6 +78,24 @@ def test_read_deployment_casts_all(tmp_path):
     write_deployment(tmp_path)
     deployment = discover_deployment(tmp_path)
 
-    datasets = read_deployment_casts(deployment, only_kept=False)
+    result = read_deployment_casts(deployment, only_kept=False)
 
-    assert len(datasets) == 3
+    assert len(result.datasets) == 3
+    assert result.failures == []
+
+
+def test_read_deployment_casts_continues_after_one_bad_cast(tmp_path, recwarn):
+    write_deployment_with_bad_cast(tmp_path)
+    deployment = discover_deployment(tmp_path)
+
+    result = read_deployment_casts(deployment, only_kept=False)
+
+    assert set(result.datasets) == {
+        "WISE_CAST_001_190817_220856_URC.csv",
+        "WISE_CAST_003_190817_221636_URC.csv",
+    }
+    assert len(result.failures) == 1
+    failure = result.failures[0]
+    assert failure.file == "WISE_CAST_002_notadate_notatime_URC.csv"
+    assert failure.error
+    assert any("failed to read cast" in str(w.message) for w in recwarn.list)

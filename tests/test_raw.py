@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import numpy as np
+import pytest
 
 from conftest import write_urc_cast
 from pycops.io.raw import _clean_column_names, parse_cast_filename, read_cast
@@ -27,7 +28,89 @@ def test_parse_cast_filename_legacy(tmp_path):
 
     assert info.date == datetime(2015, 6, 26, 15, 46)
     assert info.is_urc is False
+    assert info.cast_number == "001"
     assert info.gps_file == tmp_path / "COPS_IML4_150626_1546_gps.tsv"
+
+
+def test_parse_cast_filename_legacy_one_token(tmp_path):
+    cast_path = tmp_path / "ARCN11_110801_1957_data_002.tsv"
+    cast_path.write_text("dummy\n")
+
+    info = parse_cast_filename(cast_path, number_of_fields_before_date=1)
+
+    assert info.date == datetime(2011, 8, 1, 19, 57)
+    assert info.is_urc is False
+    assert info.cast_number == "002"
+
+
+def test_parse_cast_filename_autodetects_without_hint(tmp_path):
+    cast_path = write_urc_cast(tmp_path)
+    info = parse_cast_filename(cast_path)
+
+    assert info.date == datetime(2019, 8, 17, 22, 8)
+    assert info.cast_number == "001"
+    assert info.gps_file == tmp_path / "GPS_190817.tsv"
+
+
+def test_parse_cast_filename_wrong_hint_warns_and_still_parses(tmp_path):
+    # Reproduces a real bug found on sabre: two sibling WISEMan station folders
+    # have identically-shaped filenames, but one folder's init.cops.dat says
+    # number.of.fields.before.date=3 (correct) and another says 4 (wrong).
+    cast_path = write_urc_cast(tmp_path)
+
+    with pytest.warns(UserWarning, match="number.of.fields.before.date"):
+        info = parse_cast_filename(cast_path, number_of_fields_before_date=4)
+
+    assert info.date == datetime(2019, 8, 17, 22, 8)
+    assert info.cast_number == "001"
+
+
+def test_parse_cast_filename_many_tokens_with_and_without_hint(tmp_path):
+    cast_path = tmp_path / "AN2303_AOP_BRG_AC23_CAST_002_230913_193250_URC.tsv"
+    cast_path.write_text("dummy\n")
+
+    with_hint = parse_cast_filename(cast_path, number_of_fields_before_date=6)
+    without_hint = parse_cast_filename(cast_path)
+
+    for info in (with_hint, without_hint):
+        assert info.date == datetime(2023, 9, 13, 19, 32)
+        assert info.cast_number == "002"
+
+
+def test_parse_cast_filename_ambiguous_resolved_by_valid_hint(tmp_path):
+    # Two plausible date/time pairs: tokens (1,2) and (3,4).
+    cast_path = tmp_path / "SITE_190817_2208_190818_2209_URC.csv"
+    cast_path.write_text("dummy\n")
+
+    first = parse_cast_filename(cast_path, number_of_fields_before_date=1)
+    second = parse_cast_filename(cast_path, number_of_fields_before_date=3)
+
+    assert first.date == datetime(2019, 8, 17, 22, 8)
+    assert second.date == datetime(2019, 8, 18, 22, 9)
+
+
+def test_parse_cast_filename_ambiguous_without_hint_raises(tmp_path):
+    cast_path = tmp_path / "SITE_190817_2208_190818_2209_URC.csv"
+    cast_path.write_text("dummy\n")
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        parse_cast_filename(cast_path)
+
+
+def test_parse_cast_filename_ambiguous_with_invalid_hint_raises(tmp_path):
+    cast_path = tmp_path / "SITE_190817_2208_190818_2209_URC.csv"
+    cast_path.write_text("dummy\n")
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        parse_cast_filename(cast_path, number_of_fields_before_date=99)
+
+
+def test_parse_cast_filename_unparseable_raises(tmp_path):
+    cast_path = tmp_path / "WISE_summary_report.csv"
+    cast_path.write_text("dummy\n")
+
+    with pytest.raises(ValueError, match="could not find"):
+        parse_cast_filename(cast_path)
 
 
 def test_parse_cast_filename_no_gps_file(tmp_path):
@@ -112,6 +195,14 @@ def test_read_cast_attrs(tmp_path):
     assert ds.attrs["is_urc_format"] is True
     assert ds.attrs["instruments"] == ["Ed0", "EdZ", "LuZ", "EuZ"]
     assert ds.attrs["gps_file"].endswith("GPS_190817.tsv")
+
+
+def test_read_cast_default_hint_none_autodetects(tmp_path):
+    cast_path = write_urc_cast(tmp_path)
+    ds = read_cast(cast_path)  # no number_of_fields_before_date at all
+
+    assert ds.attrs["cast_number"] == "001"
+    assert ds.attrs["cast_date"] == datetime(2019, 8, 17, 22, 8).isoformat()
 
 
 def test_read_cast_bioshade_forces_ed0_only(tmp_path):

@@ -110,3 +110,30 @@ def write_deployment(tmp_path, with_select=True):
         _write_cast_file(tmp_path, filename)
 
     return tmp_path
+
+
+BAD_CAST_FILENAME = "WISE_CAST_002_notadate_notatime_URC.csv"
+
+
+def write_deployment_with_bad_cast(tmp_path):
+    """Like :func:`write_deployment`, but cast 002 has an unparseable file name.
+
+    Exercises ``read_deployment_casts()``'s per-cast failure isolation: casts
+    001/003 should still be read even though 002 can't be.
+    """
+    (tmp_path / "init.cops.dat").write_text(INIT_COPS_DAT)
+    (tmp_path / "info.cops.dat").write_text(
+        INFO_COPS_DAT.replace("WISE_CAST_002_190817_221224_URC.csv", BAD_CAST_FILENAME)
+    )
+    (tmp_path / "select.cops.dat").write_text(
+        SELECT_COPS_DAT.replace("WISE_CAST_002_190817_221224_URC.csv", BAD_CAST_FILENAME)
+    )
+
+    for filename in (
+        "WISE_CAST_001_190817_220856_URC.csv",
+        BAD_CAST_FILENAME,
+        "WISE_CAST_003_190817_221636_URC.csv",
+    ):
+        _write_cast_file(tmp_path, filename)
+
+    return tmp_path
