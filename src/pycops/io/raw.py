@@ -38,12 +38,17 @@ def parse_cast_filename(path: str | Path, number_of_fields_before_date: int) -> 
     ``number_of_fields_before_date`` comes from the ``init.cops.dat`` file of the
     deployment and tells how many ``_``-separated tokens precede the ``YYMMDD``
     date token in the file name (e.g. 3 for ``WISE_CAST_001_190817_220856_URC.csv``).
+    BioShade casts are named with ``_SB_`` instead of ``_CAST_NNN_`` (e.g.
+    ``hudsonbay_SB_180605_192518_URC.csv``) -- one fewer token before the date --
+    and are detected and adjusted for automatically.
     """
     path = Path(path)
     parts = path.name.split("_")
     is_urc = "URC." in path.name
 
     n = number_of_fields_before_date
+    if "_SB_" in path.name:
+        n -= 1
     date_token = parts[n]
     time_token = parts[n + 1]
     # File names encode time as HHMM or HHMMSS; only HH and MM are used, matching
@@ -164,8 +169,13 @@ def read_cast(
     gets its own ``wavelength_<instr>`` dim. Ancillary channels (roll, pitch,
     depth, temperature) become ``<instrument>_<name>`` variables on ``time``,
     and unmatched columns (GPS/BioShade fields, raw timestamps) are kept as-is.
+    BioShade casts (``_SB_`` in the file name) only carry an Ed0 sensor, so
+    ``instruments`` is forced to ``("Ed0",)`` for them regardless of what's
+    passed in.
     """
     path = Path(path)
+    if "_SB_" in path.name:
+        instruments = ("Ed0",)
     info = parse_cast_filename(path, number_of_fields_before_date)
 
     n_header = _detect_header_lines(path)

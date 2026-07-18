@@ -39,6 +39,21 @@ def test_parse_cast_filename_no_gps_file(tmp_path):
     assert info.gps_file is None
 
 
+def test_parse_cast_filename_bioshade(tmp_path):
+    # BioShade casts are named "<site>_SB_<date>_<time>_URC.<ext>" -- one fewer
+    # token before the date than "<site>_CAST_NNN_<date>_<time>_URC.<ext>".
+    cast_path = tmp_path / "hudsonbay_SB_180605_192518_URC.csv"
+    cast_path.write_text("dummy\n")
+    (tmp_path / "GPS_180605.tsv").write_text("dummy\n")
+
+    info = parse_cast_filename(cast_path, number_of_fields_before_date=3)
+
+    assert info.date == datetime(2018, 6, 5, 19, 25)
+    assert info.cast_number == "SB"
+    assert info.is_urc is True
+    assert info.gps_file == tmp_path / "GPS_180605.tsv"
+
+
 def test_clean_column_names_strips_units():
     assert _clean_column_names(["Ed0443 (uW/(cm2 nm))", "LuZTemp (degC)"]) == ["Ed0443", "LuZTemp"]
 
@@ -97,6 +112,23 @@ def test_read_cast_attrs(tmp_path):
     assert ds.attrs["is_urc_format"] is True
     assert ds.attrs["instruments"] == ["Ed0", "EdZ", "LuZ", "EuZ"]
     assert ds.attrs["gps_file"].endswith("GPS_190817.tsv")
+
+
+def test_read_cast_bioshade_forces_ed0_only(tmp_path):
+    header = "DateTime,Ed0320 (uW/(cm2 nm)),BioShade_Position (position)"
+    rows = [
+        "06/05/2018 19:25:19,37.15,25550",
+        "06/05/2018 19:25:20,38.35,25600",
+    ]
+    path = tmp_path / "hudsonbay_SB_180605_192518_URC.csv"
+    path.write_text("\n".join([header, *rows]) + "\n")
+
+    # requesting the usual 4 instruments should still only pick up Ed0
+    ds = read_cast(path, number_of_fields_before_date=3)
+
+    assert ds.attrs["instruments"] == ["Ed0"]
+    assert ds.attrs["cast_number"] == "SB"
+    assert "BioShade_Position" in ds
 
 
 def test_read_cast_omits_instrument_absent_from_file(tmp_path):
