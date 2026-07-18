@@ -16,8 +16,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from pycops.processing.cast_fit import InstrumentFit
 from pycops.processing.gregg_carder import clear_sky_irradiance
-from pycops.processing.process_cast import CastResult
 
 # Gordon & Ding (1992) self-shading coefficients, port of shadow.data.R.
 _GORDON_DING_ZENITH = np.array([0, 10, 20, 30, 40, 50, 60, 70, 80, 90], dtype=float)
@@ -71,7 +71,7 @@ class AbsorptionResult:
     source: str  # "file", "kd", or "chlorophyll" (not yet implemented)
 
 
-def kd_derived_absorption(instrument: str, cast_result: CastResult) -> np.ndarray:
+def kd_derived_absorption(instrument: str, instrument_fits: dict[str, InstrumentFit]) -> np.ndarray:
     """Absorption from Morel & Maritorena (2001) eq. 8', using this cast's own Kd/R fits.
 
     Prefers the linear-fit Kd/surface values (``K.EdZ.surf``, ``<instrument>.0m.linear``);
@@ -80,12 +80,15 @@ def kd_derived_absorption(instrument: str, cast_result: CastResult) -> np.ndarra
     ``shadow.correction.R``'s indexing quirk where the depth-grid index nearest 2.5 m is
     reused directly as a row index into ``K0.EdZ.fitted`` (whose rows are offset by one
     relative to the depth grid) -- kept as-is for numerical fidelity with the R package.
+
+    ``instrument_fits`` is :attr:`pycops.processing.process_cast.CastResult.instrument_fits`
+    (must contain ``"EdZ"`` and ``instrument``).
     """
     if instrument not in _SHADOWABLE_INSTRUMENTS:
         raise ValueError(f"instrument must be one of {_SHADOWABLE_INSTRUMENTS}, got {instrument!r}")
 
-    edz_fit = cast_result.instrument_fits["EdZ"]
-    instr_fit = cast_result.instrument_fits[instrument]
+    edz_fit = instrument_fits["EdZ"]
+    instr_fit = instrument_fits[instrument]
 
     value_at_0 = instr_fit.value_at_0
     value_at_0_linear = instr_fit.surface_linear.value_at_surface
@@ -120,7 +123,8 @@ def kd_derived_absorption(instrument: str, cast_result: CastResult) -> np.ndarra
 def resolve_absorption(
     instrument: str,
     chl: float,
-    cast_result: CastResult,
+    instrument_fits: dict[str, InstrumentFit],
+    waves: np.ndarray,
     absorption_waves: np.ndarray | None = None,
     absorption_values: np.ndarray | None = None,
 ) -> AbsorptionResult | None:
@@ -131,7 +135,9 @@ def resolve_absorption(
       ``absorption_waves``/``absorption_values`` row (see
       :func:`pycops.io.config.read_absorption_cops`).
     - ``chl == 999``: absorption is derived from this cast's own fitted Kd (see
-      :func:`kd_derived_absorption`); ``instrument``'s own wavelengths are used.
+      :func:`kd_derived_absorption`); ``instrument_fits`` is
+      :attr:`~pycops.processing.process_cast.CastResult.instrument_fits` and ``waves`` is
+      the cast's wavelength grid.
     - ``chl > 0`` (an actual chlorophyll concentration): not yet ported (Morel &
       Maritorena chlorophyll-based absorption model, ``popt.R``) -- raises
       ``NotImplementedError``.
@@ -145,8 +151,8 @@ def resolve_absorption(
         return AbsorptionResult(waves=np.asarray(absorption_waves, dtype=float), values=np.asarray(absorption_values, dtype=float), source="file")
 
     if chl == 999:
-        values = kd_derived_absorption(instrument, cast_result)
-        return AbsorptionResult(waves=cast_result.waves, values=values, source="kd")
+        values = kd_derived_absorption(instrument, instrument_fits)
+        return AbsorptionResult(waves=np.asarray(waves, dtype=float), values=values, source="kd")
 
     raise NotImplementedError(
         "chlorophyll-based absorption (Morel & Maritorena, info.cops.dat chl > 0) is not yet ported"
@@ -164,7 +170,7 @@ class ShadowCorrectionResult:
     eps_sun: np.ndarray
     eps_sky: np.ndarray
     eps: np.ndarray
-    correction: np.ndarray  # multiply the shadowed quantity by this to correct it
+    correction: np.ndarray  # divide the shadowed quantity by this to correct it (< 1: signal lost to shading)
     absorption: AbsorptionResult
 
 

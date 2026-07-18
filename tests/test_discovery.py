@@ -67,6 +67,7 @@ def test_read_deployment_casts_only_kept(tmp_path):
     ds = datasets["WISE_CAST_001_190817_220856_URC.csv"]
     assert ds.attrs["longitude"] == -68.11626
     assert ds.attrs["latitude"] == 49.24872
+    assert ds.attrs["chl_flag"] == 0.0
     assert ds.attrs["qc_flag"] == 1
     assert ds.attrs["rrs_method"] == "Rrs.0p"
     assert ds.sizes["time"] == 3

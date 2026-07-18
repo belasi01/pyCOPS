@@ -103,14 +103,18 @@ def test_shadow_epsilon_invalid_instrument_raises():
 
 
 def test_resolve_absorption_nan_chl_disables_correction():
-    result = resolve_absorption("LuZ", float("nan"), _cast_result())
+    cast_result = _cast_result()
+    result = resolve_absorption("LuZ", float("nan"), cast_result.instrument_fits, cast_result.waves)
     assert result is None
 
 
 def test_resolve_absorption_chl_zero_uses_absorption_file():
+    cast_result = _cast_result()
     waves = np.array([340.0, 380.0, 443.0, 555.0])
     values = np.array([5.0, 3.0, 1.0, 0.5])
-    result = resolve_absorption("LuZ", 0.0, _cast_result(), absorption_waves=waves, absorption_values=values)
+    result = resolve_absorption(
+        "LuZ", 0.0, cast_result.instrument_fits, cast_result.waves, absorption_waves=waves, absorption_values=values
+    )
 
     assert result.source == "file"
     np.testing.assert_allclose(result.waves, waves)
@@ -118,13 +122,14 @@ def test_resolve_absorption_chl_zero_uses_absorption_file():
 
 
 def test_resolve_absorption_chl_zero_requires_absorption_data():
+    cast_result = _cast_result()
     with pytest.raises(ValueError):
-        resolve_absorption("LuZ", 0.0, _cast_result())
+        resolve_absorption("LuZ", 0.0, cast_result.instrument_fits, cast_result.waves)
 
 
 def test_resolve_absorption_chl_999_uses_kd():
     cast_result = _cast_result()
-    result = resolve_absorption("LuZ", 999.0, cast_result)
+    result = resolve_absorption("LuZ", 999.0, cast_result.instrument_fits, cast_result.waves)
 
     assert result.source == "kd"
     np.testing.assert_array_equal(result.waves, cast_result.waves)
@@ -132,20 +137,21 @@ def test_resolve_absorption_chl_999_uses_kd():
 
 
 def test_resolve_absorption_chl_positive_not_implemented():
+    cast_result = _cast_result()
     with pytest.raises(NotImplementedError):
-        resolve_absorption("LuZ", 2.5, _cast_result())
+        resolve_absorption("LuZ", 2.5, cast_result.instrument_fits, cast_result.waves)
 
 
 def test_kd_derived_absorption_finite_where_fits_succeed():
     cast_result = _cast_result()
-    values = kd_derived_absorption("LuZ", cast_result)
+    values = kd_derived_absorption("LuZ", cast_result.instrument_fits)
     # gentler-attenuation wavelengths (index 2, 3) should have a usable fit
     assert np.all(np.isfinite(values[2:]))
 
 
 def test_shadow_correction_end_to_end_sane_values():
     cast_result = _cast_result()
-    absorption = resolve_absorption("LuZ", 999.0, cast_result)
+    absorption = resolve_absorption("LuZ", 999.0, cast_result.instrument_fits, cast_result.waves)
 
     result = shadow_correction(
         instrument="LuZ",

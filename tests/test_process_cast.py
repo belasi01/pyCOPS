@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 
 from pycops.processing.process_cast import process_cast
+from pycops.processing.rrs import compute_rrs
 
 WAVES = (340.0, 380.0, 443.0, 555.0)
 K_TRUE = (2.0, 0.9, 0.3, 0.1)
@@ -51,6 +53,7 @@ def _make_init():
         "indice.water": 1.34,
         "rau.Fresnel": 0.043,
         "tiltmax.optics": {"Ed0": 10.0, "EdZ": 7.0, "LuZ": 7.0, "EuZ": 7.0},
+        "radius.instrument.optics": {"Ed0": 0.035, "EdZ": 0.035, "LuZ": 0.035, "EuZ": 0.035},
         "delta.capteur.optics": {"Ed0": 0.0, "EdZ": DELTA_CAPTEUR_EDZ, "LuZ": DELTA_CAPTEUR_LUZ, "EuZ": 0.238},
         "sub.surface.removed.layer.optics": {"Ed0": 0.0, "EdZ": 0.3, "LuZ": 0.0, "EuZ": 0.0},
         "depth.interval.for.smoothing.optics": {"Ed0": 10.0, "EdZ": 3.0, "LuZ": 3.0, "EuZ": 3.0},
@@ -146,8 +149,6 @@ def test_process_cast_rrs_linear_matches_manual_compute_rrs():
     init = _make_init()
     result = process_cast(ds, init)
 
-    from pycops.processing.rrs import compute_rrs
-
     expected = compute_rrs(
         result.instrument_fits["LuZ"].surface_linear.value_at_surface,
         result.ed0_fit.value_at_0,
@@ -155,3 +156,63 @@ def test_process_cast_rrs_linear_matches_manual_compute_rrs():
         init["rau.Fresnel"],
     )
     np.testing.assert_allclose(result.rrs_linear.rrs_0p, expected.rrs_0p, equal_nan=True)
+
+
+def _with_real_time(ds):
+    times = pd.date_range("2019-08-18T18:18:00", periods=ds.sizes["time"], freq="s")
+    return ds.assign_coords(time=times)
+
+
+def test_process_cast_skips_shadow_correction_without_position_info():
+    ds = _with_real_time(_make_dataset())
+    result = process_cast(ds, _make_init())
+
+    assert result.shadow_corrections == {}
+    assert result.shadow_correction_note is not None
+
+
+def test_process_cast_skips_shadow_correction_when_chl_is_nan():
+    ds = _with_real_time(_make_dataset())
+    ds.attrs["chl_flag"] = float("nan")
+    ds.attrs["longitude"] = -68.108833
+    ds.attrs["latitude"] = 49.13445
+    result = process_cast(ds, _make_init())
+
+    assert result.shadow_corrections == {}
+    assert "NA" in result.shadow_correction_note or "chl" in result.shadow_correction_note.lower()
+
+
+def test_process_cast_applies_shadow_correction_when_chl_999():
+    ds = _with_real_time(_make_dataset())
+    ds.attrs["chl_flag"] = 999.0
+    ds.attrs["longitude"] = -68.108833
+    ds.attrs["latitude"] = 49.13445
+
+    result = process_cast(ds, _make_init())
+
+    assert result.shadow_correction_note is None
+    assert "LuZ" in result.shadow_corrections
+
+    luz_fit = result.instrument_fits["LuZ"]
+    corrected = luz_fit.surface_linear.value_at_surface / result.shadow_corrections["LuZ"].correction
+    expected = compute_rrs(corrected, result.ed0_fit.value_at_0, 1.34, 0.043)
+    np.testing.assert_allclose(result.rrs_linear.rrs_0p, expected.rrs_0p, equal_nan=True)
+    # shadow correction should actually change the Rrs vs. the uncorrected fit
+    uncorrected = compute_rrs(
+        luz_fit.surface_linear.value_at_surface, result.ed0_fit.value_at_0, 1.34, 0.043
+    )
+    finite = np.isfinite(result.rrs_linear.rrs_0p) & np.isfinite(uncorrected.rrs_0p)
+    assert finite.any()
+    assert not np.allclose(result.rrs_linear.rrs_0p[finite], uncorrected.rrs_0p[finite])
+
+
+def test_process_cast_shadow_correction_chl_zero_needs_absorption_table():
+    ds = _with_real_time(_make_dataset())
+    ds.attrs["chl_flag"] = 0.0
+    ds.attrs["longitude"] = -68.108833
+    ds.attrs["latitude"] = 49.13445
+
+    result = process_cast(ds, _make_init())  # no absorption_waves/values passed
+
+    assert result.shadow_corrections == {}
+    assert result.shadow_correction_note is not None

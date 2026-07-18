@@ -109,8 +109,9 @@ def discover_deployment(directory: str | Path) -> Deployment:
 def read_deployment_casts(deployment: Deployment, only_kept: bool = True) -> dict[str, xr.Dataset]:
     """Read every (kept) cast of a :class:`Deployment` into an ``xarray.Dataset``.
 
-    Each dataset is annotated with its ``info.cops.dat`` position and
-    ``select.cops.dat`` QC flag/method as attrs, keyed by cast file name.
+    Each dataset is annotated with its ``info.cops.dat`` position, chlorophyll/
+    absorption-source flag, and ``select.cops.dat`` QC flag/method as attrs,
+    keyed by cast file name.
     """
     instruments = tuple(deployment.init["instruments.optics"])
     n_fields = int(deployment.init["number.of.fields.before.date"])
@@ -122,6 +123,7 @@ def read_deployment_casts(deployment: Deployment, only_kept: bool = True) -> dic
         ds.attrs.update(
             longitude=record.info.longitude,
             latitude=record.info.latitude,
+            chl_flag=record.info.chl_flag,
             qc_flag=record.selection.flag,
             rrs_method=record.selection.method,
         )
