@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from conftest import INFO_COPS_DAT, INIT_COPS_DAT
 from pycops.io.config import read_info_cops, read_init_cops
 
@@ -40,6 +42,48 @@ def test_read_init_cops_na_sentinel_in_numeric_vector(tmp_path):
     assert thresholds["Ed0"] != thresholds["Ed0"]  # NaN
     assert thresholds["EdZ"] == 0.5
     assert thresholds["LuZ"] == 0.6
+
+
+def test_read_init_cops_defaults_missing_linear_fit_params(tmp_path):
+    # Real init.cops.dat files predating these R package parameters (e.g. the
+    # WISEMan 2020 deployments) don't have them at all.
+    path = tmp_path / "init.cops.dat"
+    path.write_text(INIT_COPS_DAT)
+
+    with pytest.warns(UserWarning, match="linear.fit.Rsquared.threshold.optics"):
+        params = read_init_cops(path)
+
+    r2 = params["linear.fit.Rsquared.threshold.optics"]
+    assert r2["EdZ"] == 0.5
+    assert r2["LuZ"] == 0.6
+    assert r2["EuZ"] == 0.6
+    assert r2["Ed0"] != r2["Ed0"]  # NaN
+
+    max_delta = params["linear.fit.max.delta.depth.optics"]
+    assert max_delta["Ed0"] != max_delta["Ed0"]  # NaN
+    assert max_delta["EdZ"] == 3.0
+    assert max_delta["LuZ"] == 2.5
+    assert max_delta["EuZ"] == 2.5
+
+
+def test_read_init_cops_defaults_missing_windspeed(tmp_path):
+    path = tmp_path / "init.cops.dat"
+    path.write_text(INIT_COPS_DAT)
+
+    with pytest.warns(UserWarning, match="windspeed_ms"):
+        params = read_init_cops(path)
+
+    assert params["windspeed_ms"] == 4.0
+
+
+def test_read_init_cops_does_not_override_present_windspeed(tmp_path):
+    content = INIT_COPS_DAT + "windspeed_ms;numeric;9.8\n"
+    path = tmp_path / "init.cops.dat"
+    path.write_text(content)
+
+    params = read_init_cops(path)
+
+    assert params["windspeed_ms"] == 9.8
 
 
 def test_read_info_cops(tmp_path):

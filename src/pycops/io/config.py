@@ -9,6 +9,7 @@ position and any per-cast overrides. Ports ``read.init.R`` from the
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,6 +26,20 @@ _PER_INSTRUMENT_KEYS = (
     "linear.fit.Rsquared.threshold.optics",
     "linear.fit.max.delta.depth.optics",
 )
+
+# Fallback defaults for parameters added to the R package after many
+# init.cops.dat files were already written (read.init.R warns and injects
+# these same values -- and rewrites the file -- the first time it hits an
+# older file missing them). Ed0 gets NaN: no linear-fit threshold applies at
+# the surface.
+_PER_INSTRUMENT_DEFAULTS = {
+    "linear.fit.Rsquared.threshold.optics": {"Ed0": float("nan"), "EdZ": 0.5, "LuZ": 0.6, "EuZ": 0.6},
+    "linear.fit.max.delta.depth.optics": {"Ed0": float("nan"), "EdZ": 3.0, "LuZ": 2.5, "EuZ": 2.5},
+}
+_SCALAR_DEFAULTS = {
+    "bandwidth": 10.0,
+    "windspeed_ms": 4.0,
+}
 
 def _to_float(value: str) -> float:
     # "NA" is R's missing-value sentinel, e.g. for a linear-fit threshold that
@@ -67,6 +82,19 @@ def read_init_cops(path: str | Path) -> dict[str, object]:
             params[name] = dict(zip(instruments, values))
         else:
             params[name] = values[0] if len(values) == 1 else values
+
+    for name, defaults_by_instrument in _PER_INSTRUMENT_DEFAULTS.items():
+        if name not in params:
+            warnings.warn(
+                f"{path.name} has no {name!r}; using default values {defaults_by_instrument}",
+                stacklevel=2,
+            )
+            params[name] = {instr: defaults_by_instrument[instr] for instr in instruments}
+
+    for name, default in _SCALAR_DEFAULTS.items():
+        if name not in params:
+            warnings.warn(f"{path.name} has no {name!r}; defaulting to {default}", stacklevel=2)
+            params[name] = default
 
     return params
 
