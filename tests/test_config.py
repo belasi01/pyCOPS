@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from conftest import INFO_COPS_DAT, INIT_COPS_DAT
-from pycops.io.config import read_info_cops, read_init_cops
+from pycops.io.config import absorption_for_cast, read_absorption_cops, read_info_cops, read_init_cops
 
 
 def test_read_init_cops_scalars(tmp_path):
@@ -108,3 +109,22 @@ def test_read_info_cops(tmp_path):
     assert third.time_window == (0.0, 90.0)
     assert third.sub_surface_removed_layer == [0.1, 0.05, 0.1, 0.0]
     assert third.dark_files == ["dark_001.csv"]
+
+
+ABSORPTION_COPS_DAT = """\
+cops.file;320;340;380;443
+WISE_CAST_001_190817_220856_URC.csv;9.2979;6.8733;3.8018;1.4911
+WISE_CAST_002_190817_221224_URC.csv;9.2979;6.8733;3.8018;1.4911
+"""
+
+
+def test_read_absorption_cops(tmp_path):
+    path = tmp_path / "absorption.cops.dat"
+    path.write_text(ABSORPTION_COPS_DAT)
+
+    table = read_absorption_cops(path)
+
+    assert list(table.index) == ["WISE_CAST_001_190817_220856_URC.csv", "WISE_CAST_002_190817_221224_URC.csv"]
+    waves, values = absorption_for_cast(table, "WISE_CAST_001_190817_220856_URC.csv")
+    np.testing.assert_allclose(waves, [320.0, 340.0, 380.0, 443.0])
+    np.testing.assert_allclose(values, [9.2979, 6.8733, 3.8018, 1.4911])

@@ -13,6 +13,7 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 # init.cops.dat parameters that are vectors indexed by instruments.optics.
@@ -157,3 +158,21 @@ def read_info_cops(path: str | Path) -> list[CastInfo]:
 def info_cops_to_frame(entries: list[CastInfo]) -> pd.DataFrame:
     """Convenience wrapper: :func:`read_info_cops` results as a flat DataFrame."""
     return pd.DataFrame([vars(e) for e in entries])
+
+
+def read_absorption_cops(path: str | Path) -> pd.DataFrame:
+    """Parse an ``absorption.cops.dat`` file: one row of absorption a(lambda) per cast.
+
+    Used for shadow correction when ``info.cops.dat``'s ``chl`` field is ``0``
+    (see :func:`pycops.processing.shadow.resolve_absorption`). Returns a
+    DataFrame indexed by cast file name, with wavelength (nm) column labels --
+    port of the ``read.table(..., row.names = 1)`` call in ``process.cops.R``.
+    """
+    return pd.read_csv(Path(path), sep=";", index_col=0)
+
+
+def absorption_for_cast(table: pd.DataFrame, filename: str) -> tuple[np.ndarray, np.ndarray]:
+    """Absorption waves/values for one cast from a table loaded by :func:`read_absorption_cops`."""
+    waves = table.columns.to_numpy(dtype=float)
+    values = table.loc[filename].to_numpy(dtype=float)
+    return waves, values
