@@ -19,7 +19,12 @@ little redundancy for a much simpler schema.
 ``rrs_method``/``rrs_source``/``shadow_correction_note``/``longitude``/
 ``latitude`` (the latter two preferring ``CastResult.resolved_longitude``/
 ``.resolved_latitude`` when shadow correction actually ran) are always
-written as global attrs. Passing the original ``ds`` (the cast read by
+written as global attrs, along with the QWIP/Forel-Ule scalar diagnostics
+(``qwip_loess_*``/``qwip_linear_*``) when available; nLw (``nlw_0p_loess``/
+``nlw_0p_linear``/``nlw_0p_recommended``) is written as a data variable
+alongside ``lw_0p``/``rrs_0p`` whenever it was computed (needs
+``init.cops.dat``'s ``bandwidth``, see :mod:`pycops.processing.nlw`).
+Passing the original ``ds`` (the cast read by
 :func:`pycops.io.raw.read_cast`) is optional but adds real value: the
 per-scan boolean ``kept`` mask and Ed0's per-scan illumination ``correction``
 get a real ``time`` coordinate instead of a bare integer index, and
@@ -106,12 +111,29 @@ def cast_result_to_dataset(cast_result: CastResult, ds: xr.Dataset | None = None
     if cast_result.rrs_loess is not None:
         data_vars["lw_0p_loess"] = ("wavelength", cast_result.rrs_loess.lw_0p)
         data_vars["rrs_0p_loess"] = ("wavelength", cast_result.rrs_loess.rrs_0p)
+        if cast_result.rrs_loess.nlw_0p is not None:
+            data_vars["nlw_0p_loess"] = ("wavelength", cast_result.rrs_loess.nlw_0p)
     if cast_result.rrs_linear is not None:
         data_vars["lw_0p_linear"] = ("wavelength", cast_result.rrs_linear.lw_0p)
         data_vars["rrs_0p_linear"] = ("wavelength", cast_result.rrs_linear.rrs_0p)
+        if cast_result.rrs_linear.nlw_0p is not None:
+            data_vars["nlw_0p_linear"] = ("wavelength", cast_result.rrs_linear.nlw_0p)
     if cast_result.recommended_rrs is not None:
         data_vars["lw_0p_recommended"] = ("wavelength", cast_result.recommended_rrs.lw_0p)
         data_vars["rrs_0p_recommended"] = ("wavelength", cast_result.recommended_rrs.rrs_0p)
+        if cast_result.recommended_rrs.nlw_0p is not None:
+            data_vars["nlw_0p_recommended"] = ("wavelength", cast_result.recommended_rrs.nlw_0p)
+
+    for label, qwip in (("loess", cast_result.qwip_loess), ("linear", cast_result.qwip_linear)):
+        if qwip is None:
+            continue
+        attrs[f"qwip_{label}_avw"] = qwip.avw
+        attrs[f"qwip_{label}_ndi"] = qwip.ndi
+        attrs[f"qwip_{label}_predicted_ndi"] = qwip.predicted_ndi
+        attrs[f"qwip_{label}_score"] = qwip.score
+        attrs[f"qwip_{label}_passed"] = int(qwip.passed)
+        attrs[f"qwip_{label}_water_class"] = qwip.water_class
+        attrs[f"qwip_{label}_fu"] = qwip.fu
 
     attrs["rrs_method"] = cast_result.rrs_method or ""
     attrs["rrs_source"] = cast_result.rrs_source or ""

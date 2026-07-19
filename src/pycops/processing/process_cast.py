@@ -5,11 +5,12 @@ Ties :func:`pycops.processing.cast_fit.fit_ed0_for_cast` and
 :func:`pycops.processing.cast_fit.fit_cast` together across all instruments
 in one cast, applies :func:`pycops.processing.shadow.shadow_correction` to
 LuZ/EuZ when the cast carries enough information for it, and computes
-:func:`pycops.processing.rrs.compute_rrs`. Equivalent to one iteration of
+:func:`pycops.processing.rrs.compute_rrs` (including nLw) plus the
+Forel-Ule/QWIP diagnostics. Equivalent to one iteration of
 ``process.cops.R``'s per-cast loop followed by ``compute.aops.R`` -- except
 the Gregg & Carder-based ``Ed0.0m`` diffuse/direct split (used there only for
-the ``R.0m``/``R.0p`` subsurface-reflectance diagnostics, not for Rrs itself)
-and nLw/FU/QWIP diagnostics, none of which are ported yet.
+the ``R.0m``/``R.0p`` subsurface-reflectance diagnostics, not for Rrs itself),
+which isn't ported yet.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from pycops.processing.cast_fit import InstrumentFit, fit_cast, fit_ed0_for_cast
 from pycops.processing.ed0 import Ed0Fit
 from pycops.processing.position import PositionOverride
 from pycops.processing.qfactor import compute_q_factor
+from pycops.processing.qwip import QWIPResult, compute_qwip
 from pycops.processing.rrs import RrsResult, compute_rrs
 from pycops.processing.shadow import ShadowCorrectionResult, resolve_absorption, shadow_correction
 from pycops.processing.solar import sun_position
@@ -55,6 +57,8 @@ class CastResult:
     rrs_method: str | None  # select.cops.dat's method for this cast, if known
     recommended_rrs: RrsResult | None  # rrs_loess or rrs_linear per rrs_method, whichever is available
     rrs_source: str | None  # "LuZ" or "EuZ" (via the Q factor) -- which instrument Rrs came from, if any
+    qwip_loess: QWIPResult | None  # QWIP/Forel-Ule diagnostics on rrs_loess, if available
+    qwip_linear: QWIPResult | None  # QWIP/Forel-Ule diagnostics on rrs_linear, if available
     resolved_longitude: float | None  # position actually used for shadow correction, if it ran (may differ
     resolved_latitude: float | None  # from ds.attrs -- e.g. resolved via position_override or a GPS file)
 
@@ -200,6 +204,13 @@ def process_cast(
     between ``rrs_loess`` and ``rrs_linear``, falling back to whichever is
     available if the preferred one is missing (e.g. no LuZ or EuZ) or
     ``None`` (the surface fit failed for every wavelength).
+
+    Each available ``RrsResult`` also gets its normalized water-leaving
+    radiance (``nlw_0p``, from ``init.cops.dat``'s ``bandwidth``) and, on
+    ``CastResult``, its Forel-Ule/QWIP quality-control diagnostics
+    (``qwip_loess``/``qwip_linear``, see
+    :func:`pycops.processing.qwip.compute_qwip`) -- ``None`` when the
+    corresponding Rrs is unavailable.
     """
     waves = ds["wavelength"].values
     ed0_fit = fit_ed0_for_cast(ds, init)
@@ -247,11 +258,19 @@ def process_cast(
     else:
         luz_value_at_0 = luz_value_at_surface = None
 
+    qwip_loess = qwip_linear = None
     if luz_value_at_0 is not None:
         indice_water = init["indice.water"]
         rau_fresnel = init["rau.Fresnel"]
-        rrs_loess = compute_rrs(luz_value_at_0, ed0_fit.value_at_0, indice_water, rau_fresnel)
-        rrs_linear = compute_rrs(luz_value_at_surface, ed0_fit.value_at_0, indice_water, rau_fresnel)
+        bandwidth = init.get("bandwidth")
+        rrs_loess = compute_rrs(luz_value_at_0, ed0_fit.value_at_0, indice_water, rau_fresnel, waves, bandwidth)
+        rrs_linear = compute_rrs(
+            luz_value_at_surface, ed0_fit.value_at_0, indice_water, rau_fresnel, waves, bandwidth
+        )
+        if np.any(np.isfinite(rrs_loess.rrs_0p)):
+            qwip_loess = compute_qwip(waves, rrs_loess.rrs_0p)
+        if np.any(np.isfinite(rrs_linear.rrs_0p)):
+            qwip_linear = compute_qwip(waves, rrs_linear.rrs_0p)
 
     rrs_method = ds.attrs.get("rrs_method")
     preferred, fallback = (rrs_loess, rrs_linear) if rrs_method == _METHOD_LOESS else (rrs_linear, rrs_loess)
@@ -268,6 +287,8 @@ def process_cast(
         rrs_method=rrs_method,
         recommended_rrs=recommended_rrs,
         rrs_source=rrs_source,
+        qwip_loess=qwip_loess,
+        qwip_linear=qwip_linear,
         resolved_longitude=resolved_longitude,
         resolved_latitude=resolved_latitude,
     )

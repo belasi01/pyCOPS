@@ -197,3 +197,47 @@ def test_cast_result_to_dataset_records_rrs_source():
 
     assert result.rrs_source == "LuZ"
     assert out.attrs["rrs_source"] == "LuZ"
+
+
+def test_cast_result_to_dataset_writes_qwip_diagnostics():
+    ds, result = _cast_result_with_shadow()
+    out = cast_result_to_dataset(result, ds=ds)
+
+    assert result.qwip_linear is not None
+    assert out.attrs["qwip_linear_avw"] == result.qwip_linear.avw
+    assert out.attrs["qwip_linear_fu"] == result.qwip_linear.fu
+    assert out.attrs["qwip_linear_water_class"] == result.qwip_linear.water_class
+
+
+def test_cast_result_to_dataset_writes_nlw_when_bandwidth_present():
+    ds = _make_dataset()
+    ds.attrs["chl_flag"] = 999.0
+    ds.attrs["longitude"] = -68.108833
+    ds.attrs["latitude"] = 49.13445
+    init = _make_init()
+    init["bandwidth"] = 10.0
+    result = process_cast(ds, init)
+
+    out = cast_result_to_dataset(result, ds=ds)
+
+    assert "nlw_0p_linear" in out.data_vars
+    np.testing.assert_allclose(out["nlw_0p_linear"].values, result.rrs_linear.nlw_0p, equal_nan=True)
+
+
+def test_write_cast_result_round_trips_qwip_and_nlw(tmp_path):
+    ds = _make_dataset()
+    ds.attrs["chl_flag"] = 999.0
+    ds.attrs["longitude"] = -68.108833
+    ds.attrs["latitude"] = 49.13445
+    init = _make_init()
+    init["bandwidth"] = 10.0
+    result = process_cast(ds, init)
+    path = tmp_path / "cast.nc"
+
+    write_cast_result(result, path, ds=ds)
+    reloaded = xr.open_dataset(path)
+    try:
+        assert reloaded.attrs["qwip_linear_fu"] == result.qwip_linear.fu
+        np.testing.assert_allclose(reloaded["nlw_0p_linear"].values, result.rrs_linear.nlw_0p, equal_nan=True)
+    finally:
+        reloaded.close()

@@ -430,3 +430,53 @@ def test_process_cast_euz_only_positive_chl_leaves_rrs_none():
     assert result.rrs_loess is None
     assert result.rrs_linear is None
     assert set(result.instrument_fits) == {"EdZ", "EuZ"}  # fitting itself is unaffected
+
+
+def test_process_cast_computes_nlw_when_bandwidth_present():
+    ds = _make_dataset()
+    init = _make_init()
+    init["bandwidth"] = 10.0
+
+    result = process_cast(ds, init)
+
+    assert result.rrs_linear.nlw_0p is not None
+    assert result.rrs_linear.nlw_0p.shape == np.array(WAVES).shape
+
+
+def test_process_cast_nlw_none_without_bandwidth():
+    ds = _make_dataset()
+    result = process_cast(ds, _make_init())  # no "bandwidth" key
+
+    assert result.rrs_linear.nlw_0p is None
+
+
+def test_process_cast_computes_qwip_diagnostics():
+    ds = _make_dataset()
+    init = _make_init()
+    init["bandwidth"] = 10.0
+
+    result = process_cast(ds, init)
+
+    assert result.qwip_linear is not None
+    assert np.isfinite(result.qwip_linear.avw)
+    assert 1 <= result.qwip_linear.fu <= 21
+
+
+def test_process_cast_qwip_none_without_rrs():
+    ds = xr.Dataset(
+        {
+            "Ed0": (("time", "wavelength"), np.full((300, 4), 100.0)),
+            "EdZ": (("time", "wavelength"), np.full((300, 4), 50.0)),
+            "Ed0_Roll": ("time", np.zeros(300)),
+            "Ed0_Pitch": ("time", np.zeros(300)),
+            "EdZ_Roll": ("time", np.zeros(300)),
+            "EdZ_Pitch": ("time", np.zeros(300)),
+            "LuZ_Depth": ("time", np.linspace(0.05, 6.0, 300)),
+        },
+        coords={"time": np.arange(300), "wavelength": np.array(WAVES)},
+    )
+
+    result = process_cast(ds, _make_init())
+
+    assert result.qwip_loess is None
+    assert result.qwip_linear is None
