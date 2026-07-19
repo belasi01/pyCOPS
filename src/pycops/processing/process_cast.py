@@ -202,8 +202,11 @@ def process_cast(
     If ``ds`` came from :func:`~pycops.io.discovery.read_deployment_casts`, its
     ``rrs_method`` attr (from ``select.cops.dat``) picks ``recommended_rrs``
     between ``rrs_loess`` and ``rrs_linear``, falling back to whichever is
-    available if the preferred one is missing (e.g. no LuZ or EuZ) or
-    ``None`` (the surface fit failed for every wavelength).
+    available if the preferred one is missing entirely (e.g. no LuZ or EuZ)
+    *or* present but unusable -- every wavelength ``NaN`` (e.g. the linear
+    surface fit's Kolmogorov-Smirnov/R² gate rejected every candidate window
+    for this cast, even though ``select.cops.dat`` recorded the linear
+    method as the researcher's general preference for the station).
 
     Each available ``RrsResult`` also gets its normalized water-leaving
     radiance (``nlw_0p``, from ``init.cops.dat``'s ``bandwidth``) and, on
@@ -274,7 +277,8 @@ def process_cast(
 
     rrs_method = ds.attrs.get("rrs_method")
     preferred, fallback = (rrs_loess, rrs_linear) if rrs_method == _METHOD_LOESS else (rrs_linear, rrs_loess)
-    recommended_rrs = preferred if preferred is not None else fallback
+    preferred_usable = preferred is not None and np.any(np.isfinite(preferred.rrs_0p))
+    recommended_rrs = preferred if preferred_usable else fallback
 
     return CastResult(
         waves=waves,

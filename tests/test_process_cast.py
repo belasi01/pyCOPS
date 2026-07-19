@@ -137,6 +137,24 @@ def test_process_cast_recommends_linear_when_select_cops_dat_says_so():
     np.testing.assert_array_equal(result.recommended_rrs.rrs_0p, result.rrs_linear.rrs_0p)
 
 
+def test_process_cast_recommended_rrs_falls_back_when_preferred_is_all_nan():
+    # real-data finding (BoueesIML IML4_CAST_001, chl=2): select.cops.dat can
+    # recommend "Rrs.0p.linear" for a station in general, but the linear
+    # surface fit's R2/KS gate can still reject every wavelength for one
+    # particular cast -- recommended_rrs must not return that all-NaN result
+    # just because it isn't a bare None.
+    ds = _make_dataset()
+    ds.attrs["rrs_method"] = "Rrs.0p.linear"
+    init = _make_init()
+    init["linear.fit.Rsquared.threshold.optics"]["LuZ"] = 2.0  # R2 <= 1 always, so every window fails
+
+    result = process_cast(ds, init)
+
+    assert np.all(np.isnan(result.rrs_linear.rrs_0p))  # confirms the fixture actually forces the failure
+    assert np.any(np.isfinite(result.rrs_loess.rrs_0p))
+    np.testing.assert_array_equal(result.recommended_rrs.rrs_0p, result.rrs_loess.rrs_0p)
+
+
 def test_process_cast_recommended_rrs_none_without_luz():
     ds = _make_dataset(include_edz=True)
     ds = ds.drop_vars("LuZ")
