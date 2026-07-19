@@ -37,6 +37,23 @@ def test_read_gps_file_handles_inconsistent_millisecond_precision(tmp_path):
     assert table["time"].is_monotonic_increasing
 
 
+def test_read_gps_file_drops_repeated_header_mid_file(tmp_path):
+    # Simulates a GPS/COPS logger restart partway through the day: uProfile
+    # re-emits the header row (twice here, to also cover multiple restarts).
+    header = GPS_TSV.splitlines()[0]
+    lines = GPS_TSV.splitlines()
+    corrupted = "\n".join([lines[0], lines[1], header, lines[2], header, lines[3]]) + "\n"
+    path = tmp_path / "GPS_180605.tsv"
+    path.write_text(corrupted)
+
+    with pytest.warns(UserWarning, match="dropped 2 repeated header row"):
+        table = read_gps_file(path)
+
+    assert len(table) == 3
+    np.testing.assert_allclose(table["longitude"], [-81.8483, -81.8481, -81.8479])
+    np.testing.assert_allclose(table["latitude"], [63.1770, 63.1772, 63.1774])
+
+
 def test_position_from_gps_median_within_cast_window(tmp_path):
     path = tmp_path / "GPS_180605.tsv"
     path.write_text(GPS_TSV)

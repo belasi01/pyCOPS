@@ -20,6 +20,8 @@ only tells the user, via a printed message, to hand-edit ``info.cops.dat``).
 
 from __future__ import annotations
 
+import io
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,10 +56,42 @@ def read_gps_file(path: str | Path) -> pd.DataFrame:
     against). ``DateTimeUTC``'s sub-second precision is inconsistent row to
     row in real files (some rows carry milliseconds, some don't), so parsing
     uses pandas' per-row format inference rather than one fixed format string.
+
+    GPS files cover a whole day, and if the GPS/COPS logger is restarted
+    partway through, uProfile re-emits a fresh header row **in the middle of
+    the file** -- a real, recurring crash in the R package (``read.table``
+    with ``colClasses`` pinning a column to ``"numeric"`` chokes on the
+    literal header text landing there). Guards against this by dropping any
+    line (anywhere past the first) whose first field matches the header's own
+    first field -- always the literal ``[DateTime]``/``DateTimeUTC`` token,
+    never a real timestamp -- before parsing, and warns with the count
+    dropped. Handles the logger restarting any number of times in one file.
     """
     path = Path(path)
     sep = "\t" if path.suffix.lower() in (".tsv", ".txt") else ","
-    table = pd.read_csv(path, sep=sep, quotechar='"')
+    with path.open() as f:
+        lines = f.readlines()
+    if not lines:
+        raise ValueError(f"{path}: empty GPS file")
+
+    header = lines[0]
+    header_first_field = header.split(sep, 1)[0].strip().strip('"')
+    kept_lines = [header]
+    n_dropped = 0
+    for line in lines[1:]:
+        first_field = line.split(sep, 1)[0].strip().strip('"')
+        if first_field == header_first_field:
+            n_dropped += 1
+            continue
+        kept_lines.append(line)
+    if n_dropped:
+        warnings.warn(
+            f"{path.name}: dropped {n_dropped} repeated header row(s) mid-file "
+            "(the GPS logger was likely restarted during the day)",
+            stacklevel=2,
+        )
+
+    table = pd.read_csv(io.StringIO("".join(kept_lines)), sep=sep, quotechar='"')
     table.columns = [c.strip("[]") for c in table.columns]
     return pd.DataFrame(
         {

@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 from pycops.processing.filters import median_filter
@@ -20,6 +22,31 @@ def good_depth_mask(depth: np.ndarray, k: int = 3) -> np.ndarray:
     delta = np.max(depth) / len(depth) * 50
     filtered = median_filter(depth, k=k, delta=delta, fill=True, replace=False)
     return ~np.isnan(filtered)
+
+
+def time_window_mask(time: np.ndarray, time_window: tuple[float, float]) -> np.ndarray:
+    """Flag scans within ``time_window`` (start, end seconds elapsed from the cast's first scan).
+
+    Port of ``derived.data.R``'s ``dates.good`` (``dates.secs.from.beginning <- as.numeric(dates)
+    - min(as.numeric(dates))``), meant to be ANDed into :func:`good_depth_mask`'s result -- R
+    applies both at the same level (``Depth.good <- Depth.good & dates.good``), once per cast,
+    before any per-instrument fitting.
+
+    If every scan carries the same timestamp (e.g. :func:`pycops.io.raw.read_cast`'s
+    ``_infer_time`` fallback, when no usable per-scan time column exists), elapsed time can't
+    meaningfully distinguish scans -- rather than let a degenerate ``time_window`` silently zero
+    out the whole cast, this warns and returns an all-``True`` mask instead.
+    """
+    time = np.asarray(time)
+    elapsed = (time - time.min()) / np.timedelta64(1, "s")
+    if np.ptp(elapsed) == 0:
+        warnings.warn(
+            "every scan has the same timestamp (no usable per-scan time column); "
+            "ignoring time_window",
+            stacklevel=2,
+        )
+        return np.ones(time.shape, dtype=bool)
+    return (elapsed >= time_window[0]) & (elapsed <= time_window[1])
 
 
 def depth_grid(discretization: list[float], max_depth: float | None = None) -> np.ndarray:

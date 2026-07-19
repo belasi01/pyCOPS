@@ -181,6 +181,15 @@ def process_cast(
     Instruments the R package's ``instruments.optics`` lists but that aren't
     actually in ``ds`` (e.g. no EuZ sensor on that deployment) are skipped.
 
+    ``ds.attrs["time_window"]`` (an ``info.cops.dat`` per-cast override, set by
+    :func:`~pycops.io.discovery.read_deployment_casts`), if present, restricts
+    every instrument's kept scans to that elapsed-seconds-from-first-scan
+    window, falling back to ``init["time.window"]`` (the deployment-wide
+    default) when the per-cast override is absent -- matching
+    ``derived.data.R``'s ``Depth.good <- Depth.good & dates.good``, applied
+    once per cast before any per-instrument fitting (see
+    :func:`pycops.processing.depth.time_window_mask`).
+
     Shadow correction (see :mod:`pycops.processing.shadow`) requires ``ds`` to
     carry ``chl_flag``/``longitude``/``latitude`` attrs (as
     :func:`~pycops.io.discovery.read_deployment_casts` sets from
@@ -265,9 +274,16 @@ def process_cast(
     instrument isn't available.
     """
     waves = ds["wavelength"].values
-    ed0_fit = fit_ed0_for_cast(ds, init)
+    time_window = ds.attrs.get("time_window") or (
+        tuple(init["time.window"]) if "time.window" in init else None
+    )
+    ed0_fit = fit_ed0_for_cast(ds, init, time_window=time_window)
 
-    instrument_fits = {instr: fit_cast(ds, init, instr, ed0_fit) for instr in _DEPTH_PROFILED_INSTRUMENTS if instr in ds}
+    instrument_fits = {
+        instr: fit_cast(ds, init, instr, ed0_fit, time_window=time_window)
+        for instr in _DEPTH_PROFILED_INSTRUMENTS
+        if instr in ds
+    }
 
     lon, lat, julian_day, sun_zenith_deg, geometry_note = _resolve_sun_geometry(ds, position_override)
 

@@ -60,6 +60,35 @@ def _make_init():
     }
 
 
+def _make_dataset_with_time(**kwargs):
+    ds = _make_dataset(**kwargs)
+    n = ds.sizes["time"]
+    time = np.datetime64("2020-01-01T00:00:00") + np.arange(n) * np.timedelta64(1, "s")
+    return ds.assign_coords(time=("time", time))
+
+
+def test_fit_cast_time_window_excludes_scans_outside_window():
+    ds = _make_dataset_with_time()
+    init = _make_init()
+    ed0_fit = fit_ed0_for_cast(ds, init, time_window=(50.0, 250.0))
+    result = fit_cast(ds, init, "LuZ", ed0_fit, time_window=(50.0, 250.0))
+
+    elapsed = np.arange(ds.sizes["time"])  # 1 scan/sec starting at t=0
+    outside = (elapsed < 50) | (elapsed > 250)
+    inside = ~outside
+
+    assert not result.kept[outside].any()
+    assert result.kept[inside].sum() > 0
+
+
+def test_fit_cast_no_time_window_keeps_full_range():
+    ds = _make_dataset_with_time()
+    init = _make_init()
+    ed0_fit = fit_ed0_for_cast(ds, init)
+    result = fit_cast(ds, init, "LuZ", ed0_fit)
+    assert result.kept.sum() == ds.sizes["time"]
+
+
 def test_fit_ed0_for_cast_no_clouds_gives_unit_correction():
     ds = _make_dataset()
     ed0_fit = fit_ed0_for_cast(ds, _make_init())

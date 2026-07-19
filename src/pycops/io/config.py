@@ -164,6 +164,120 @@ def info_cops_to_frame(entries: list[CastInfo]) -> pd.DataFrame:
     return pd.DataFrame([vars(e) for e in entries])
 
 
+# Verbatim header comment block from a real cops.go()-generated info.cops.dat
+# (local_data/AlgaeWISE/20220705_StationPME6/COPS/info.cops.dat) -- so a file
+# freshly created by update_time_window() looks like one the R package itself
+# would produce, joined with "\r\n" at write time to match real files' line
+# endings (see update_time_window).
+_INFO_COPS_DAT_HEADER = [
+    "#" * 135,
+    "#                           this file is a table with a maximum of 12 fields separated by \";\"                                         #",
+    "#" * 135,
+    "# the 8 first fields are mandatory                                                                                                    #",
+    "#" * 135,
+    "#-fields-- 1 2 3 4 ------#                                                                                                            #",
+    "#-------------------------                                                                                                            #",
+    "# field #1 : file name                                                                                                                #",
+    "# field #2 : longitude (decimal degs)                                                                                                 #",
+    "# field #3 : latitude (decimal degs)                                                                                                  #",
+    "# field #4 : a positive value, 0, 999, or NA                                                                                          #",
+    "#           if > 0, it is the chlorophyll concentration, which is used to calculate absorption at each wavelength (case 1 waters model)#",
+    "#           if = 0, the absorption coefficients for all wavelengths must be found in a file called absorption.cops.dat                #",
+    "#           if 999, the absorption coefficients are derived from Kd near the sea surface",
+    "#           if NA, no shadow correction                                                                                               #",
+    "#" * 135,
+    "#-fields-- 5 6 7 8 ------#                                                                                                            #",
+    "#-------------------------                                                                                                            #",
+    "# NB : fields 5 6 7 8 9 10 are defined for the whole cast in file init.cops.dat                                                       #",
+    "#      if no peculiar value is needed for an experiment, just put a \"x\" in the field, the value in init.cops.dat is kept              #",
+    "#-------------------------                                                                                                            #",
+    "# field #5 : time.window, 2 numeric values separated by \",\"; no space                                                                 #",
+    "# field #6 : sub.surface.removed.layer, N numeric separated by \",\"; no space (N is the number of optics instruments - respect order)   #",
+    "# field #7 : tiltmax, N numeric separated by \",\"; no space (N is the number of optics instruments - respect order)                     #",
+    "# field #8 : depth.interval.for.smoothing, N numeric separated by \",\"; no space (N is the number of optics instruments - respect order)#",
+    "# field #9 : linear.fit.Rsquared.threshold, N numeric separated by \",\"; no space (N is the number of optics instruments - respect order)#",
+    "# field #10 : linear.fit.max.delta.depth,  N numeric separated by \",\"; no space (N is the number of optics instruments - respect order)#",
+    "#",
+    "#",
+    "#" * 135,
+    "# 4 optional fields ( #11 #12 #13 and #14 ) : names of files containing dark measures                                                  #",
+    "#" * 135,
+    "# examples                                                                                                                            #",
+    "#110923_0237_001_data.txt;7.1;43.9;0.1;0,90;0.1,0.05,0.1;10,10,5;10,12,15;x;x;110923_0237_004_data.txt                                    #",
+    "#110923_0237_001_data.txt;7.1;43.9;0;x;0.1,0.05,0.1;x;x;x;x;110923_0237_004_data.txt;110923_0237_005_data.txt                             #",
+    "#110923_0237_001_data.txt;7.1;43.9;0.2;x;x;10,10,5;x;x;x                                                                           #",
+    "#" * 133 + " #",
+]
+
+
+def _format_time_window(time_window: tuple[float, float]) -> str:
+    start, end = time_window
+    return f"{start:g},{end:g}"
+
+
+def update_time_window(path: str | Path, file: str, time_window: tuple[float, float]) -> None:
+    """Write a per-cast ``time.window`` override into ``info.cops.dat``, touching only that field.
+
+    A surgical line-level edit rather than a full read-into-:class:`CastInfo`-then-rewrite-
+    everything round trip, so it never disturbs a row/field/comment it doesn't own -- real files
+    carry a large hand-written comment header, and other fields (e.g. ``dark_files``) round-trip
+    imperfectly through :func:`read_info_cops` today. Real ``info.cops.dat`` files are
+    CRLF-terminated; this preserves whatever line ending each existing line already has (untouched
+    lines round-trip byte-for-byte) rather than normalizing the whole file to ``\\n``.
+
+    If ``file`` already has a row, only its field 5 (``time.window``) is replaced -- padding the
+    row out to 5 fields with ``"x"`` first if it was shorter. If the file exists but has no row for
+    ``file``, one is appended (matching a real minimal row's shape: lon/lat/chl ``NA``, other
+    overrides ``"x"``). If ``path`` doesn't exist at all, it's created with the same header comment
+    block a real ``cops.go()``-generated file has, plus that one row.
+    """
+    path = Path(path)
+    formatted = _format_time_window(time_window)
+
+    if not path.exists():
+        row = f"{file};NA;NA;NA;{formatted};x;x;x;x;x"
+        content = "\r\n".join([*_INFO_COPS_DAT_HEADER, row]) + "\r\n"
+        path.write_text(content, newline="")
+        return
+
+    with path.open(newline="") as f:
+        text = f.read()
+    lines = text.splitlines(keepends=True)
+
+    found = False
+    for i, line in enumerate(lines):
+        content = line.splitlines()[0] if line else line
+        terminator = line[len(content) :]
+        stripped = content.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        fields = content.split(";")
+        if fields[0].strip() != file:
+            continue
+        if len(fields) <= 4:
+            fields += ["x"] * (5 - len(fields))
+        fields[4] = formatted
+        lines[i] = ";".join(fields) + terminator
+        found = True
+        break
+
+    if not found:
+        terminator = "\r\n"
+        for line in reversed(lines):
+            if line.endswith("\r\n"):
+                terminator = "\r\n"
+                break
+            if line.endswith("\n"):
+                terminator = "\n"
+                break
+        if lines and not lines[-1].endswith(("\n", "\r\n", "\r")):
+            lines[-1] += terminator
+        lines.append(f"{file};NA;NA;NA;{formatted};x;x;x;x;x{terminator}")
+
+    with path.open("w", newline="") as f:
+        f.write("".join(lines))
+
+
 def read_absorption_cops(path: str | Path) -> pd.DataFrame:
     """Parse an ``absorption.cops.dat`` file: one row of absorption a(lambda) per cast.
 

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
-from pycops.processing.depth import bin_by_depth, depth_grid, good_depth_mask
+from pycops.processing.depth import bin_by_depth, depth_grid, good_depth_mask, time_window_mask
 
 
 def test_depth_grid_matches_expected_adaptive_points():
@@ -83,3 +84,22 @@ def test_bin_by_depth_empty_bin_is_nan():
 
     assert np.isnan(binned[1])
     assert counts[1] == 0
+
+
+def test_time_window_mask_flags_scans_outside_window():
+    time = np.datetime64("2020-01-01T00:00:00") + np.arange(10) * np.timedelta64(1, "s")
+    mask = time_window_mask(time, (2.0, 6.0))
+    np.testing.assert_array_equal(mask, [False, False, True, True, True, True, True, False, False, False])
+
+
+def test_time_window_mask_no_restriction_when_window_covers_everything():
+    time = np.datetime64("2020-01-01T00:00:00") + np.arange(5) * np.timedelta64(1, "s")
+    mask = time_window_mask(time, (0.0, 100.0))
+    assert mask.all()
+
+
+def test_time_window_mask_degenerate_constant_timestamp_warns_and_keeps_all():
+    time = np.full(5, np.datetime64("2020-01-01T00:00:00"))
+    with pytest.warns(UserWarning, match="same timestamp"):
+        mask = time_window_mask(time, (0.0, 1.0))
+    assert mask.all()

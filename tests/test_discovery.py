@@ -105,6 +105,18 @@ def test_read_deployment_casts_sets_shallow_attr(tmp_path):
         assert ds.attrs["shallow"] is False
 
 
+def test_read_deployment_casts_sets_time_window_attr(tmp_path):
+    write_deployment(tmp_path)
+    deployment = discover_deployment(tmp_path)
+
+    result = read_deployment_casts(deployment, only_kept=False)
+
+    # cast 003 has "0,90" in info.cops.dat; casts 001/002 have "x" (no override).
+    assert result.datasets["WISE_CAST_003_190817_221636_URC.csv"].attrs["time_window"] == (0.0, 90.0)
+    assert result.datasets["WISE_CAST_001_190817_220856_URC.csv"].attrs["time_window"] is None
+    assert result.datasets["WISE_CAST_002_190817_221224_URC.csv"].attrs["time_window"] is None
+
+
 def test_read_deployment_casts_continues_after_one_bad_cast(tmp_path, recwarn):
     write_deployment_with_bad_cast(tmp_path)
     deployment = discover_deployment(tmp_path)

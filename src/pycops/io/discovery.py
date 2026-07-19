@@ -158,6 +158,7 @@ def read_deployment_casts(deployment: Deployment, only_kept: bool = True) -> Dep
                 qc_flag=record.selection.flag,
                 rrs_method=record.selection.method,
                 shallow=record.selection.shallow,
+                time_window=record.info.time_window,
             )
         except Exception as exc:  # noqa: BLE001 -- deliberately broad: isolate one bad cast from the rest
             error = f"{type(exc).__name__}: {exc}"

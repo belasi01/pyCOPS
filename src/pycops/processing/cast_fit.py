@@ -19,7 +19,7 @@ import xarray as xr
 from pycops.processing.aop_cleaning import secondary_clean
 from pycops.processing.attenuation import compute_K
 from pycops.processing.depth import depth_grid as build_depth_grid
-from pycops.processing.depth import good_depth_mask
+from pycops.processing.depth import good_depth_mask, time_window_mask
 from pycops.processing.detection_limits import detection_limit_for_waves
 from pycops.processing.ed0 import Ed0Fit, fit_ed0
 from pycops.processing.profile_fit import fit_profile_loess
@@ -29,15 +29,23 @@ from pycops.processing.tilt import tilt_mask
 _DEPTH_PROFILED_INSTRUMENTS = ("EdZ", "LuZ", "EuZ")
 
 
-def fit_ed0_for_cast(ds: xr.Dataset, init: dict[str, object]) -> Ed0Fit:
+def fit_ed0_for_cast(
+    ds: xr.Dataset, init: dict[str, object], time_window: tuple[float, float] | None = None
+) -> Ed0Fit:
     """Fit the above-water reference (Ed0) for a cast, per ``process.Ed0.R``.
 
     Its ``correction`` is the illumination-adjustment factor to apply to
     EdZ/LuZ/EuZ (see :func:`fit_cast`) before their own QC and fitting.
+    ``time_window``, if given, further restricts kept scans to those falling
+    within it (see :func:`pycops.processing.depth.time_window_mask`) --
+    resolved by the caller (see :func:`pycops.processing.process_cast.process_cast`),
+    not read from ``ds.attrs`` here.
     """
     waves = ds["wavelength"].values
     depth_ref = ds[f"{init['depth.is.on']}_Depth"].values
     depth_good = good_depth_mask(depth_ref)
+    if time_window is not None:
+        depth_good = depth_good & time_window_mask(ds["time"].values, time_window)
     ed0_tilt_ok = tilt_mask(ds, "Ed0", init["tiltmax.optics"]["Ed0"]).values
     kept = depth_good & ed0_tilt_ok
 
@@ -69,7 +77,13 @@ class InstrumentFit:
     surface_linear: SurfaceLinearFit
 
 
-def fit_cast(ds: xr.Dataset, init: dict[str, object], instrument: str, ed0_fit: Ed0Fit) -> InstrumentFit:
+def fit_cast(
+    ds: xr.Dataset,
+    init: dict[str, object],
+    instrument: str,
+    ed0_fit: Ed0Fit,
+    time_window: tuple[float, float] | None = None,
+) -> InstrumentFit:
     """Fit ``instrument`` (``"EdZ"``, ``"LuZ"``, or ``"EuZ"``) for one cast.
 
     Applies Ed0's illumination correction, tilt and depth QC, and the
@@ -77,7 +91,8 @@ def fit_cast(ds: xr.Dataset, init: dict[str, object], instrument: str, ed0_fit: 
     detection-limit masking, matching ``process.EdZ.R``/``process.LuZ.R``/
     ``process.EuZ.R``) and the near-surface log-linear extrapolation.
     ``ed0_fit`` comes from :func:`fit_ed0_for_cast` (shared across
-    instruments, computed once per cast).
+    instruments, computed once per cast). ``time_window``, if given, further
+    restricts kept scans (see :func:`fit_ed0_for_cast`).
     """
     if instrument not in _DEPTH_PROFILED_INSTRUMENTS:
         raise ValueError(f"instrument must be one of {_DEPTH_PROFILED_INSTRUMENTS}, got {instrument!r}")
@@ -85,6 +100,8 @@ def fit_cast(ds: xr.Dataset, init: dict[str, object], instrument: str, ed0_fit: 
     waves = ds["wavelength"].values
     depth_ref = ds[f"{init['depth.is.on']}_Depth"].values
     depth_good = good_depth_mask(depth_ref)
+    if time_window is not None:
+        depth_good = depth_good & time_window_mask(ds["time"].values, time_window)
 
     depth = depth_ref + init["delta.capteur.optics"][instrument]
     tilt_ok = tilt_mask(ds, instrument, init["tiltmax.optics"][instrument]).values

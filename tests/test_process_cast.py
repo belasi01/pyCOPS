@@ -65,6 +65,44 @@ def _make_init():
     }
 
 
+def _make_dataset_with_time(**kwargs):
+    ds = _make_dataset(**kwargs)
+    n = ds.sizes["time"]
+    time = np.datetime64("2020-01-01T00:00:00") + np.arange(n) * np.timedelta64(1, "s")
+    return ds.assign_coords(time=("time", time))
+
+
+def test_process_cast_resolves_time_window_from_ds_attrs():
+    ds = _make_dataset_with_time()
+    ds.attrs["time_window"] = (50.0, 250.0)
+    result = process_cast(ds, _make_init())
+
+    elapsed = np.arange(ds.sizes["time"])
+    outside = (elapsed < 50) | (elapsed > 250)
+    assert not result.instrument_fits["LuZ"].kept[outside].any()
+
+
+def test_process_cast_falls_back_to_init_time_window_when_ds_attrs_unset():
+    ds = _make_dataset_with_time()
+    init = _make_init()
+    init["time.window"] = [50.0, 250.0]
+    result = process_cast(ds, init)
+
+    elapsed = np.arange(ds.sizes["time"])
+    outside = (elapsed < 50) | (elapsed > 250)
+    assert not result.instrument_fits["LuZ"].kept[outside].any()
+
+
+def test_process_cast_ds_attrs_time_window_overrides_init_default():
+    ds = _make_dataset_with_time()
+    ds.attrs["time_window"] = (0.0, 299.0)  # per-cast override: keep (almost) everything
+    init = _make_init()
+    init["time.window"] = [50.0, 250.0]  # deployment default would exclude the edges
+    result = process_cast(ds, init)
+
+    assert result.instrument_fits["LuZ"].kept[0]  # not excluded by the (unused) init default
+
+
 def test_process_cast_fits_every_present_instrument():
     ds = _make_dataset(include_edz=True)
     result = process_cast(ds, _make_init())

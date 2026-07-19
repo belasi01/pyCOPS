@@ -10,6 +10,12 @@ dependencies = [
     "scipy>=1.17.1",
 ]
 
+[project.optional-dependencies]
+ui = ["streamlit>=1.35", "matplotlib>=3.8"]
+
+[project.scripts]
+pycops-clean = "pycops.ui.clean_app:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

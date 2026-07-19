@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import numpy as np
 import xarray as xr
 
+from pycops.processing.depth import time_window_mask
 from pycops.processing.profile_fit import fit_profile_loess
 from pycops.processing.tilt import compute_tilt
 
@@ -63,13 +64,13 @@ def process_bioshade(ds: xr.Dataset, init: dict[str, object]) -> BioShadeResult:
     """
     waves = ds["wavelength"].values
     ed0_all = ds["Ed0"].values
-    time_seconds = (ds["time"].values - ds["time"].values[0]) / np.timedelta64(1, "s")
+    time_seconds = (ds["time"].values - ds["time"].values.min()) / np.timedelta64(1, "s")
 
     tilt = compute_tilt(ds["Ed0_Roll"].values, ds["Ed0_Pitch"].values)
     tilt_ok = tilt < init["tiltmax.optics"]["Ed0"]
 
-    time_window = init.get("time.window", [0.0, 10000.0])
-    time_ok = (time_seconds >= time_window[0]) & (time_seconds <= time_window[1])
+    time_window = tuple(init.get("time.window", [0.0, 10000.0]))
+    time_ok = time_window_mask(ds["time"].values, time_window)
 
     kept = tilt_ok & time_ok
     ed0 = ed0_all[kept]
