@@ -133,7 +133,8 @@ def test_update_time_window_creates_missing_file(tmp_path):
     path = tmp_path / "info.cops.dat"
     update_time_window(path, "WISE_CAST_001_190817_220856_URC.csv", (10.0, 90.5))
 
-    text = path.read_text(newline="")
+    with path.open(newline="") as f:  # Path.read_text(newline=...) needs Python 3.13+
+        text = f.read()
     assert "\r\n" in text  # matches a real cops.go()-generated file
     assert "this file is a table with a maximum of 12 fields" in text  # header block present
 
