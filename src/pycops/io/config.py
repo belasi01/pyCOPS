@@ -105,8 +105,8 @@ class CastInfo:
     """One row of ``info.cops.dat``: a cast file's position and overrides."""
 
     file: str
-    longitude: float
-    latitude: float
+    longitude: float | None
+    latitude: float | None
     chl_flag: float | None
     time_window: tuple[float, float] | None
     sub_surface_removed_layer: list[float] | None
@@ -122,6 +122,11 @@ def _override(field: str) -> list[float] | None:
     return [float(v) for v in field.split(",")]
 
 
+def _optional_float(field: str) -> float | None:
+    field = field.strip()
+    return None if field.upper() == "NA" else float(field)
+
+
 def read_info_cops(path: str | Path) -> list[CastInfo]:
     """Parse an ``info.cops.dat`` file into one :class:`CastInfo` per cast."""
     path = Path(path)
@@ -135,15 +140,14 @@ def read_info_cops(path: str | Path) -> list[CastInfo]:
             fields = [f.strip() for f in line.split(";")]
             fields += [""] * (12 - len(fields))
 
-            chl_field = fields[3]
             time_window = _override(fields[4])
 
             entries.append(
                 CastInfo(
                     file=fields[0],
-                    longitude=float(fields[1]),
-                    latitude=float(fields[2]),
-                    chl_flag=None if chl_field.upper() == "NA" else float(chl_field),
+                    longitude=_optional_float(fields[1]),
+                    latitude=_optional_float(fields[2]),
+                    chl_flag=_optional_float(fields[3]),
                     time_window=tuple(time_window) if time_window else None,
                     sub_surface_removed_layer=_override(fields[5]),
                     tiltmax=_override(fields[6]),

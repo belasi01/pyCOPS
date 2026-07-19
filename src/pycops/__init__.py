@@ -1,5 +1,6 @@
 from pycops.io.discovery import CastReadFailure, DeploymentCastsResult, discover_deployment, read_deployment_casts
 from pycops.io.raw import read_cast
+from pycops.processing.deployment import CastProcessingFailure, DeploymentProcessingResult, process_deployment
 
 __all__ = [
     "read_cast",
@@ -7,4 +8,7 @@ __all__ = [
     "read_deployment_casts",
     "CastReadFailure",
     "DeploymentCastsResult",
+    "process_deployment",
+    "DeploymentProcessingResult",
+    "CastProcessingFailure",
 ]

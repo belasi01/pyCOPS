@@ -111,6 +111,18 @@ def test_read_info_cops(tmp_path):
     assert third.dark_files == ["dark_001.csv"]
 
 
+def test_read_info_cops_na_longitude_latitude(tmp_path):
+    # Real BaySYS station015 data has "NA" lon/lat -- position instead comes
+    # from a GPS_*.tsv file (not yet ported); this must not crash discovery.
+    path = tmp_path / "info.cops.dat"
+    path.write_text("hudsonbay_CAST_001_180605_194923_URC.csv;NA;NA;999;x;x;x;x\n")
+
+    entries = read_info_cops(path)
+
+    assert entries[0].longitude is None
+    assert entries[0].latitude is None
+
+
 ABSORPTION_COPS_DAT = """\
 cops.file;320;340;380;443
 WISE_CAST_001_190817_220856_URC.csv;9.2979;6.8733;3.8018;1.4911
