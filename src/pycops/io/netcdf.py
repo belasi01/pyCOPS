@@ -18,12 +18,15 @@ little redundancy for a much simpler schema.
 
 ``rrs_method``/``rrs_source``/``shadow_correction_note``/``longitude``/
 ``latitude`` (the latter two preferring ``CastResult.resolved_longitude``/
-``.resolved_latitude`` when shadow correction actually ran) are always
-written as global attrs, along with the QWIP/Forel-Ule scalar diagnostics
-(``qwip_loess_*``/``qwip_linear_*``) when available; nLw (``nlw_0p_loess``/
-``nlw_0p_linear``/``nlw_0p_recommended``) is written as a data variable
-alongside ``lw_0p``/``rrs_0p`` whenever it was computed (needs
-``init.cops.dat``'s ``bandwidth``, see :mod:`pycops.processing.nlw`).
+``.resolved_latitude`` when position/sun geometry actually resolved) are
+always written as global attrs, along with the QWIP/Forel-Ule scalar
+diagnostics (``qwip_loess_*``/``qwip_linear_*``) when available; nLw
+(``nlw_0p_loess``/``nlw_0p_linear``/``nlw_0p_recommended``) and
+``ed0_0m``/``r0m_loess``/``r0m_linear`` (see
+:mod:`pycops.processing.ed0_0m`) are written as data variables whenever
+they were computed (nLw needs ``init.cops.dat``'s ``bandwidth``, see
+:mod:`pycops.processing.nlw`; ``ed0_0m``/``r0m_*`` need EuZ present and
+position/sun-geometry to resolve).
 Passing the original ``ds`` (the cast read by
 :func:`pycops.io.raw.read_cast`) is optional but adds real value: the
 per-scan boolean ``kept`` mask and Ed0's per-scan illumination ``correction``
@@ -123,6 +126,13 @@ def cast_result_to_dataset(cast_result: CastResult, ds: xr.Dataset | None = None
         data_vars["rrs_0p_recommended"] = ("wavelength", cast_result.recommended_rrs.rrs_0p)
         if cast_result.recommended_rrs.nlw_0p is not None:
             data_vars["nlw_0p_recommended"] = ("wavelength", cast_result.recommended_rrs.nlw_0p)
+
+    if cast_result.ed0_0m is not None:
+        data_vars["ed0_0m"] = ("wavelength", cast_result.ed0_0m)
+    if cast_result.r0m_loess is not None:
+        data_vars["r0m_loess"] = ("wavelength", cast_result.r0m_loess)
+    if cast_result.r0m_linear is not None:
+        data_vars["r0m_linear"] = ("wavelength", cast_result.r0m_linear)
 
     for label, qwip in (("loess", cast_result.qwip_loess), ("linear", cast_result.qwip_linear)):
         if qwip is None:

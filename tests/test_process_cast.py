@@ -498,3 +498,62 @@ def test_process_cast_qwip_none_without_rrs():
 
     assert result.qwip_loess is None
     assert result.qwip_linear is None
+
+
+def test_process_cast_computes_ed0_0m_and_r0m_when_euz_present():
+    ds = _make_euz_dataset()
+    ds.attrs["chl_flag"] = 999.0
+    ds.attrs["longitude"] = -68.108833
+    ds.attrs["latitude"] = 49.13445
+
+    result = process_cast(ds, _make_init_euz_only())
+
+    assert result.ed0_0m is not None
+    assert result.r0m_loess is not None
+    assert result.r0m_linear is not None
+    euz_fit = result.instrument_fits["EuZ"]
+    euz_shadow = result.shadow_corrections["EuZ"]
+    expected_r0m_loess = (euz_fit.value_at_0 / euz_shadow.correction) / result.ed0_0m
+    np.testing.assert_allclose(result.r0m_loess, expected_r0m_loess, equal_nan=True)
+
+
+def test_process_cast_ed0_0m_available_even_when_chl_unavailable():
+    # Ed0.0m/R.0m only need position/sun geometry, not chl_flag (matches
+    # derived.data.R's sunzen computation, which is independent of chl too) --
+    # unlike shadow correction, which does need chl.
+    ds = _with_real_time(_make_euz_dataset())
+    ds.attrs["longitude"] = -68.108833
+    ds.attrs["latitude"] = 49.13445
+    # no chl_flag attr at all
+
+    result = process_cast(ds, _make_init_euz_only())
+
+    assert result.shadow_corrections == {}
+    assert result.shadow_correction_note is not None
+    assert result.ed0_0m is not None
+    assert result.r0m_loess is not None
+    assert result.resolved_longitude == -68.108833
+    assert result.resolved_latitude == 49.13445
+
+
+def test_process_cast_ed0_0m_none_without_euz():
+    ds = _with_real_time(_make_dataset())
+    ds.attrs["chl_flag"] = 999.0
+    ds.attrs["longitude"] = -68.108833
+    ds.attrs["latitude"] = 49.13445
+
+    result = process_cast(ds, _make_init())
+
+    assert result.ed0_0m is None
+    assert result.r0m_loess is None
+    assert result.r0m_linear is None
+
+
+def test_process_cast_ed0_0m_none_without_position():
+    ds = _make_euz_dataset()  # no position attrs at all
+
+    result = process_cast(ds, _make_init_euz_only())
+
+    assert result.ed0_0m is None
+    assert result.resolved_longitude is None
+    assert result.resolved_latitude is None

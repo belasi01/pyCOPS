@@ -5,12 +5,10 @@ Ties :func:`pycops.processing.cast_fit.fit_ed0_for_cast` and
 :func:`pycops.processing.cast_fit.fit_cast` together across all instruments
 in one cast, applies :func:`pycops.processing.shadow.shadow_correction` to
 LuZ/EuZ when the cast carries enough information for it, and computes
-:func:`pycops.processing.rrs.compute_rrs` (including nLw) plus the
-Forel-Ule/QWIP diagnostics. Equivalent to one iteration of
-``process.cops.R``'s per-cast loop followed by ``compute.aops.R`` -- except
-the Gregg & Carder-based ``Ed0.0m`` diffuse/direct split (used there only for
-the ``R.0m``/``R.0p`` subsurface-reflectance diagnostics, not for Rrs itself),
-which isn't ported yet.
+:func:`pycops.processing.rrs.compute_rrs` (including nLw), the Forel-Ule/QWIP
+diagnostics, and (when EuZ is present) ``Ed0.0m``/``R.0m`` (see
+:mod:`pycops.processing.ed0_0m`). Equivalent to one iteration of
+``process.cops.R``'s per-cast loop followed by ``compute.aops.R``.
 """
 
 from __future__ import annotations
@@ -24,6 +22,8 @@ import xarray as xr
 from pycops.processing.bioshade import BioShadeResult
 from pycops.processing.cast_fit import InstrumentFit, fit_cast, fit_ed0_for_cast
 from pycops.processing.ed0 import Ed0Fit
+from pycops.processing.ed0_0m import compute_ed0_subsurface
+from pycops.processing.gregg_carder import gregg_carder_diffuse_direct
 from pycops.processing.position import PositionOverride
 from pycops.processing.qfactor import compute_q_factor
 from pycops.processing.qwip import QWIPResult, compute_qwip
@@ -59,8 +59,11 @@ class CastResult:
     rrs_source: str | None  # "LuZ" or "EuZ" (via the Q factor) -- which instrument Rrs came from, if any
     qwip_loess: QWIPResult | None  # QWIP/Forel-Ule diagnostics on rrs_loess, if available
     qwip_linear: QWIPResult | None  # QWIP/Forel-Ule diagnostics on rrs_linear, if available
-    resolved_longitude: float | None  # position actually used for shadow correction, if it ran (may differ
-    resolved_latitude: float | None  # from ds.attrs -- e.g. resolved via position_override or a GPS file)
+    ed0_0m: np.ndarray | None  # Ed0(0-), diffuse/direct-decomposed -- diagnostic only, Rrs doesn't need it
+    r0m_loess: np.ndarray | None  # EuZ.0m(LOESS) / Ed0.0m -- subsurface irradiance reflectance
+    r0m_linear: np.ndarray | None  # EuZ.0m(linear) / Ed0.0m
+    resolved_longitude: float | None  # position actually used for shadow correction/Ed0.0m, if resolved
+    resolved_latitude: float | None  # (may differ from ds.attrs -- e.g. a position_override or GPS file)
 
 
 def _cast_sun_geometry(
@@ -78,6 +81,28 @@ def _cast_sun_geometry(
     return mean_time.dayofyear, zenith_deg
 
 
+def _resolve_sun_geometry(
+    ds: xr.Dataset, position_override: PositionOverride | None
+) -> tuple[float | None, float | None, int | None, float | None, str | None]:
+    """Cast position and sun geometry -- independent of ``chl``, shared by shadow correction and Ed0.0m.
+
+    Returns ``(lon, lat, julian_day, sun_zenith_deg, note)``; ``note`` explains why geometry
+    couldn't be resolved (``None`` on success). Matches ``derived.data.R``'s ``sunzen``/position
+    computation, which likewise doesn't depend on the ``chl`` field at all.
+    """
+    position_override = position_override or PositionOverride()
+    lon = position_override.longitude if position_override.longitude is not None else ds.attrs.get("longitude")
+    lat = position_override.latitude if position_override.latitude is not None else ds.attrs.get("latitude")
+    if lon is None or lat is None:
+        return None, None, None, None, "cast position (longitude/latitude) unavailable"
+
+    julian_day, sun_zenith_deg = _cast_sun_geometry(ds, lon, lat, position_override.utc_time)
+    if sun_zenith_deg < 0:
+        return lon, lat, julian_day, sun_zenith_deg, "sun below the horizon for this cast"
+
+    return lon, lat, julian_day, sun_zenith_deg, None
+
+
 def _shadow_correct_instruments(
     ds: xr.Dataset,
     init: dict[str, object],
@@ -87,21 +112,18 @@ def _shadow_correct_instruments(
     absorption_waves: np.ndarray | None,
     absorption_values: np.ndarray | None,
     bioshade: BioShadeResult | None,
-    position_override: PositionOverride | None,
-) -> tuple[dict[str, ShadowCorrectionResult], str | None, float | None, float | None]:
+    lon: float | None,
+    lat: float | None,
+    julian_day: int | None,
+    sun_zenith_deg: float | None,
+    geometry_note: str | None,
+) -> tuple[dict[str, ShadowCorrectionResult], str | None]:
+    if geometry_note is not None:
+        return {}, f"{geometry_note}: shadow correction not applied"
+
     chl = ds.attrs.get("chl_flag")
     if chl is None or (isinstance(chl, float) and np.isnan(chl)):
-        return {}, "chl unavailable or NA (info.cops.dat): shadow correction not applied", None, None
-
-    position_override = position_override or PositionOverride()
-    lon = position_override.longitude if position_override.longitude is not None else ds.attrs.get("longitude")
-    lat = position_override.latitude if position_override.latitude is not None else ds.attrs.get("latitude")
-    if lon is None or lat is None:
-        return {}, "cast position (longitude/latitude) unavailable: shadow correction not applied", None, None
-
-    julian_day, sun_zenith_deg = _cast_sun_geometry(ds, lon, lat, position_override.utc_time)
-    if sun_zenith_deg < 0:
-        return {}, "sun below the horizon for this cast: shadow correction not applied", lon, lat
+        return {}, "chl unavailable or NA (info.cops.dat): shadow correction not applied"
 
     results: dict[str, ShadowCorrectionResult] = {}
     note: str | None = None
@@ -137,7 +159,7 @@ def _shadow_correct_instruments(
             bioshade=bioshade,
         )
 
-    return results, note, lon, lat
+    return results, note
 
 
 def process_cast(
@@ -184,10 +206,14 @@ def process_cast(
     longitude/latitude actually got used (from the override, ``ds.attrs``, or
     -- when the caller is :func:`~pycops.processing.deployment.process_deployment`
     -- a GPS file) is recorded on ``CastResult.resolved_longitude``/
-    ``.resolved_latitude`` (``None`` if shadow correction never got that far),
+    ``.resolved_latitude`` (``None`` if position couldn't be resolved at all),
     since it can differ from ``ds.attrs`` and callers persisting this result
     (see :mod:`pycops.io.netcdf`) need the position actually used, not just
-    what ``info.cops.dat`` originally said.
+    what ``info.cops.dat`` originally said. Position/sun-geometry resolution
+    doesn't depend on ``chl_flag`` (matching ``derived.data.R``), so
+    ``resolved_longitude``/``.resolved_latitude`` can be set even when
+    ``shadow_correction_note`` explains shadow correction itself was skipped
+    for an unrelated (``chl``-only) reason.
 
     Rrs comes from LuZ when present (``rrs_source == "LuZ"``); for a cast with
     EuZ but no LuZ sensor, it's derived instead as ``LuZ.0m = EuZ.0m /
@@ -214,13 +240,25 @@ def process_cast(
     (``qwip_loess``/``qwip_linear``, see
     :func:`pycops.processing.qwip.compute_qwip`) -- ``None`` when the
     corresponding Rrs is unavailable.
+
+    When EuZ is present and position/sun-geometry resolve, ``CastResult``
+    also gets ``ed0_0m`` (``Ed0(0-)``, diffuse/direct-decomposed -- see
+    :mod:`pycops.processing.ed0_0m`) and ``r0m_loess``/``r0m_linear``
+    (subsurface irradiance reflectance, ``EuZ.0m / Ed0.0m``); diagnostic
+    only, since Rrs itself only ever needs ``Ed0.0p``. The diffuse/direct
+    split reuses whichever of LuZ's/EuZ's shadow correction succeeded (LuZ
+    preferred, matching ``compute.aops.R``'s block order when both are
+    present), or a fresh Gregg & Carder clear-sky estimate when neither did
+    -- unlike shadow correction, this doesn't require ``chl_flag``.
     """
     waves = ds["wavelength"].values
     ed0_fit = fit_ed0_for_cast(ds, init)
 
     instrument_fits = {instr: fit_cast(ds, init, instr, ed0_fit) for instr in _DEPTH_PROFILED_INSTRUMENTS if instr in ds}
 
-    shadow_corrections, shadow_correction_note, resolved_longitude, resolved_latitude = _shadow_correct_instruments(
+    lon, lat, julian_day, sun_zenith_deg, geometry_note = _resolve_sun_geometry(ds, position_override)
+
+    shadow_corrections, shadow_correction_note = _shadow_correct_instruments(
         ds,
         init,
         waves,
@@ -229,7 +267,11 @@ def process_cast(
         absorption_waves,
         absorption_values,
         bioshade,
-        position_override,
+        lon,
+        lat,
+        julian_day,
+        sun_zenith_deg,
+        geometry_note,
     )
 
     rrs_loess = rrs_linear = rrs_source = None
@@ -280,6 +322,30 @@ def process_cast(
     preferred_usable = preferred is not None and np.any(np.isfinite(preferred.rrs_0p))
     recommended_rrs = preferred if preferred_usable else fallback
 
+    ed0_0m = r0m_loess = r0m_linear = None
+    if geometry_note is None and "EuZ" in instrument_fits:
+        euz_fit = instrument_fits["EuZ"]
+        euz_value_at_0 = euz_fit.value_at_0
+        euz_value_at_surface = euz_fit.surface_linear.value_at_surface
+        euz_shadow = shadow_corrections.get("EuZ")
+        if euz_shadow is not None:
+            euz_value_at_0 = euz_value_at_0 / euz_shadow.correction
+            euz_value_at_surface = euz_value_at_surface / euz_shadow.correction
+
+        fed_dir_source = shadow_corrections.get("LuZ") or shadow_corrections.get("EuZ")
+        if fed_dir_source is not None:
+            edir, edif = fed_dir_source.edir, fed_dir_source.edif
+        else:
+            edif, edir = gregg_carder_diffuse_direct(julian_day, lon, lat, waves, sun_zenith_deg, ed0_fit.value_at_0)
+
+        windspeed_ms = init.get("windspeed_ms", 4.0)
+        ed0_sub = compute_ed0_subsurface(
+            ed0_fit.value_at_0, edir, edif, sun_zenith_deg, windspeed_ms, euz_value_at_0, euz_value_at_surface
+        )
+        ed0_0m = ed0_sub.ed0_0m
+        r0m_loess = ed0_sub.r0m_loess
+        r0m_linear = ed0_sub.r0m_linear
+
     return CastResult(
         waves=waves,
         ed0_fit=ed0_fit,
@@ -293,6 +359,9 @@ def process_cast(
         rrs_source=rrs_source,
         qwip_loess=qwip_loess,
         qwip_linear=qwip_linear,
-        resolved_longitude=resolved_longitude,
-        resolved_latitude=resolved_latitude,
+        ed0_0m=ed0_0m,
+        r0m_loess=r0m_loess,
+        r0m_linear=r0m_linear,
+        resolved_longitude=lon,
+        resolved_latitude=lat,
     )

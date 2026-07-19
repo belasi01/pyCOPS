@@ -17,7 +17,7 @@ import numpy as np
 
 from pycops.processing.bioshade import BioShadeResult
 from pycops.processing.cast_fit import InstrumentFit
-from pycops.processing.gregg_carder import clear_sky_irradiance
+from pycops.processing.gregg_carder import gregg_carder_diffuse_direct
 from pycops.processing.popt import chlorophyll_absorption
 
 # Gordon & Ding (1992) self-shading coefficients, port of shadow.data.R.
@@ -210,19 +210,7 @@ def shadow_correction(
         ed0_tot = np.interp(waves, bioshade.waves, bioshade.ed0_tot)
         edir = ed0_tot - edif
     else:
-        ix_490 = int(np.argmin(np.abs(waves - 490.0)))
-        ed0_0p = np.asarray(ed0_0p, dtype=float)
-
-        visibility = 25.0
-        egc = clear_sky_irradiance(julian_day, lon, lat, waves, sun_zenith_deg, visibility_km=visibility)
-        ratio = egc.ed[ix_490] * 100.0 / ed0_0p[ix_490]
-        while ratio > 1.05 and visibility > 0.5:
-            visibility -= 0.5
-            egc = clear_sky_irradiance(julian_day, lon, lat, waves, sun_zenith_deg, visibility_km=visibility)
-            ratio = egc.ed[ix_490] * 100.0 / ed0_0p[ix_490]
-
-        edif = egc.edif * 100.0
-        edir = egc.edir * 100.0
+        edif, edir = gregg_carder_diffuse_direct(julian_day, lon, lat, waves, sun_zenith_deg, ed0_0p)
 
     ratio_edsky_edsun = edif / edir
 

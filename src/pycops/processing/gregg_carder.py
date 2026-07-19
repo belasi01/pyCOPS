@@ -200,3 +200,33 @@ def clear_sky_irradiance(
     ed = edir + edif
 
     return ClearSkyIrradiance(waves=waves, edir=edir, edif=edif, ed=ed)
+
+
+def gregg_carder_diffuse_direct(
+    julian_day: int, lon: float, lat: float, waves: np.ndarray, sun_zenith_deg: float, ed0_0p: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Diffuse/direct clear-sky irradiance (``Edif``, ``Edir``), visibility-matched to ``Ed0.0p``.
+
+    Shared visibility-search used both by shadow correction
+    (:mod:`pycops.processing.shadow`) and the ``Ed0.0m`` diffuse/direct
+    decomposition (:mod:`pycops.processing.ed0_0m`) when no BioShade
+    measurement is available: starts at 25 km visibility and reduces it in
+    0.5 km steps until the model's clear-sky irradiance at 490 nm is within
+    5% of the cast's own measured ``Ed0.0p`` there (or visibility bottoms
+    out at 0.5 km), matching both ``shadow.correction.R`` and
+    ``compute.aops.R``'s ``no shadow correction`` branch, which use the
+    identical loop.
+    """
+    waves = np.asarray(waves, dtype=float)
+    ed0_0p = np.asarray(ed0_0p, dtype=float)
+    ix_490 = int(np.argmin(np.abs(waves - 490.0)))
+
+    visibility = 25.0
+    egc = clear_sky_irradiance(julian_day, lon, lat, waves, sun_zenith_deg, visibility_km=visibility)
+    ratio = egc.ed[ix_490] * 100.0 / ed0_0p[ix_490]
+    while ratio > 1.05 and visibility > 0.5:
+        visibility -= 0.5
+        egc = clear_sky_irradiance(julian_day, lon, lat, waves, sun_zenith_deg, visibility_km=visibility)
+        ratio = egc.ed[ix_490] * 100.0 / ed0_0p[ix_490]
+
+    return egc.edif * 100.0, egc.edir * 100.0

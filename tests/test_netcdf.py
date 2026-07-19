@@ -16,7 +16,7 @@ DELTA_CAPTEUR_LUZ = 0.238
 DELTA_CAPTEUR_EDZ = -0.05
 
 
-def _make_dataset(n=300, ed0_level=100.0, include_edz=True):
+def _make_dataset(n=300, ed0_level=100.0, include_edz=True, include_euz=False):
     sensor_depth = np.linspace(0.05, 6.0, n)
     waves = np.array(WAVES)
     K = np.array(K_TRUE)
@@ -43,6 +43,15 @@ def _make_dataset(n=300, ed0_level=100.0, include_edz=True):
             ("time", "wavelength"),
             np.array(EDZ_X0_TRUE)[None, :] * np.exp(-K[None, :] * edz_true_depth[:, None]),
         )
+    if include_euz:
+        euz_true_depth = sensor_depth + DELTA_CAPTEUR_LUZ
+        data_vars["EuZ"] = (
+            ("time", "wavelength"),
+            np.array(LUZ_X0_TRUE)[None, :] * np.exp(-K[None, :] * euz_true_depth[:, None]) * 3.0,
+        )
+        data_vars["EuZ_Roll"] = ("time", zeros)
+        data_vars["EuZ_Pitch"] = ("time", zeros)
+        data_vars["EuZ_Temp"] = ("time", np.full(n, 10.0))
 
     times = pd.date_range("2019-08-18T18:18:00", periods=n, freq="s")
     return xr.Dataset(data_vars, coords={"time": times, "wavelength": waves})
@@ -241,3 +250,29 @@ def test_write_cast_result_round_trips_qwip_and_nlw(tmp_path):
         np.testing.assert_allclose(reloaded["nlw_0p_linear"].values, result.rrs_linear.nlw_0p, equal_nan=True)
     finally:
         reloaded.close()
+
+
+def test_cast_result_to_dataset_writes_ed0_0m_and_r0m_when_euz_present():
+    ds = _make_dataset(include_euz=True)
+    ds.attrs["chl_flag"] = 999.0
+    ds.attrs["longitude"] = -68.108833
+    ds.attrs["latitude"] = 49.13445
+    result = process_cast(ds, _make_init())
+
+    out = cast_result_to_dataset(result, ds=ds)
+
+    assert result.ed0_0m is not None
+    assert "ed0_0m" in out.data_vars
+    assert "r0m_loess" in out.data_vars
+    assert "r0m_linear" in out.data_vars
+    np.testing.assert_allclose(out["ed0_0m"].values, result.ed0_0m, equal_nan=True)
+    np.testing.assert_allclose(out["r0m_loess"].values, result.r0m_loess, equal_nan=True)
+
+
+def test_cast_result_to_dataset_omits_ed0_0m_without_euz():
+    ds, result = _cast_result_with_shadow()
+    out = cast_result_to_dataset(result, ds=ds)
+
+    assert result.ed0_0m is None
+    assert "ed0_0m" not in out.data_vars
+    assert "r0m_loess" not in out.data_vars
