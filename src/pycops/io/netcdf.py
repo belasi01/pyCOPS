@@ -22,6 +22,12 @@ per-scan boolean ``kept`` mask and Ed0's per-scan illumination ``correction``
 get a real ``time`` coordinate instead of a bare integer index, and the
 cast's own position/QC attrs (``chl_flag``, ``longitude``, ``latitude``,
 ``qc_flag``, ``rrs_method``) are copied onto the output file's global attrs.
+
+:func:`write_deployment_result` writes every profile cast in a
+:class:`~pycops.processing.deployment.DeploymentProcessingResult` (from
+:func:`~pycops.processing.deployment.process_deployment`) to its own
+``<cast file stem>.nc`` in a target directory -- BioShade casts aren't
+written (they have no ``CastResult``, just a ``BioShadeResult``).
 """
 
 from __future__ import annotations
@@ -31,6 +37,7 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
+from pycops.processing.deployment import DeploymentProcessingResult
 from pycops.processing.process_cast import CastResult
 
 _DEPTH_PROFILED_INSTRUMENTS = ("EdZ", "LuZ", "EuZ")
@@ -129,3 +136,32 @@ def cast_result_to_dataset(cast_result: CastResult, ds: xr.Dataset | None = None
 def write_cast_result(cast_result: CastResult, path: str | Path, ds: xr.Dataset | None = None) -> None:
     """Write ``cast_result`` (see :func:`cast_result_to_dataset`) to a NetCDF file at ``path``."""
     cast_result_to_dataset(cast_result, ds=ds).to_netcdf(Path(path), engine="netcdf4")
+
+
+def write_deployment_result(
+    result: DeploymentProcessingResult,
+    directory: str | Path,
+    datasets: dict[str, xr.Dataset] | None = None,
+) -> dict[str, Path]:
+    """Write every cast in ``result.cast_results`` to its own NetCDF file in ``directory``.
+
+    ``directory`` is created if it doesn't exist. Each file is named
+    ``<cast file stem>.nc`` (e.g. ``hudsonbay_CAST_001_..._URC.csv`` ->
+    ``hudsonbay_CAST_001_..._URC.nc``). ``datasets``, if given -- typically
+    :attr:`~pycops.io.discovery.DeploymentCastsResult.datasets` from the same
+    :func:`~pycops.io.discovery.read_deployment_casts` call that fed
+    :func:`~pycops.processing.deployment.process_deployment` -- supplies the
+    original cast per file for the richer output :func:`write_cast_result`
+    can produce; a cast missing from it just gets no ``ds`` passed. Returns
+    the cast file name -> written path for every file actually written.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    written: dict[str, Path] = {}
+    for file, cast_result in result.cast_results.items():
+        path = directory / f"{Path(file).stem}.nc"
+        write_cast_result(cast_result, path, ds=(datasets or {}).get(file))
+        written[file] = path
+
+    return written
