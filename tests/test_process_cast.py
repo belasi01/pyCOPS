@@ -293,5 +293,39 @@ def test_process_cast_utc_time_override_changes_sun_geometry():
 
     finite = np.isfinite(normal.rrs_linear.rrs_0p) & np.isfinite(shifted.rrs_linear.rrs_0p)
     assert finite.any()
-    assert not np.allclose(normal.rrs_linear.rrs_0p[finite], shifted.rrs_linear.rrs_0p[finite]
+    assert not np.allclose(normal.rrs_linear.rrs_0p[finite], shifted.rrs_linear.rrs_0p[finite])
+
+
+def test_process_cast_resolved_position_matches_attrs_when_no_override():
+    ds = _with_real_time(_make_dataset())
+    ds.attrs["chl_flag"] = 999.0
+    ds.attrs["longitude"] = -68.108833
+    ds.attrs["latitude"] = 49.13445
+
+    result = process_cast(ds, _make_init())
+
+    assert result.resolved_longitude == -68.108833
+    assert result.resolved_latitude == 49.13445
+
+
+def test_process_cast_resolved_position_reflects_override_not_attrs():
+    ds = _with_real_time(_make_dataset())
+    ds.attrs["chl_flag"] = 999.0
+    ds.attrs["longitude"] = -68.108833
+    ds.attrs["latitude"] = 49.13445
+
+    result = process_cast(
+        ds, _make_init(), position_override=PositionOverride(longitude=10.0, latitude=-30.0)
     )
+
+    assert result.resolved_longitude == 10.0
+    assert result.resolved_latitude == -30.0
+
+
+def test_process_cast_resolved_position_none_when_shadow_correction_skipped():
+    ds = _with_real_time(_make_dataset())  # no chl_flag/position attrs at all
+
+    result = process_cast(ds, _make_init())
+
+    assert result.resolved_longitude is None
+    assert result.resolved_latitude is None

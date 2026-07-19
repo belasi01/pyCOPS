@@ -1,0 +1,131 @@
+"""Persist a :class:`~pycops.processing.process_cast.CastResult` to NetCDF.
+
+`xarray` + NetCDF (via the ``netCDF4`` engine) was chosen early in the
+project as the target in-repo data format -- self-describing, native support
+for the ``(time, wavelength, depth)`` structure of a cast, and interoperable
+with the R package's own ``ncdf4`` workflow -- but nothing wired it up until
+now. :func:`cast_result_to_dataset` packages every array in a ``CastResult``
+into one ``xarray.Dataset``; :func:`write_cast_result` writes it to disk.
+
+Each depth-profiled instrument (EdZ/LuZ/EuZ) gets its own depth dimension
+(``"<instrument>_depth"``) since :func:`~pycops.processing.depth.depth_grid`
+is built per instrument from that instrument's own kept scans and isn't
+guaranteed to match another instrument's grid length. ``KZ``/``K0`` are
+naturally one row shorter than ``depth_grid`` (they're aligned with
+``depth_grid[1:]``, see ``compute_K``); a leading NaN row is prepended so
+every per-instrument variable shares the same depth dimension, trading a
+little redundancy for a much simpler schema.
+
+Passing the original ``ds`` (the cast read by
+:func:`pycops.io.raw.read_cast`) is optional but adds real value: the
+per-scan boolean ``kept`` mask and Ed0's per-scan illumination ``correction``
+get a real ``time`` coordinate instead of a bare integer index, and the
+cast's own position/QC attrs (``chl_flag``, ``longitude``, ``latitude``,
+``qc_flag``, ``rrs_method``) are copied onto the output file's global attrs.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import xarray as xr
+
+from pycops.processing.process_cast import CastResult
+
+_DEPTH_PROFILED_INSTRUMENTS = ("EdZ", "LuZ", "EuZ")
+
+
+def _pad_leading_nan(array: np.ndarray) -> np.ndarray:
+    """Prepend one NaN row so a ``(n-1, n_waves)`` array aligns with an ``n``-point depth grid."""
+    pad = np.full((1, array.shape[1]), np.nan)
+    return np.concatenate([pad, array], axis=0)
+
+
+def cast_result_to_dataset(cast_result: CastResult, ds: xr.Dataset | None = None) -> xr.Dataset:
+    """Build one ``xarray.Dataset`` holding every array in ``cast_result``.
+
+    ``ds``, if given, is the original cast (from :func:`pycops.io.raw.read_cast`
+    or :func:`pycops.io.discovery.read_deployment_casts`) -- see the module
+    docstring for what it adds.
+    """
+    waves = np.asarray(cast_result.waves, dtype=float)
+    data_vars: dict[str, tuple] = {}
+    coords: dict[str, np.ndarray] = {"wavelength": waves}
+    attrs: dict[str, object] = {}
+
+    time_dim = "time"
+    time_coord = ds["time"].values if ds is not None else np.arange(cast_result.ed0_fit.correction.shape[0])
+    coords[time_dim] = time_coord
+
+    data_vars["ed0_value_at_0"] = ("wavelength", cast_result.ed0_fit.value_at_0)
+    data_vars["ed0_correction"] = ((time_dim, "wavelength"), cast_result.ed0_fit.correction)
+
+    for instrument, fit in cast_result.instrument_fits.items():
+        depth_dim = f"{instrument}_depth"
+        coords[depth_dim] = fit.depth_grid
+        attrs[f"{instrument}_idx_depth_0"] = fit.idx_depth_0
+
+        data_vars[f"{instrument}_fitted"] = ((depth_dim, "wavelength"), fit.aop_fitted)
+        data_vars[f"{instrument}_value_at_0"] = ("wavelength", fit.value_at_0)
+        data_vars[f"{instrument}_detection_limit"] = ("wavelength", fit.detection_limit)
+        data_vars[f"{instrument}_KZ"] = ((depth_dim, "wavelength"), _pad_leading_nan(fit.KZ))
+        data_vars[f"{instrument}_K0"] = ((depth_dim, "wavelength"), _pad_leading_nan(fit.K0))
+
+        linear = fit.surface_linear
+        data_vars[f"{instrument}_surface_value_at_surface"] = ("wavelength", linear.value_at_surface)
+        data_vars[f"{instrument}_surface_k_surf"] = ("wavelength", linear.k_surf)
+        data_vars[f"{instrument}_surface_z_interval"] = ("wavelength", linear.z_interval)
+        data_vars[f"{instrument}_surface_ix_z_interval"] = ("wavelength", linear.ix_z_interval)
+        data_vars[f"{instrument}_surface_r2"] = ("wavelength", linear.r2)
+        data_vars[f"{instrument}_surface_ks_pvalue"] = ("wavelength", linear.ks_pvalue)
+        data_vars[f"{instrument}_kept"] = (time_dim, fit.kept.astype(np.int8))
+
+    for instrument, shadow in cast_result.shadow_corrections.items():
+        data_vars[f"{instrument}_shadow_aR"] = ("wavelength", shadow.aR)
+        data_vars[f"{instrument}_shadow_edif"] = ("wavelength", shadow.edif)
+        data_vars[f"{instrument}_shadow_edir"] = ("wavelength", shadow.edir)
+        data_vars[f"{instrument}_shadow_ratio_edsky_edsun"] = ("wavelength", shadow.ratio_edsky_edsun)
+        data_vars[f"{instrument}_shadow_eps_sun"] = ("wavelength", shadow.eps_sun)
+        data_vars[f"{instrument}_shadow_eps_sky"] = ("wavelength", shadow.eps_sky)
+        data_vars[f"{instrument}_shadow_eps"] = ("wavelength", shadow.eps)
+        data_vars[f"{instrument}_shadow_correction"] = ("wavelength", shadow.correction)
+        data_vars[f"{instrument}_absorption"] = ("wavelength", shadow.absorption.values)
+        attrs[f"{instrument}_absorption_source"] = shadow.absorption.source
+
+    if cast_result.rrs_loess is not None:
+        data_vars["lw_0p_loess"] = ("wavelength", cast_result.rrs_loess.lw_0p)
+        data_vars["rrs_0p_loess"] = ("wavelength", cast_result.rrs_loess.rrs_0p)
+    if cast_result.rrs_linear is not None:
+        data_vars["lw_0p_linear"] = ("wavelength", cast_result.rrs_linear.lw_0p)
+        data_vars["rrs_0p_linear"] = ("wavelength", cast_result.rrs_linear.rrs_0p)
+    if cast_result.recommended_rrs is not None:
+        data_vars["lw_0p_recommended"] = ("wavelength", cast_result.recommended_rrs.lw_0p)
+        data_vars["rrs_0p_recommended"] = ("wavelength", cast_result.recommended_rrs.rrs_0p)
+
+    attrs["rrs_method"] = cast_result.rrs_method or ""
+    attrs["shadow_correction_note"] = cast_result.shadow_correction_note or ""
+
+    if ds is not None:
+        for key, missing in (("chl_flag", float("nan")), ("qc_flag", -1)):
+            value = ds.attrs.get(key)
+            attrs[key] = value if value is not None else missing
+
+    # Prefer the position actually used for shadow correction (may come from a
+    # PositionOverride or a GPS file via process_deployment(), and so can
+    # differ from ds.attrs) over the raw ds.attrs value from info.cops.dat.
+    longitude = cast_result.resolved_longitude
+    latitude = cast_result.resolved_latitude
+    if longitude is None and ds is not None:
+        longitude = ds.attrs.get("longitude")
+    if latitude is None and ds is not None:
+        latitude = ds.attrs.get("latitude")
+    attrs["longitude"] = longitude if longitude is not None else float("nan")
+    attrs["latitude"] = latitude if latitude is not None else float("nan")
+
+    return xr.Dataset(data_vars=data_vars, coords=coords, attrs=attrs)
+
+
+def write_cast_result(cast_result: CastResult, path: str | Path, ds: xr.Dataset | None = None) -> None:
+    """Write ``cast_result`` (see :func:`cast_result_to_dataset`) to a NetCDF file at ``path``."""
+    cast_result_to_dataset(cast_result, ds=ds).to_netcdf(Path(path), engine="netcdf4")

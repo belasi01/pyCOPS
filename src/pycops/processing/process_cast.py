@@ -53,6 +53,8 @@ class CastResult:
     rrs_linear: RrsResult | None  # from LuZ's linear-fitted surface value (shadow-corrected if available)
     rrs_method: str | None  # select.cops.dat's method for this cast, if known
     recommended_rrs: RrsResult | None  # rrs_loess or rrs_linear per rrs_method, whichever is available
+    resolved_longitude: float | None  # position actually used for shadow correction, if it ran (may differ
+    resolved_latitude: float | None  # from ds.attrs -- e.g. resolved via position_override or a GPS file)
 
 
 def _cast_sun_geometry(
@@ -80,20 +82,20 @@ def _shadow_correct_instruments(
     absorption_values: np.ndarray | None,
     bioshade: BioShadeResult | None,
     position_override: PositionOverride | None,
-) -> tuple[dict[str, ShadowCorrectionResult], str | None]:
+) -> tuple[dict[str, ShadowCorrectionResult], str | None, float | None, float | None]:
     chl = ds.attrs.get("chl_flag")
     if chl is None or (isinstance(chl, float) and np.isnan(chl)):
-        return {}, "chl unavailable or NA (info.cops.dat): shadow correction not applied"
+        return {}, "chl unavailable or NA (info.cops.dat): shadow correction not applied", None, None
 
     position_override = position_override or PositionOverride()
     lon = position_override.longitude if position_override.longitude is not None else ds.attrs.get("longitude")
     lat = position_override.latitude if position_override.latitude is not None else ds.attrs.get("latitude")
     if lon is None or lat is None:
-        return {}, "cast position (longitude/latitude) unavailable: shadow correction not applied"
+        return {}, "cast position (longitude/latitude) unavailable: shadow correction not applied", None, None
 
     julian_day, sun_zenith_deg = _cast_sun_geometry(ds, lon, lat, position_override.utc_time)
     if sun_zenith_deg < 0:
-        return {}, "sun below the horizon for this cast: shadow correction not applied"
+        return {}, "sun below the horizon for this cast: shadow correction not applied", lon, lat
 
     results: dict[str, ShadowCorrectionResult] = {}
     note: str | None = None
@@ -129,7 +131,7 @@ def _shadow_correct_instruments(
             bioshade=bioshade,
         )
 
-    return results, note
+    return results, note, lon, lat
 
 
 def process_cast(
@@ -171,7 +173,14 @@ def process_cast(
     directly instead of relying on ``ds.attrs``/``ds["time"]`` -- for a cast
     whose own GPS (and any GPS file) is unavailable or known to be wrong, a
     real recurring field situation. Any field left ``None`` on the override
-    falls back to the normal source for that field alone.
+    falls back to the normal source for that field alone. Whatever
+    longitude/latitude actually got used (from the override, ``ds.attrs``, or
+    -- when the caller is :func:`~pycops.processing.deployment.process_deployment`
+    -- a GPS file) is recorded on ``CastResult.resolved_longitude``/
+    ``.resolved_latitude`` (``None`` if shadow correction never got that far),
+    since it can differ from ``ds.attrs`` and callers persisting this result
+    (see :mod:`pycops.io.netcdf`) need the position actually used, not just
+    what ``info.cops.dat`` originally said.
 
     If ``ds`` came from :func:`~pycops.io.discovery.read_deployment_casts`, its
     ``rrs_method`` attr (from ``select.cops.dat``) picks ``recommended_rrs``
@@ -184,7 +193,7 @@ def process_cast(
 
     instrument_fits = {instr: fit_cast(ds, init, instr, ed0_fit) for instr in _DEPTH_PROFILED_INSTRUMENTS if instr in ds}
 
-    shadow_corrections, shadow_correction_note = _shadow_correct_instruments(
+    shadow_corrections, shadow_correction_note, resolved_longitude, resolved_latitude = _shadow_correct_instruments(
         ds,
         init,
         waves,
@@ -226,4 +235,6 @@ def process_cast(
         rrs_linear=rrs_linear,
         rrs_method=rrs_method,
         recommended_rrs=recommended_rrs,
+        resolved_longitude=resolved_longitude,
+        resolved_latitude=resolved_latitude,
     )
