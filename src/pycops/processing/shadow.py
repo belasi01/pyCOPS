@@ -2,9 +2,7 @@
 
 Ports ``shadow.data.R`` (Gordon & Ding 1992 coefficients), ``shadow.epsilon.R``
 (the self-shading error formula), and the absorption-resolution and
-orchestration logic of ``shadow.correction.R`` -- except the Morel &
-Maritorena chlorophyll-based absorption model (``info.cops.dat``'s ``chl`` a
-positive, non-999 value), which is not yet ported. The sky/sun diffuse-direct
+orchestration logic of ``shadow.correction.R``. The sky/sun diffuse-direct
 split needed here comes from a measured BioShade cast
 (:mod:`pycops.processing.bioshade`) when one is available for the deployment,
 falling back to the Gregg & Carder clear-sky model
@@ -20,6 +18,7 @@ import numpy as np
 from pycops.processing.bioshade import BioShadeResult
 from pycops.processing.cast_fit import InstrumentFit
 from pycops.processing.gregg_carder import clear_sky_irradiance
+from pycops.processing.popt import chlorophyll_absorption
 
 # Gordon & Ding (1992) self-shading coefficients, port of shadow.data.R.
 _GORDON_DING_ZENITH = np.array([0, 10, 20, 30, 40, 50, 60, 70, 80, 90], dtype=float)
@@ -70,7 +69,7 @@ class AbsorptionResult:
 
     waves: np.ndarray
     values: np.ndarray  # absorption coefficient a(lambda), 1/m
-    source: str  # "file", "kd", or "chlorophyll" (not yet implemented)
+    source: str  # "file", "kd", or "chlorophyll"
 
 
 def kd_derived_absorption(instrument: str, instrument_fits: dict[str, InstrumentFit]) -> np.ndarray:
@@ -140,9 +139,9 @@ def resolve_absorption(
       :func:`kd_derived_absorption`); ``instrument_fits`` is
       :attr:`~pycops.processing.process_cast.CastResult.instrument_fits` and ``waves`` is
       the cast's wavelength grid.
-    - ``chl > 0`` (an actual chlorophyll concentration): not yet ported (Morel &
-      Maritorena chlorophyll-based absorption model, ``popt.R``) -- raises
-      ``NotImplementedError``.
+    - ``chl > 0`` (an actual chlorophyll concentration): the Morel & Maritorena
+      case-1-waters absorption model (see
+      :func:`pycops.processing.popt.chlorophyll_absorption`).
     """
     if np.isnan(chl):
         return None
@@ -156,9 +155,8 @@ def resolve_absorption(
         values = kd_derived_absorption(instrument, instrument_fits)
         return AbsorptionResult(waves=np.asarray(waves, dtype=float), values=values, source="kd")
 
-    raise NotImplementedError(
-        "chlorophyll-based absorption (Morel & Maritorena, info.cops.dat chl > 0) is not yet ported"
-    )
+    values = chlorophyll_absorption(waves, chl)
+    return AbsorptionResult(waves=np.asarray(waves, dtype=float), values=values, source="chlorophyll")
 
 
 @dataclass(frozen=True)

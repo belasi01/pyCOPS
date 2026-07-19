@@ -137,10 +137,14 @@ def test_resolve_absorption_chl_999_uses_kd():
     assert result.values.shape == cast_result.waves.shape
 
 
-def test_resolve_absorption_chl_positive_not_implemented():
+def test_resolve_absorption_chl_positive_uses_chlorophyll_model():
     cast_result = _cast_result()
-    with pytest.raises(NotImplementedError):
-        resolve_absorption("LuZ", 2.5, cast_result.instrument_fits, cast_result.waves)
+    result = resolve_absorption("LuZ", 2.5, cast_result.instrument_fits, cast_result.waves)
+
+    assert result.source == "chlorophyll"
+    np.testing.assert_array_equal(result.waves, cast_result.waves)
+    assert result.values.shape == cast_result.waves.shape
+    assert np.all(result.values > 0)
 
 
 def test_kd_derived_absorption_finite_where_fits_succeed():

@@ -12,15 +12,22 @@ using the constant. ``popt.R`` isn't ported yet (see
 ``chl > 0`` gap for the shadow-correction absorption model) -- so this
 raises the same way, rather than silently pretending ``chl > 0`` works.
 
-Deliberate deviation from the R source: ``Q.and.f.factors.R`` only special-
-cases ``chl == 999`` before calling ``popt.f.Q`` -- for ``chl == 0`` it
-still calls ``popt.f.Q(..., log(0), ...)``, i.e. ``log(-Inf)``, seemingly an
-unexercised/unintended edge case (``chl == 0`` means "read absorption from
-``absorption.cops.dat``", per ``resolve_absorption``, not "no chlorophyll
-estimate available" in any sense ``popt.f.Q`` was designed around). Since
-``popt.R`` isn't ported anyway, there's nothing meaningful to reproduce
-there -- ``chl == 0`` defaults to the constant here too, consistently with
-every other ``chl`` value pycops's shadow correction already supports.
+``chl == 0`` handling here matches ``pycops``'s ``chl`` convention, not a
+literal read of ``Q.and.f.factors.R`` in isolation: that function's own
+``if(!is.na(chl)) { if (chl==999) ... else popt.f.Q(...) }`` *would* call
+``popt.f.Q`` for a raw ``chl == 0`` if invoked directly (confirmed by
+running it), but in the real pipeline it never actually sees a raw ``0`` --
+``process.cops.R`` reassigns ``chl <- NA`` (after loading
+``absorption.cops.dat`` into ``absorption.values``) for any cast whose
+*raw* ``info.cops.dat`` ``chl`` is ``0``, before ``chl`` is ever stored
+into the ``cops`` list that ``shadow.correction()``/``Q.and.f.factors()``
+receive. So a raw ``chl == 0`` and a raw ``chl == NA`` are indistinguishable
+by the time either function runs -- both see ``NA`` -- and both correctly
+default to the constant. ``pycops.io.discovery`` sets ``chl_flag`` from the
+*raw* ``info.cops.dat`` value (matching ``resolve_absorption``'s own
+``chl == 0`` file-based branch, which is keyed on the same raw value), so
+``compute_q_factor`` folding raw ``chl == 0`` into the constant-``pi`` case
+reproduces the real end-to-end pipeline behavior, not a deviation from it.
 
 The rest of ``Q.and.f.factors.R`` (``Q.0``, ``f.sun``, ``f.0``) isn't ported:
 nothing else in the pieces of the R package ported so far consumes them.
