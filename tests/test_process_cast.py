@@ -329,3 +329,104 @@ def test_process_cast_resolved_position_none_when_shadow_correction_skipped():
 
     assert result.resolved_longitude is None
     assert result.resolved_latitude is None
+
+
+def _make_euz_dataset(n=300, ed0_level=100.0):
+    sensor_depth = np.linspace(0.05, 6.0, n)
+    waves = np.array(WAVES)
+    K = np.array(K_TRUE)
+
+    euz_true_depth = sensor_depth + DELTA_CAPTEUR_LUZ  # reuse an arbitrary offset for EuZ too
+    euz = np.array(LUZ_X0_TRUE)[None, :] * np.exp(-K[None, :] * euz_true_depth[:, None])
+    edz_true_depth = sensor_depth + DELTA_CAPTEUR_EDZ
+    edz = np.array(EDZ_X0_TRUE)[None, :] * np.exp(-K[None, :] * edz_true_depth[:, None])
+
+    ed0 = np.full((n, len(waves)), ed0_level)
+    zeros = np.zeros(n)
+
+    times = pd.date_range("2019-08-18T18:18:00", periods=n, freq="s")
+    return xr.Dataset(
+        {
+            "Ed0": (("time", "wavelength"), ed0),
+            "EuZ": (("time", "wavelength"), euz),
+            "EdZ": (("time", "wavelength"), edz),
+            "Ed0_Roll": ("time", zeros),
+            "Ed0_Pitch": ("time", zeros),
+            "EdZ_Roll": ("time", zeros),
+            "EdZ_Pitch": ("time", zeros),
+            "EuZ_Roll": ("time", zeros),
+            "EuZ_Pitch": ("time", zeros),
+            "EdZ_Depth": ("time", sensor_depth),
+            "EuZ_Temp": ("time", np.full(n, 10.0)),
+        },
+        coords={"time": times, "wavelength": waves},
+    )
+
+
+def _make_init_euz_only():
+    init = _make_init()
+    init["depth.is.on"] = "EdZ"
+    return init
+
+
+def test_process_cast_computes_rrs_from_euz_when_no_luz():
+    ds = _make_euz_dataset()
+    result = process_cast(ds, _make_init_euz_only())
+
+    assert set(result.instrument_fits) == {"EdZ", "EuZ"}
+    assert result.rrs_source == "EuZ"
+    assert result.rrs_loess is not None
+    assert result.rrs_linear is not None
+    assert np.all(result.rrs_linear.rrs_0p[2:] > 0)
+    assert np.all(np.isfinite(result.rrs_linear.rrs_0p[2:]))
+
+
+def test_process_cast_euz_derived_rrs_matches_manual_q_factor_division():
+    ds = _make_euz_dataset()
+    result = process_cast(ds, _make_init_euz_only())
+
+    euz_fit = result.instrument_fits["EuZ"]
+    expected = compute_rrs(
+        euz_fit.surface_linear.value_at_surface / np.pi,
+        result.ed0_fit.value_at_0,
+        1.34,
+        0.043,
+    )
+    np.testing.assert_allclose(result.rrs_linear.rrs_0p, expected.rrs_0p, equal_nan=True)
+
+
+def test_process_cast_rrs_source_is_luz_when_both_present():
+    ds = _make_euz_dataset()
+    ds["LuZ"] = ds["EuZ"]  # both present -- LuZ must still win
+    result = process_cast(ds, _make_init_euz_only())
+
+    assert result.rrs_source == "LuZ"
+
+
+def test_process_cast_euz_only_shadow_corrected_before_q_division():
+    ds = _with_real_time(_make_euz_dataset())
+    ds.attrs["chl_flag"] = 999.0
+    ds.attrs["longitude"] = -68.108833
+    ds.attrs["latitude"] = 49.13445
+
+    result = process_cast(ds, _make_init_euz_only())
+
+    assert result.rrs_source == "EuZ"
+    assert "EuZ" in result.shadow_corrections
+    euz_fit = result.instrument_fits["EuZ"]
+    euz_shadow = result.shadow_corrections["EuZ"]
+    corrected = (euz_fit.surface_linear.value_at_surface / euz_shadow.correction) / np.pi
+    expected = compute_rrs(corrected, result.ed0_fit.value_at_0, 1.34, 0.043)
+    np.testing.assert_allclose(result.rrs_linear.rrs_0p, expected.rrs_0p, equal_nan=True)
+
+
+def test_process_cast_euz_only_positive_chl_leaves_rrs_none():
+    ds = _make_euz_dataset()
+    ds.attrs["chl_flag"] = 2.5  # real chlorophyll concentration -- Q factor not ported
+
+    result = process_cast(ds, _make_init_euz_only())
+
+    assert result.rrs_source is None
+    assert result.rrs_loess is None
+    assert result.rrs_linear is None
+    assert set(result.instrument_fits) == {"EdZ", "EuZ"}  # fitting itself is unaffected

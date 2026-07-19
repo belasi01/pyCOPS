@@ -16,12 +16,15 @@ naturally one row shorter than ``depth_grid`` (they're aligned with
 every per-instrument variable shares the same depth dimension, trading a
 little redundancy for a much simpler schema.
 
-Passing the original ``ds`` (the cast read by
+``rrs_method``/``rrs_source``/``shadow_correction_note``/``longitude``/
+``latitude`` (the latter two preferring ``CastResult.resolved_longitude``/
+``.resolved_latitude`` when shadow correction actually ran) are always
+written as global attrs. Passing the original ``ds`` (the cast read by
 :func:`pycops.io.raw.read_cast`) is optional but adds real value: the
 per-scan boolean ``kept`` mask and Ed0's per-scan illumination ``correction``
-get a real ``time`` coordinate instead of a bare integer index, and the
-cast's own position/QC attrs (``chl_flag``, ``longitude``, ``latitude``,
-``qc_flag``, ``rrs_method``) are copied onto the output file's global attrs.
+get a real ``time`` coordinate instead of a bare integer index, and
+``chl_flag``/``qc_flag`` are additionally copied onto the global attrs, along
+with ``longitude``/``latitude`` when they weren't otherwise resolved.
 
 :func:`write_deployment_result` writes every profile cast in a
 :class:`~pycops.processing.deployment.DeploymentProcessingResult` (from
@@ -111,6 +114,7 @@ def cast_result_to_dataset(cast_result: CastResult, ds: xr.Dataset | None = None
         data_vars["rrs_0p_recommended"] = ("wavelength", cast_result.recommended_rrs.rrs_0p)
 
     attrs["rrs_method"] = cast_result.rrs_method or ""
+    attrs["rrs_source"] = cast_result.rrs_source or ""
     attrs["shadow_correction_note"] = cast_result.shadow_correction_note or ""
 
     if ds is not None:

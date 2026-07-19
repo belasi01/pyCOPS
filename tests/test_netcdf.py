@@ -189,3 +189,11 @@ def test_cast_result_to_dataset_longitude_nan_when_unresolved():
 
     assert np.isnan(out.attrs["longitude"])
     assert np.isnan(out.attrs["latitude"])
+
+
+def test_cast_result_to_dataset_records_rrs_source():
+    ds, result = _cast_result_with_shadow()
+    out = cast_result_to_dataset(result, ds=ds)
+
+    assert result.rrs_source == "LuZ"
+    assert out.attrs["rrs_source"] == "LuZ"

@@ -7,9 +7,9 @@ in one cast, applies :func:`pycops.processing.shadow.shadow_correction` to
 LuZ/EuZ when the cast carries enough information for it, and computes
 :func:`pycops.processing.rrs.compute_rrs`. Equivalent to one iteration of
 ``process.cops.R``'s per-cast loop followed by ``compute.aops.R`` -- except
-the Gregg & Carder-based ``Ed0.0m`` diffuse/direct split and Q/f BRDF factors,
-so a EuZ-only cast (no LuZ) still can't produce Rrs (that needs the Q/f-based
-EuZ-to-LuZ conversion).
+the Gregg & Carder-based ``Ed0.0m`` diffuse/direct split (used there only for
+the ``R.0m``/``R.0p`` subsurface-reflectance diagnostics, not for Rrs itself)
+and nLw/FU/QWIP diagnostics, none of which are ported yet.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from pycops.processing.bioshade import BioShadeResult
 from pycops.processing.cast_fit import InstrumentFit, fit_cast, fit_ed0_for_cast
 from pycops.processing.ed0 import Ed0Fit
 from pycops.processing.position import PositionOverride
+from pycops.processing.qfactor import compute_q_factor
 from pycops.processing.rrs import RrsResult, compute_rrs
 from pycops.processing.shadow import ShadowCorrectionResult, resolve_absorption, shadow_correction
 from pycops.processing.solar import sun_position
@@ -49,10 +50,11 @@ class CastResult:
     instrument_fits: dict[str, InstrumentFit]
     shadow_corrections: dict[str, ShadowCorrectionResult]  # by instrument ("LuZ"/"EuZ"), whichever succeeded
     shadow_correction_note: str | None  # why shadow correction wasn't applied to some/all instruments, if so
-    rrs_loess: RrsResult | None  # from LuZ's LOESS-fitted surface value (shadow-corrected if available)
-    rrs_linear: RrsResult | None  # from LuZ's linear-fitted surface value (shadow-corrected if available)
+    rrs_loess: RrsResult | None  # from LuZ's (or EuZ-derived) LOESS-fitted surface value
+    rrs_linear: RrsResult | None  # from LuZ's (or EuZ-derived) linear-fitted surface value
     rrs_method: str | None  # select.cops.dat's method for this cast, if known
     recommended_rrs: RrsResult | None  # rrs_loess or rrs_linear per rrs_method, whichever is available
+    rrs_source: str | None  # "LuZ" or "EuZ" (via the Q factor) -- which instrument Rrs came from, if any
     resolved_longitude: float | None  # position actually used for shadow correction, if it ran (may differ
     resolved_latitude: float | None  # from ds.attrs -- e.g. resolved via position_override or a GPS file)
 
@@ -159,7 +161,8 @@ def process_cast(
     Whenever any of that is missing, or ``chl_flag`` is a positive chlorophyll
     value (not yet ported), shadow correction is skipped for the affected
     instrument(s) and ``shadow_correction_note`` explains why -- ``rrs_loess``/
-    ``rrs_linear`` then fall back to the uncorrected LuZ surface values.
+    ``rrs_linear`` then fall back to the uncorrected LuZ (or EuZ-derived)
+    surface values.
 
     ``bioshade``, if given, is a :func:`~pycops.processing.bioshade.process_bioshade`
     result from a BioShade shadow-band cast (``select.cops.dat`` flag ``2``) in
@@ -182,11 +185,21 @@ def process_cast(
     (see :mod:`pycops.io.netcdf`) need the position actually used, not just
     what ``info.cops.dat`` originally said.
 
+    Rrs comes from LuZ when present (``rrs_source == "LuZ"``); for a cast with
+    EuZ but no LuZ sensor, it's derived instead as ``LuZ.0m = EuZ.0m /
+    Q.sun.nadir`` (``rrs_source == "EuZ"``, see
+    :func:`pycops.processing.qfactor.compute_q_factor` -- ``Q.sun.nadir`` is
+    the constant ``pi`` for every ``chl_flag`` pycops's shadow correction
+    already supports; a genuine ``chl_flag > 0`` isn't ported, in which case
+    Rrs is left ``None`` rather than raising, same as a cast with neither
+    instrument). Shadow correction, when available, is applied to whichever
+    instrument Rrs is derived from before the Q-factor conversion.
+
     If ``ds`` came from :func:`~pycops.io.discovery.read_deployment_casts`, its
     ``rrs_method`` attr (from ``select.cops.dat``) picks ``recommended_rrs``
     between ``rrs_loess`` and ``rrs_linear``, falling back to whichever is
-    available if the preferred one is missing (e.g. no LuZ) or ``None`` (the
-    surface fit failed for every wavelength).
+    available if the preferred one is missing (e.g. no LuZ or EuZ) or
+    ``None`` (the surface fit failed for every wavelength).
     """
     waves = ds["wavelength"].values
     ed0_fit = fit_ed0_for_cast(ds, init)
@@ -205,19 +218,38 @@ def process_cast(
         position_override,
     )
 
-    rrs_loess = rrs_linear = None
+    rrs_loess = rrs_linear = rrs_source = None
     if "LuZ" in instrument_fits:
+        rrs_source = "LuZ"
         luz_fit = instrument_fits["LuZ"]
-        indice_water = init["indice.water"]
-        rau_fresnel = init["rau.Fresnel"]
-
         luz_value_at_0 = luz_fit.value_at_0
         luz_value_at_surface = luz_fit.surface_linear.value_at_surface
         luz_shadow = shadow_corrections.get("LuZ")
         if luz_shadow is not None:
             luz_value_at_0 = luz_value_at_0 / luz_shadow.correction
             luz_value_at_surface = luz_value_at_surface / luz_shadow.correction
+    elif "EuZ" in instrument_fits:
+        try:
+            q_factor = compute_q_factor(ds.attrs.get("chl_flag"), len(waves))
+        except NotImplementedError:
+            luz_value_at_0 = luz_value_at_surface = None
+        else:
+            rrs_source = "EuZ"
+            euz_fit = instrument_fits["EuZ"]
+            euz_value_at_0 = euz_fit.value_at_0
+            euz_value_at_surface = euz_fit.surface_linear.value_at_surface
+            euz_shadow = shadow_corrections.get("EuZ")
+            if euz_shadow is not None:
+                euz_value_at_0 = euz_value_at_0 / euz_shadow.correction
+                euz_value_at_surface = euz_value_at_surface / euz_shadow.correction
+            luz_value_at_0 = euz_value_at_0 / q_factor
+            luz_value_at_surface = euz_value_at_surface / q_factor
+    else:
+        luz_value_at_0 = luz_value_at_surface = None
 
+    if luz_value_at_0 is not None:
+        indice_water = init["indice.water"]
+        rau_fresnel = init["rau.Fresnel"]
         rrs_loess = compute_rrs(luz_value_at_0, ed0_fit.value_at_0, indice_water, rau_fresnel)
         rrs_linear = compute_rrs(luz_value_at_surface, ed0_fit.value_at_0, indice_water, rau_fresnel)
 
@@ -235,6 +267,7 @@ def process_cast(
         rrs_linear=rrs_linear,
         rrs_method=rrs_method,
         recommended_rrs=recommended_rrs,
+        rrs_source=rrs_source,
         resolved_longitude=resolved_longitude,
         resolved_latitude=resolved_latitude,
     )
