@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from pycops.processing.bioshade import BioShadeResult
 from pycops.processing.process_cast import process_cast
 from pycops.processing.rrs import compute_rrs
 
@@ -216,3 +217,32 @@ def test_process_cast_shadow_correction_chl_zero_needs_absorption_table():
 
     assert result.shadow_corrections == {}
     assert result.shadow_correction_note is not None
+
+
+def test_process_cast_uses_bioshade_split_when_given():
+    ds = _with_real_time(_make_dataset())
+    ds.attrs["chl_flag"] = 999.0
+    ds.attrs["longitude"] = -68.108833
+    ds.attrs["latitude"] = 49.13445
+
+    waves = np.array(WAVES)
+    ed0_dif = np.array([20.0, 18.0, 12.0, 6.0])
+    ed0_tot = np.array([80.0, 70.0, 50.0, 25.0])
+    bioshade = BioShadeResult(
+        waves=waves, ed0_tot=ed0_tot, ed0_dif=ed0_dif, ed0_diffuse_fraction=ed0_dif / ed0_tot
+    )
+
+    result = process_cast(ds, _make_init(), bioshade=bioshade)
+    without_bioshade = process_cast(ds, _make_init())
+
+    assert result.shadow_correction_note is None
+    assert "LuZ" in result.shadow_corrections
+    np.testing.assert_allclose(result.shadow_corrections["LuZ"].edif, ed0_dif)
+    np.testing.assert_allclose(result.shadow_corrections["LuZ"].edir, ed0_tot - ed0_dif)
+
+    # the measured split must actually change the correction vs. the Gregg & Carder fallback
+    finite = np.isfinite(result.rrs_linear.rrs_0p) & np.isfinite(without_bioshade.rrs_linear.rrs_0p)
+    assert finite.any()
+    assert not np.allclose(
+        result.rrs_linear.rrs_0p[finite], without_bioshade.rrs_linear.rrs_0p[finite]
+    )

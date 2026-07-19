@@ -4,10 +4,11 @@ Ports ``shadow.data.R`` (Gordon & Ding 1992 coefficients), ``shadow.epsilon.R``
 (the self-shading error formula), and the absorption-resolution and
 orchestration logic of ``shadow.correction.R`` -- except the Morel &
 Maritorena chlorophyll-based absorption model (``info.cops.dat``'s ``chl`` a
-positive, non-999 value) and BioShade shadow-band measurements, neither of
-which is ported yet. Without BioShade data, the diffuse/direct split needed
-here always comes from the Gregg & Carder clear-sky model
-(:mod:`pycops.processing.gregg_carder`).
+positive, non-999 value), which is not yet ported. The sky/sun diffuse-direct
+split needed here comes from a measured BioShade cast
+(:mod:`pycops.processing.bioshade`) when one is available for the deployment,
+falling back to the Gregg & Carder clear-sky model
+(:mod:`pycops.processing.gregg_carder`) otherwise.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from pycops.processing.bioshade import BioShadeResult
 from pycops.processing.cast_fit import InstrumentFit
 from pycops.processing.gregg_carder import clear_sky_irradiance
 
@@ -184,33 +186,46 @@ def shadow_correction(
     lon: float,
     lat: float,
     ed0_0p: np.ndarray,
+    bioshade: BioShadeResult | None = None,
 ) -> ShadowCorrectionResult:
     """Self-shading correction factor for ``instrument`` at ``waves``.
 
     ``absorption`` comes from :func:`resolve_absorption`; ``radius_m`` is the
     instrument's radius (``radius.instrument.optics`` in ``init.cops.dat``).
-    The sky/sun diffuse-direct split always comes from the Gregg & Carder
-    clear-sky model here (no BioShade support yet), with the same
-    visibility-search ``shadow.correction.R`` uses to match the model's total
-    irradiance at 490 nm to the cast's own measured ``Ed0.0p``.
+
+    When ``bioshade`` is given (a processed BioShade cast from the same
+    deployment -- see :func:`pycops.processing.bioshade.process_bioshade`),
+    the sky/sun diffuse-direct split uses its measured values, matching
+    ``shadow.correction.R``'s ``SB`` branch (``Edif = Ed0.dif``,
+    ``Edir = Ed0.tot - Edif``); ``julian_day``, ``lon``, ``lat``, and
+    ``ed0_0p`` are then unused. Otherwise the split comes from the Gregg &
+    Carder clear-sky model, with the same visibility-search
+    ``shadow.correction.R`` uses to match the model's total irradiance at
+    490 nm to the cast's own measured ``Ed0.0p``.
     """
     waves = np.asarray(waves, dtype=float)
     a_interp = np.interp(waves, absorption.waves, absorption.values)
     aR = a_interp * radius_m
 
-    ix_490 = int(np.argmin(np.abs(waves - 490.0)))
-    ed0_0p = np.asarray(ed0_0p, dtype=float)
+    if bioshade is not None:
+        edif = np.interp(waves, bioshade.waves, bioshade.ed0_dif)
+        ed0_tot = np.interp(waves, bioshade.waves, bioshade.ed0_tot)
+        edir = ed0_tot - edif
+    else:
+        ix_490 = int(np.argmin(np.abs(waves - 490.0)))
+        ed0_0p = np.asarray(ed0_0p, dtype=float)
 
-    visibility = 25.0
-    egc = clear_sky_irradiance(julian_day, lon, lat, waves, sun_zenith_deg, visibility_km=visibility)
-    ratio = egc.ed[ix_490] * 100.0 / ed0_0p[ix_490]
-    while ratio > 1.05 and visibility > 0.5:
-        visibility -= 0.5
+        visibility = 25.0
         egc = clear_sky_irradiance(julian_day, lon, lat, waves, sun_zenith_deg, visibility_km=visibility)
         ratio = egc.ed[ix_490] * 100.0 / ed0_0p[ix_490]
+        while ratio > 1.05 and visibility > 0.5:
+            visibility -= 0.5
+            egc = clear_sky_irradiance(julian_day, lon, lat, waves, sun_zenith_deg, visibility_km=visibility)
+            ratio = egc.ed[ix_490] * 100.0 / ed0_0p[ix_490]
 
-    edif = egc.edif * 100.0
-    edir = egc.edir * 100.0
+        edif = egc.edif * 100.0
+        edir = egc.edir * 100.0
+
     ratio_edsky_edsun = edif / edir
 
     epss = shadow_epsilon(instrument, aR, sun_zenith_deg, ratio_edsky_edsun)

@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from pycops.processing.bioshade import BioShadeResult
 from pycops.processing.cast_fit import InstrumentFit, fit_cast, fit_ed0_for_cast
 from pycops.processing.ed0 import Ed0Fit
 from pycops.processing.rrs import RrsResult, compute_rrs
@@ -69,6 +70,7 @@ def _shadow_correct_instruments(
     ed0_0p: np.ndarray,
     absorption_waves: np.ndarray | None,
     absorption_values: np.ndarray | None,
+    bioshade: BioShadeResult | None,
 ) -> tuple[dict[str, ShadowCorrectionResult], str | None]:
     chl = ds.attrs.get("chl_flag")
     if chl is None or (isinstance(chl, float) and np.isnan(chl)):
@@ -114,6 +116,7 @@ def _shadow_correct_instruments(
             lon=lon,
             lat=lat,
             ed0_0p=ed0_0p,
+            bioshade=bioshade,
         )
 
     return results, note
@@ -124,6 +127,7 @@ def process_cast(
     init: dict[str, object],
     absorption_waves: np.ndarray | None = None,
     absorption_values: np.ndarray | None = None,
+    bioshade: BioShadeResult | None = None,
 ) -> CastResult:
     """Fit Ed0 plus every depth-profiled instrument present in ``ds``, shadow-correct, and Rrs/Lw.
 
@@ -144,6 +148,14 @@ def process_cast(
     instrument(s) and ``shadow_correction_note`` explains why -- ``rrs_loess``/
     ``rrs_linear`` then fall back to the uncorrected LuZ surface values.
 
+    ``bioshade``, if given, is a :func:`~pycops.processing.bioshade.process_bioshade`
+    result from a BioShade shadow-band cast (``select.cops.dat`` flag ``2``) in
+    the same deployment folder as ``ds``; it's the caller's job to find and
+    process that sibling cast (e.g. via :func:`~pycops.io.discovery.discover_deployment`)
+    since ``process_cast`` only ever sees one cast at a time. When present, it
+    replaces the Gregg & Carder clear-sky estimate with the measured
+    diffuse/direct split for every shadow-corrected instrument on this cast.
+
     If ``ds`` came from :func:`~pycops.io.discovery.read_deployment_casts`, its
     ``rrs_method`` attr (from ``select.cops.dat``) picks ``recommended_rrs``
     between ``rrs_loess`` and ``rrs_linear``, falling back to whichever is
@@ -156,7 +168,7 @@ def process_cast(
     instrument_fits = {instr: fit_cast(ds, init, instr, ed0_fit) for instr in _DEPTH_PROFILED_INSTRUMENTS if instr in ds}
 
     shadow_corrections, shadow_correction_note = _shadow_correct_instruments(
-        ds, init, waves, instrument_fits, ed0_fit.value_at_0, absorption_waves, absorption_values
+        ds, init, waves, instrument_fits, ed0_fit.value_at_0, absorption_waves, absorption_values, bioshade
     )
 
     rrs_loess = rrs_linear = None

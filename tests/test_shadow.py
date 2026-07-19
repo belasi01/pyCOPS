@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import xarray as xr
 
+from pycops.processing.bioshade import BioShadeResult
 from pycops.processing.process_cast import process_cast
 from pycops.processing.shadow import (
     kd_derived_absorption,
@@ -170,3 +171,46 @@ def test_shadow_correction_end_to_end_sane_values():
     assert np.all((result.correction[finite] > 0) & (result.correction[finite] <= 1))
     assert np.all(result.edif[np.isfinite(result.edif)] > 0)
     assert np.all(result.edir[np.isfinite(result.edir)] > 0)
+
+
+def test_shadow_correction_uses_bioshade_split_when_given():
+    cast_result = _cast_result()
+    absorption = resolve_absorption("LuZ", 999.0, cast_result.instrument_fits, cast_result.waves)
+
+    waves = np.array(WAVES)
+    ed0_dif = np.array([20.0, 18.0, 12.0, 6.0])
+    ed0_tot = np.array([80.0, 70.0, 50.0, 25.0])
+    bioshade = BioShadeResult(
+        waves=waves, ed0_tot=ed0_tot, ed0_dif=ed0_dif, ed0_diffuse_fraction=ed0_dif / ed0_tot
+    )
+
+    result = shadow_correction(
+        instrument="LuZ",
+        waves=cast_result.waves,
+        absorption=absorption,
+        radius_m=0.035,
+        sun_zenith_deg=41.8,
+        julian_day=230,
+        lon=-68.108833,
+        lat=49.13445,
+        ed0_0p=cast_result.ed0_fit.value_at_0,
+        bioshade=bioshade,
+    )
+
+    np.testing.assert_allclose(result.edif, ed0_dif)
+    np.testing.assert_allclose(result.edir, ed0_tot - ed0_dif)
+    np.testing.assert_allclose(result.ratio_edsky_edsun, ed0_dif / (ed0_tot - ed0_dif))
+
+    # sanity: passing bioshade must actually change the result vs. the Gregg & Carder path
+    without_bioshade = shadow_correction(
+        instrument="LuZ",
+        waves=cast_result.waves,
+        absorption=absorption,
+        radius_m=0.035,
+        sun_zenith_deg=41.8,
+        julian_day=230,
+        lon=-68.108833,
+        lat=49.13445,
+        ed0_0p=cast_result.ed0_fit.value_at_0,
+    )
+    assert not np.allclose(result.edif, without_bioshade.edif)
