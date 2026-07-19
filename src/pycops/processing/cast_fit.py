@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import numpy as np
 import xarray as xr
 
+from pycops.processing.aop_cleaning import secondary_clean
 from pycops.processing.attenuation import compute_K
 from pycops.processing.depth import depth_grid as build_depth_grid
 from pycops.processing.depth import good_depth_mask
@@ -87,7 +88,8 @@ def fit_cast(ds: xr.Dataset, init: dict[str, object], instrument: str, ed0_fit: 
 
     depth = depth_ref + init["delta.capteur.optics"][instrument]
     tilt_ok = tilt_mask(ds, instrument, init["tiltmax.optics"][instrument]).values
-    kept = depth_good & tilt_ok & (depth > init["sub.surface.removed.layer.optics"][instrument])
+    depth_tilt_ok = depth_good & tilt_ok
+    kept = depth_tilt_ok & (depth > init["sub.surface.removed.layer.optics"][instrument])
 
     aop = ds[instrument].values * ed0_fit.correction
     detection_limit = detection_limit_for_waves(instrument, waves)
@@ -113,6 +115,19 @@ def fit_cast(ds: xr.Dataset, init: dict[str, object], instrument: str, ed0_fit: 
     aop_fitted = np.exp(loess.fitted)
     value_at_0 = np.exp(loess.value_at_0)
     KZ, K0 = compute_K(grid, idx_depth_0, value_at_0, aop_fitted)
+
+    aop_fitted, value_at_0, KZ, K0 = secondary_clean(
+        depth[depth_tilt_ok],
+        aop[depth_tilt_ok],
+        grid,
+        idx_depth_0,
+        detection_limit,
+        depth_first_kept=float(depth[kept][0]),
+        aop_fitted=aop_fitted,
+        value_at_0=value_at_0,
+        KZ=KZ,
+        K0=K0,
+    )
 
     linear = fit_surface_linear(
         depth[kept],

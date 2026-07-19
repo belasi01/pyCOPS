@@ -119,3 +119,73 @@ def test_fit_cast_KZ_K0_shapes_align_with_depth_grid():
     n_grid = len(result.depth_grid)
     assert result.KZ.shape == (n_grid - 1, len(WAVES))
     assert result.K0.shape == (n_grid - 1, len(WAVES))
+
+
+def test_fit_cast_secondary_clean_wired_in_and_consistent():
+    # Integration-level check that the secondary spline pass runs against
+    # real fit_profile_loess/compute_K output without crashing, and that its
+    # invariant holds: value_at_0 must track the (possibly re-masked) fitted
+    # profile at idx_depth_0.
+    ds = _make_dataset()
+    init = _make_init()
+    ed0_fit = fit_ed0_for_cast(ds, init)
+    result = fit_cast(ds, init, "LuZ", ed0_fit)
+
+    np.testing.assert_array_equal(
+        result.value_at_0,
+        result.aop_fitted[result.idx_depth_0, :],
+    )
+    # A strongly-attenuating channel (K=2.0) decaying past the detection
+    # limit at depth must still end up masked (primary detection-limit
+    # re-check, at minimum).
+    assert np.any(np.isnan(result.aop_fitted[-5:, 0]))
+
+
+def test_fit_cast_secondary_clean_catches_noise_primary_fit_missed():
+    # Inject scan-level noise deep in the profile (where the true signal is
+    # already faint) that pushes some *raw* scans below the detection limit
+    # even though the primary LOESS fit -- averaging over many scans --
+    # stays just above it. The secondary spline, fit on the broader
+    # (un-detection-masked) raw scans, should catch this.
+    ds = _make_dataset()
+    depth = ds["LuZ_Depth"].values
+    rng = np.random.default_rng(0)
+    deep = depth > 4.5
+    noise = rng.normal(loc=1.0, scale=0.6, size=(int(deep.sum()), len(WAVES)))
+    ds["LuZ"].values[deep, :] *= np.clip(noise, 0.05, None)
+
+    init = _make_init()
+    ed0_fit = fit_ed0_for_cast(ds, init)
+    with_secondary = fit_cast(ds, init, "LuZ", ed0_fit)
+
+    from pycops.processing.depth import good_depth_mask
+    from pycops.processing.detection_limits import detection_limit_for_waves
+    from pycops.processing.profile_fit import fit_profile_loess
+    from pycops.processing.tilt import tilt_mask
+
+    waves = ds["wavelength"].values
+    depth_good = good_depth_mask(depth)
+    depth_shifted = depth + init["delta.capteur.optics"]["LuZ"]
+    tilt_ok = tilt_mask(ds, "LuZ", init["tiltmax.optics"]["LuZ"]).values
+    kept = depth_good & tilt_ok & (depth_shifted > init["sub.surface.removed.layer.optics"]["LuZ"])
+    aop = ds["LuZ"].values * ed0_fit.correction
+    detection_limit = detection_limit_for_waves("LuZ", waves)
+    masked = aop[kept].copy()
+    masked[masked <= detection_limit[None, :]] = np.nan
+    loess = fit_profile_loess(
+        waves,
+        depth_shifted[kept],
+        np.log(masked),
+        span=init["depth.interval.for.smoothing.optics"]["LuZ"],
+        depth_grid=with_secondary.depth_grid,
+        idx_depth_0=with_secondary.idx_depth_0,
+        span_wave_correction=True,
+        depth_span=True,
+        minimum_obs=10,
+    )
+    primary_only_fitted = np.exp(loess.fitted)
+
+    primary_nan = np.isnan(primary_only_fitted)
+    secondary_nan = np.isnan(with_secondary.aop_fitted)
+    assert secondary_nan.sum() > primary_nan.sum()
+    assert np.all(primary_nan <= secondary_nan)  # secondary only adds NaNs, never removes
