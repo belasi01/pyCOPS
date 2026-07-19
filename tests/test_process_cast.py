@@ -5,6 +5,7 @@ import pandas as pd
 import xarray as xr
 
 from pycops.processing.bioshade import BioShadeResult
+from pycops.processing.position import PositionOverride
 from pycops.processing.process_cast import process_cast
 from pycops.processing.rrs import compute_rrs
 
@@ -245,4 +246,52 @@ def test_process_cast_uses_bioshade_split_when_given():
     assert finite.any()
     assert not np.allclose(
         result.rrs_linear.rrs_0p[finite], without_bioshade.rrs_linear.rrs_0p[finite]
+    )
+
+
+def test_process_cast_position_override_enables_shadow_correction_without_attrs():
+    # no ds.attrs["longitude"/"latitude"] at all -- the override alone must be enough
+    ds = _with_real_time(_make_dataset())
+    ds.attrs["chl_flag"] = 999.0
+
+    result = process_cast(
+        ds, _make_init(), position_override=PositionOverride(longitude=-68.108833, latitude=49.13445)
+    )
+
+    assert result.shadow_correction_note is None
+    assert "LuZ" in result.shadow_corrections
+
+
+def test_process_cast_position_override_wins_over_attrs():
+    ds = _with_real_time(_make_dataset())
+    ds.attrs["chl_flag"] = 999.0
+    ds.attrs["longitude"] = -68.108833
+    ds.attrs["latitude"] = 49.13445
+
+    with_attrs = process_cast(ds, _make_init())
+    overridden = process_cast(
+        ds, _make_init(), position_override=PositionOverride(longitude=100.0, latitude=-30.0)
+    )
+
+    finite = np.isfinite(with_attrs.rrs_linear.rrs_0p) & np.isfinite(overridden.rrs_linear.rrs_0p)
+    assert finite.any()
+    assert not np.allclose(with_attrs.rrs_linear.rrs_0p[finite], overridden.rrs_linear.rrs_0p[finite])
+
+
+def test_process_cast_utc_time_override_changes_sun_geometry():
+    ds = _with_real_time(_make_dataset())
+    ds.attrs["chl_flag"] = 999.0
+    ds.attrs["longitude"] = -68.108833
+    ds.attrs["latitude"] = 49.13445
+
+    normal = process_cast(ds, _make_init())
+    shifted = process_cast(
+        ds,
+        _make_init(),
+        position_override=PositionOverride(utc_time=pd.Timestamp("2019-01-18T04:18:00")),
+    )
+
+    finite = np.isfinite(normal.rrs_linear.rrs_0p) & np.isfinite(shifted.rrs_linear.rrs_0p)
+    assert finite.any()
+    assert not np.allclose(normal.rrs_linear.rrs_0p[finite], shifted.rrs_linear.rrs_0p[finite]
     )

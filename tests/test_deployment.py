@@ -9,6 +9,13 @@ import pycops.processing.deployment as deployment_module
 from pycops.io.config import CastInfo
 from pycops.io.discovery import CastRecord, CastReadFailure, CastSelection, Deployment, DeploymentCastsResult
 from pycops.processing.deployment import process_deployment
+from pycops.processing.position import PositionOverride
+
+GPS_TSV_FOR_PROFILE = (
+    '"[DateTime]"\t"DateTimeUTC"\t"Millisecond"\t"[GpsTime]"\t"Latitude"\t"Longitude"\t"SatelliteCount"\n'
+    '"6/5/2018 7:50:00 PM"\t"06/05/2018 07:50:00 PM"\t0\t"6/5/2018 7:49:59 PM"\t63.1770\t-81.8483\t11\n'
+    '"6/5/2018 7:51:00 PM"\t"06/05/2018 07:51:00 PM"\t0\t"6/5/2018 7:50:59 PM"\t63.1772\t-81.8481\t9\n'
+)
 
 WAVES = (340.0, 380.0, 443.0, 555.0)
 K_TRUE = (2.0, 0.9, 0.3, 0.1)
@@ -135,6 +142,12 @@ def _with_position_attrs(ds, chl_flag):
     return ds
 
 
+def _with_chl_only_attrs(ds, chl_flag):
+    # simulates info.cops.dat's longitude/latitude being NA for this cast.
+    ds.attrs["chl_flag"] = chl_flag
+    return ds
+
+
 def _patch_discovery(monkeypatch, deployment, datasets, failures=None):
     monkeypatch.setattr(deployment_module, "discover_deployment", lambda directory: deployment)
     monkeypatch.setattr(
@@ -252,3 +265,69 @@ def test_process_deployment_propagates_read_failures(tmp_path, monkeypatch):
 
     assert result.read_failures == [failure]
     assert PROFILE_CAST not in result.cast_results
+
+
+def test_process_deployment_uses_gps_file_when_info_lacks_position(tmp_path, monkeypatch):
+    deployment = _make_deployment(tmp_path)
+    profile_ds = _with_chl_only_attrs(_with_real_time(_make_profile_dataset()), 999.0)
+    datasets = {PROFILE_CAST: profile_ds, BIOSHADE_CAST: _make_bioshade_dataset()}
+    _patch_discovery(monkeypatch, deployment, datasets)
+    (tmp_path / "GPS_180605.tsv").write_text(GPS_TSV_FOR_PROFILE)
+
+    result = process_deployment(tmp_path)
+
+    cast_result = result.cast_results[PROFILE_CAST]
+    assert cast_result.shadow_correction_note is None
+    assert "LuZ" in cast_result.shadow_corrections
+
+
+def test_process_deployment_no_position_source_reports_note(tmp_path, monkeypatch):
+    deployment = _make_deployment(tmp_path)
+    profile_ds = _with_chl_only_attrs(_with_real_time(_make_profile_dataset()), 999.0)
+    datasets = {PROFILE_CAST: profile_ds, BIOSHADE_CAST: _make_bioshade_dataset()}
+    _patch_discovery(monkeypatch, deployment, datasets)
+    # no GPS file, no manual override
+
+    result = process_deployment(tmp_path)
+
+    cast_result = result.cast_results[PROFILE_CAST]
+    assert cast_result.shadow_corrections == {}
+    assert "position" in cast_result.shadow_correction_note.lower()
+
+
+def test_process_deployment_manual_override_wins_over_gps_file(tmp_path, monkeypatch):
+    deployment = _make_deployment(tmp_path)
+    profile_ds = _with_chl_only_attrs(_with_real_time(_make_profile_dataset()), 999.0)
+    datasets = {PROFILE_CAST: profile_ds, BIOSHADE_CAST: _make_bioshade_dataset()}
+    _patch_discovery(monkeypatch, deployment, datasets)
+    (tmp_path / "GPS_180605.tsv").write_text(GPS_TSV_FOR_PROFILE)
+
+    result_gps = process_deployment(tmp_path)
+    result_override = process_deployment(
+        tmp_path, position_overrides={PROFILE_CAST: PositionOverride(longitude=10.0, latitude=-40.0)}
+    )
+
+    gps_rrs = result_gps.cast_results[PROFILE_CAST].rrs_linear.rrs_0p
+    override_rrs = result_override.cast_results[PROFILE_CAST].rrs_linear.rrs_0p
+    finite = np.isfinite(gps_rrs) & np.isfinite(override_rrs)
+    assert finite.any()
+    assert not np.allclose(gps_rrs[finite], override_rrs[finite])
+
+
+def test_process_deployment_manual_utc_time_override(tmp_path, monkeypatch):
+    deployment = _make_deployment(tmp_path)
+    profile_ds = _with_position_attrs(_with_real_time(_make_profile_dataset()), 999.0)
+    datasets = {PROFILE_CAST: profile_ds, BIOSHADE_CAST: _make_bioshade_dataset()}
+    _patch_discovery(monkeypatch, deployment, datasets)
+
+    result_normal = process_deployment(tmp_path)
+    result_shifted = process_deployment(
+        tmp_path,
+        position_overrides={PROFILE_CAST: PositionOverride(utc_time=pd.Timestamp("2018-01-05T04:49:23"))},
+    )
+
+    normal_rrs = result_normal.cast_results[PROFILE_CAST].rrs_linear.rrs_0p
+    shifted_rrs = result_shifted.cast_results[PROFILE_CAST].rrs_linear.rrs_0p
+    finite = np.isfinite(normal_rrs) & np.isfinite(shifted_rrs)
+    assert finite.any()
+    assert not np.allclose(normal_rrs[finite], shifted_rrs[finite])

@@ -23,6 +23,7 @@ import xarray as xr
 from pycops.processing.bioshade import BioShadeResult
 from pycops.processing.cast_fit import InstrumentFit, fit_cast, fit_ed0_for_cast
 from pycops.processing.ed0 import Ed0Fit
+from pycops.processing.position import PositionOverride
 from pycops.processing.rrs import RrsResult, compute_rrs
 from pycops.processing.shadow import ShadowCorrectionResult, resolve_absorption, shadow_correction
 from pycops.processing.solar import sun_position
@@ -54,9 +55,16 @@ class CastResult:
     recommended_rrs: RrsResult | None  # rrs_loess or rrs_linear per rrs_method, whichever is available
 
 
-def _cast_sun_geometry(ds: xr.Dataset, lon: float, lat: float) -> tuple[int, float]:
-    """Julian day and sun zenith angle (degrees) for a cast's mean scan time and position."""
-    mean_time = pd.Series(np.asarray(ds["time"].values)).mean()
+def _cast_sun_geometry(
+    ds: xr.Dataset, lon: float, lat: float, utc_time_override: pd.Timestamp | None = None
+) -> tuple[int, float]:
+    """Julian day and sun zenith angle (degrees) for a cast's mean scan time and position.
+
+    ``utc_time_override``, if given (see :class:`~pycops.processing.position.PositionOverride`),
+    replaces the cast's own recorded mean scan time -- for a cast whose clock is known to be
+    wrong (e.g. no GPS to sync it in the field).
+    """
+    mean_time = pd.Timestamp(utc_time_override) if utc_time_override is not None else pd.Series(np.asarray(ds["time"].values)).mean()
     hour_utc = mean_time.hour + mean_time.minute / 60.0 + mean_time.second / 3600.0
     zenith_deg, _ = sun_position(mean_time.month, mean_time.day, hour_utc, lon, lat)
     return mean_time.dayofyear, zenith_deg
@@ -71,17 +79,19 @@ def _shadow_correct_instruments(
     absorption_waves: np.ndarray | None,
     absorption_values: np.ndarray | None,
     bioshade: BioShadeResult | None,
+    position_override: PositionOverride | None,
 ) -> tuple[dict[str, ShadowCorrectionResult], str | None]:
     chl = ds.attrs.get("chl_flag")
     if chl is None or (isinstance(chl, float) and np.isnan(chl)):
         return {}, "chl unavailable or NA (info.cops.dat): shadow correction not applied"
 
-    lon = ds.attrs.get("longitude")
-    lat = ds.attrs.get("latitude")
+    position_override = position_override or PositionOverride()
+    lon = position_override.longitude if position_override.longitude is not None else ds.attrs.get("longitude")
+    lat = position_override.latitude if position_override.latitude is not None else ds.attrs.get("latitude")
     if lon is None or lat is None:
         return {}, "cast position (longitude/latitude) unavailable: shadow correction not applied"
 
-    julian_day, sun_zenith_deg = _cast_sun_geometry(ds, lon, lat)
+    julian_day, sun_zenith_deg = _cast_sun_geometry(ds, lon, lat, position_override.utc_time)
     if sun_zenith_deg < 0:
         return {}, "sun below the horizon for this cast: shadow correction not applied"
 
@@ -128,6 +138,7 @@ def process_cast(
     absorption_waves: np.ndarray | None = None,
     absorption_values: np.ndarray | None = None,
     bioshade: BioShadeResult | None = None,
+    position_override: PositionOverride | None = None,
 ) -> CastResult:
     """Fit Ed0 plus every depth-profiled instrument present in ``ds``, shadow-correct, and Rrs/Lw.
 
@@ -156,6 +167,12 @@ def process_cast(
     replaces the Gregg & Carder clear-sky estimate with the measured
     diffuse/direct split for every shadow-corrected instrument on this cast.
 
+    ``position_override``, if given, supplies longitude/latitude/UTC-time
+    directly instead of relying on ``ds.attrs``/``ds["time"]`` -- for a cast
+    whose own GPS (and any GPS file) is unavailable or known to be wrong, a
+    real recurring field situation. Any field left ``None`` on the override
+    falls back to the normal source for that field alone.
+
     If ``ds`` came from :func:`~pycops.io.discovery.read_deployment_casts`, its
     ``rrs_method`` attr (from ``select.cops.dat``) picks ``recommended_rrs``
     between ``rrs_loess`` and ``rrs_linear``, falling back to whichever is
@@ -168,7 +185,15 @@ def process_cast(
     instrument_fits = {instr: fit_cast(ds, init, instr, ed0_fit) for instr in _DEPTH_PROFILED_INSTRUMENTS if instr in ds}
 
     shadow_corrections, shadow_correction_note = _shadow_correct_instruments(
-        ds, init, waves, instrument_fits, ed0_fit.value_at_0, absorption_waves, absorption_values, bioshade
+        ds,
+        init,
+        waves,
+        instrument_fits,
+        ed0_fit.value_at_0,
+        absorption_waves,
+        absorption_values,
+        bioshade,
+        position_override,
     )
 
     rrs_loess = rrs_linear = None
