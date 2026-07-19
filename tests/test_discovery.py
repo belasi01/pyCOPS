@@ -1,7 +1,17 @@
 from __future__ import annotations
 
 from conftest import write_deployment, write_deployment_with_bad_cast
-from pycops.io.discovery import discover_deployment, read_deployment_casts
+from pycops.io.discovery import CastSelection, discover_deployment, read_deployment_casts
+
+
+def test_cast_selection_shallow_true_for_flag_field():
+    assert CastSelection(file="x", flag=1, method="Rrs.0p", extra="1").shallow is True
+
+
+def test_cast_selection_shallow_false_for_na_or_other():
+    assert CastSelection(file="x", flag=1, method="Rrs.0p", extra="NA").shallow is False
+    assert CastSelection(file="x", flag=1, method="Rrs.0p", extra="0").shallow is False
+    assert CastSelection(file="x", flag=1, method="Rrs.0p", extra="").shallow is False
 
 
 def test_discover_deployment_reads_all_casts(tmp_path):
@@ -82,6 +92,17 @@ def test_read_deployment_casts_all(tmp_path):
 
     assert len(result.datasets) == 3
     assert result.failures == []
+
+
+def test_read_deployment_casts_sets_shallow_attr(tmp_path):
+    write_deployment(tmp_path)
+    deployment = discover_deployment(tmp_path)
+
+    result = read_deployment_casts(deployment, only_kept=False)
+
+    # write_deployment()'s SELECT_COPS_DAT fixture has no shallow-flagged casts
+    for ds in result.datasets.values():
+        assert ds.attrs["shallow"] is False
 
 
 def test_read_deployment_casts_continues_after_one_bad_cast(tmp_path, recwarn):

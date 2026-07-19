@@ -33,7 +33,15 @@ class CastSelection:
     file: str
     flag: int
     method: str
-    extra: str
+    extra: str  # select.cops.dat's 4th field: "1" means SHALLOW (see .shallow)
+
+    @property
+    def shallow(self) -> bool:
+        """Whether this cast is flagged ``SHALLOW`` -- ``process.cops.R``'s
+        ``select.tab[,4] == "1"`` ("Shallow water. Profile finished just
+        above the bottom"), gating :mod:`pycops.processing.bottom`.
+        """
+        return self.extra.strip() == "1"
 
 
 def read_select_cops(path: str | Path) -> list[CastSelection]:
@@ -149,6 +157,7 @@ def read_deployment_casts(deployment: Deployment, only_kept: bool = True) -> Dep
                 chl_flag=record.info.chl_flag,
                 qc_flag=record.selection.flag,
                 rrs_method=record.selection.method,
+                shallow=record.selection.shallow,
             )
         except Exception as exc:  # noqa: BLE001 -- deliberately broad: isolate one bad cast from the rest
             error = f"{type(exc).__name__}: {exc}"

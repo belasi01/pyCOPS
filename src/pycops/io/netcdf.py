@@ -16,23 +16,26 @@ naturally one row shorter than ``depth_grid`` (they're aligned with
 every per-instrument variable shares the same depth dimension, trading a
 little redundancy for a much simpler schema.
 
-``rrs_method``/``rrs_source``/``shadow_correction_note``/``longitude``/
-``latitude`` (the latter two preferring ``CastResult.resolved_longitude``/
-``.resolved_latitude`` when position/sun geometry actually resolved) are
-always written as global attrs, along with the QWIP/Forel-Ule scalar
-diagnostics (``qwip_loess_*``/``qwip_linear_*``) when available; nLw
-(``nlw_0p_loess``/``nlw_0p_linear``/``nlw_0p_recommended``) and
+``rrs_method``/``rrs_source``/``shadow_correction_note``/``bottom_note``/
+``longitude``/``latitude`` (the latter two preferring
+``CastResult.resolved_longitude``/``.resolved_latitude`` when position/sun
+geometry actually resolved) are always written as global attrs, along with
+the QWIP/Forel-Ule scalar diagnostics (``qwip_loess_*``/``qwip_linear_*``)
+when available; nLw (``nlw_0p_loess``/``nlw_0p_linear``/``nlw_0p_recommended``),
 ``ed0_0m``/``r0m_loess``/``r0m_linear`` (see
-:mod:`pycops.processing.ed0_0m`) are written as data variables whenever
-they were computed (nLw needs ``init.cops.dat``'s ``bandwidth``, see
-:mod:`pycops.processing.nlw`; ``ed0_0m``/``r0m_*`` need EuZ present and
-position/sun-geometry to resolve).
+:mod:`pycops.processing.ed0_0m`), and ``<instrument>_rb``/``_rb_extrapolated``
+(see :mod:`pycops.processing.bottom`, plus per-instrument ``bottom_depth``/
+``rb_depth_over_bottom`` attrs) are written whenever they were computed (nLw
+needs ``init.cops.dat``'s ``bandwidth``, see :mod:`pycops.processing.nlw`;
+``ed0_0m``/``r0m_*`` need EuZ present and position/sun-geometry to resolve;
+``rb``/``rb_extrapolated`` need the cast flagged ``SHALLOW``).
 Passing the original ``ds`` (the cast read by
 :func:`pycops.io.raw.read_cast`) is optional but adds real value: the
 per-scan boolean ``kept`` mask and Ed0's per-scan illumination ``correction``
 get a real ``time`` coordinate instead of a bare integer index, and
-``chl_flag``/``qc_flag`` are additionally copied onto the global attrs, along
-with ``longitude``/``latitude`` when they weren't otherwise resolved.
+``chl_flag``/``qc_flag``/``shallow`` are additionally copied onto the global
+attrs, along with ``longitude``/``latitude`` when they weren't otherwise
+resolved.
 
 :func:`write_deployment_result` writes every profile cast in a
 :class:`~pycops.processing.deployment.DeploymentProcessingResult` (from
@@ -145,14 +148,22 @@ def cast_result_to_dataset(cast_result: CastResult, ds: xr.Dataset | None = None
         attrs[f"qwip_{label}_water_class"] = qwip.water_class
         attrs[f"qwip_{label}_fu"] = qwip.fu
 
+    for instrument, bottom in cast_result.bottom_reflectance.items():
+        data_vars[f"{instrument}_rb"] = ("wavelength", bottom.rb)
+        data_vars[f"{instrument}_rb_extrapolated"] = ("wavelength", bottom.rb_extrapolated)
+        attrs[f"{instrument}_bottom_depth"] = bottom.bottom_depth
+        attrs[f"{instrument}_rb_depth_over_bottom"] = bottom.depth_over_bottom
+
     attrs["rrs_method"] = cast_result.rrs_method or ""
     attrs["rrs_source"] = cast_result.rrs_source or ""
     attrs["shadow_correction_note"] = cast_result.shadow_correction_note or ""
+    attrs["bottom_note"] = cast_result.bottom_note or ""
 
     if ds is not None:
         for key, missing in (("chl_flag", float("nan")), ("qc_flag", -1)):
             value = ds.attrs.get(key)
             attrs[key] = value if value is not None else missing
+        attrs["shallow"] = int(bool(ds.attrs.get("shallow", False)))
 
     # Prefer the position actually used for shadow correction (may come from a
     # PositionOverride or a GPS file via process_deployment(), and so can

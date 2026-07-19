@@ -557,3 +557,37 @@ def test_process_cast_ed0_0m_none_without_position():
     assert result.ed0_0m is None
     assert result.resolved_longitude is None
     assert result.resolved_latitude is None
+
+
+def test_process_cast_computes_bottom_reflectance_when_shallow():
+    ds = _make_dataset(include_edz=True)
+    ds.attrs["shallow"] = True
+
+    result = process_cast(ds, _make_init())
+
+    assert "LuZ" in result.bottom_reflectance
+    assert result.bottom_note is None
+    br = result.bottom_reflectance["LuZ"]
+    assert br.bottom_depth > 6.0  # beyond the deepest recorded scan
+    assert np.all(np.isfinite(br.rb_extrapolated))
+
+
+def test_process_cast_bottom_reflectance_empty_when_not_shallow():
+    ds = _make_dataset(include_edz=True)
+    # no "shallow" attr at all -- the common case
+
+    result = process_cast(ds, _make_init())
+
+    assert result.bottom_reflectance == {}
+    assert result.bottom_note is None
+
+
+def test_process_cast_bottom_reflectance_notes_missing_edz():
+    ds = _make_dataset(include_edz=False)
+    ds.attrs["shallow"] = True
+
+    result = process_cast(ds, _make_init())
+
+    assert result.bottom_reflectance == {}
+    assert result.bottom_note is not None
+    assert "EdZ" in result.bottom_note

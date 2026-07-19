@@ -20,6 +20,7 @@ import pandas as pd
 import xarray as xr
 
 from pycops.processing.bioshade import BioShadeResult
+from pycops.processing.bottom import BottomReflectanceResult, compute_bottom_depth, compute_bottom_reflectance
 from pycops.processing.cast_fit import InstrumentFit, fit_cast, fit_ed0_for_cast
 from pycops.processing.ed0 import Ed0Fit
 from pycops.processing.ed0_0m import compute_ed0_subsurface
@@ -62,6 +63,8 @@ class CastResult:
     ed0_0m: np.ndarray | None  # Ed0(0-), diffuse/direct-decomposed -- diagnostic only, Rrs doesn't need it
     r0m_loess: np.ndarray | None  # EuZ.0m(LOESS) / Ed0.0m -- subsurface irradiance reflectance
     r0m_linear: np.ndarray | None  # EuZ.0m(linear) / Ed0.0m
+    bottom_reflectance: dict[str, BottomReflectanceResult]  # by instrument ("LuZ"/"EuZ"), only for SHALLOW casts
+    bottom_note: str | None  # why bottom_reflectance is empty despite a SHALLOW-flagged cast, if so
     resolved_longitude: float | None  # position actually used for shadow correction/Ed0.0m, if resolved
     resolved_latitude: float | None  # (may differ from ds.attrs -- e.g. a position_override or GPS file)
 
@@ -250,6 +253,16 @@ def process_cast(
     preferred, matching ``compute.aops.R``'s block order when both are
     present), or a fresh Gregg & Carder clear-sky estimate when neither did
     -- unlike shadow correction, this doesn't require ``chl_flag``.
+
+    When ``ds`` is flagged ``SHALLOW`` (``select.cops.dat``'s 4th field,
+    ``"1"`` -- see :attr:`~pycops.io.discovery.CastSelection.shallow`),
+    ``CastResult.bottom_reflectance`` also gets one
+    :class:`~pycops.processing.bottom.BottomReflectanceResult` per available
+    instrument (``"LuZ"``/``"EuZ"``), estimating substrate reflectance near
+    and extrapolated to the cast's own maximum recorded depth (see
+    :mod:`pycops.processing.bottom`) -- ``bottom_note`` explains why it's
+    empty if flagged ``SHALLOW`` but EdZ or the ``depth.is.on`` reference
+    instrument isn't available.
     """
     waves = ds["wavelength"].values
     ed0_fit = fit_ed0_for_cast(ds, init)
@@ -346,6 +359,30 @@ def process_cast(
         r0m_loess = ed0_sub.r0m_loess
         r0m_linear = ed0_sub.r0m_linear
 
+    bottom_reflectance: dict[str, BottomReflectanceResult] = {}
+    bottom_note: str | None = None
+    if ds.attrs.get("shallow"):
+        depth_is_on = init.get("depth.is.on")
+        if "EdZ" not in instrument_fits:
+            bottom_note = "EdZ unavailable: bottom reflectance not computed"
+        elif depth_is_on not in instrument_fits:
+            bottom_note = f"depth reference instrument ({depth_is_on!r}) unavailable: bottom reflectance not computed"
+        else:
+            depth_ref = ds[f"{depth_is_on}_Depth"].values
+            bottom_depth = compute_bottom_depth(
+                depth_ref, instrument_fits[depth_is_on].kept, init["delta.capteur.optics"][depth_is_on]
+            )
+            edz_fit = instrument_fits["EdZ"]
+            for instrument in ("LuZ", "EuZ"):
+                if instrument not in instrument_fits:
+                    continue
+                span = init["depth.interval.for.smoothing.optics"][instrument]
+                bottom_reflectance[instrument] = compute_bottom_reflectance(
+                    instrument, waves, instrument_fits[instrument], edz_fit, bottom_depth, span
+                )
+            if not bottom_reflectance:
+                bottom_note = "neither LuZ nor EuZ available: bottom reflectance not computed"
+
     return CastResult(
         waves=waves,
         ed0_fit=ed0_fit,
@@ -362,6 +399,8 @@ def process_cast(
         ed0_0m=ed0_0m,
         r0m_loess=r0m_loess,
         r0m_linear=r0m_linear,
+        bottom_reflectance=bottom_reflectance,
+        bottom_note=bottom_note,
         resolved_longitude=lon,
         resolved_latitude=lat,
     )

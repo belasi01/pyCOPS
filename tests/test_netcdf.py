@@ -276,3 +276,26 @@ def test_cast_result_to_dataset_omits_ed0_0m_without_euz():
     assert result.ed0_0m is None
     assert "ed0_0m" not in out.data_vars
     assert "r0m_loess" not in out.data_vars
+
+
+def test_cast_result_to_dataset_writes_bottom_reflectance_when_shallow():
+    ds = _make_dataset(include_edz=True)
+    ds.attrs["shallow"] = True
+    result = process_cast(ds, _make_init())
+
+    out = cast_result_to_dataset(result, ds=ds)
+
+    assert "LuZ" in result.bottom_reflectance
+    assert "LuZ_rb" in out.data_vars
+    assert "LuZ_rb_extrapolated" in out.data_vars
+    assert out.attrs["LuZ_bottom_depth"] == result.bottom_reflectance["LuZ"].bottom_depth
+    assert out.attrs["shallow"] == 1
+
+
+def test_cast_result_to_dataset_omits_bottom_reflectance_when_not_shallow():
+    ds, result = _cast_result_with_shadow()
+    out = cast_result_to_dataset(result, ds=ds)
+
+    assert result.bottom_reflectance == {}
+    assert "LuZ_rb" not in out.data_vars
+    assert out.attrs["shallow"] == 0
