@@ -111,13 +111,56 @@ def _existing_selection(select_path: Path, filename: str) -> CastSelection | Non
     return None
 
 
+def _browse_directory(initial_dir: str = "") -> str | None:
+    """Open a native OS folder-picker dialog and return the chosen path (``None`` if cancelled).
+
+    This app is meant to be run locally by the researcher on their own machine (``pycops-clean``),
+    so the Python process already has direct access to the same filesystem/display as the
+    browser -- a real native dialog, not a browser-sandboxed upload widget, is the right tool
+    here. ``tkinter`` ships with Python; if it's genuinely unavailable, falls back to ``None`` so
+    the caller can keep using the plain text field instead of crashing the app.
+    """
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except ImportError:
+        return None
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    kwargs = {"title": "Choisir un dossier"}
+    if initial_dir and Path(initial_dir).is_dir():
+        kwargs["initialdir"] = initial_dir
+    try:
+        path = filedialog.askdirectory(**kwargs)
+    finally:
+        root.destroy()
+    return path or None
+
+
+def _directory_input(label: str, key: str, default: str = "") -> str:
+    """A text input paired with a "Parcourir..." button opening a native folder-picker dialog."""
+    col_text, col_button = st.columns([5, 1])
+    with col_text:
+        value = st.text_input(label, value=default, key=key)
+    with col_button:
+        st.write("")  # vertical spacer, roughly aligns the button with the text field
+        if st.button("📁 Parcourir", key=f"{key}_browse"):
+            chosen = _browse_directory(value)
+            if chosen:
+                st.session_state[key] = chosen
+                st.rerun()
+    return value
+
+
 def _render_scaffold_tab() -> None:
     st.caption(
         "Copie les casts choisis d'un dossier L1 (lecture seule, jamais modifié) vers un "
         "nouveau dossier de station L2/YYYYMMDD_StationXXX/cops/."
     )
 
-    l1_input = st.text_input("Dossier L1 source", key="scaffold_l1")
+    l1_input = _directory_input("Dossier L1 source", key="scaffold_l1")
     if not l1_input:
         st.info("Entrer un dossier L1 pour commencer.")
         return
@@ -141,7 +184,7 @@ def _render_scaffold_tab() -> None:
             selected.append(cast_path.name)
 
     station_id_input = st.text_input("ID de la station (ex: MAN-F05)", key="scaffold_station_id")
-    l2_parent_input = st.text_input(
+    l2_parent_input = _directory_input(
         "Dossier L2 parent (le nouveau dossier de station sera créé dedans)", key="scaffold_l2_parent"
     )
     init_template_input = st.text_input(
@@ -194,7 +237,7 @@ def _render_scaffold_tab() -> None:
 
 def _render_clean_tab() -> None:
     default_dir = sys.argv[1] if len(sys.argv) > 1 else ""
-    directory_input = st.text_input("Deployment folder (L2/.../COPS*)", value=default_dir, key="clean_dir")
+    directory_input = _directory_input("Deployment folder (L2/.../COPS*)", key="clean_dir", default=default_dir)
     if not directory_input:
         st.info("Enter a deployment folder to begin.")
         return
