@@ -1,12 +1,16 @@
-"""Interactive Streamlit tool to edit each cast's ``info.cops.dat`` row (position, absorption
-flag, ``time.window`` trim, and per-instrument overrides) and ``select.cops.dat`` row (QC flag,
-Rrs method, SHALLOW) -- non-destructively, without hand-editing either file as text.
+"""Interactive Streamlit tool covering two steps of Simon's real per-station workflow:
 
-Simon's R workflow ends with ``cops.go(clean.files=TRUE)``: plot Depth vs. scan index, click the
-start of the good downcast and the end (or, for a shallow cast, where the instrument hit bottom),
-and R **overwrites the raw cast file** with just the trimmed rows. This tool reproduces the same
-researcher-facing task -- pick a start/end for each cast -- but non-destructively: it writes the
-choice into ``info.cops.dat``'s existing ``time.window`` field instead (see
+1. **Scaffold a new L2 station folder from L1 raw casts** (see :mod:`pycops.io.scaffold`) --
+   ``L1`` is read-only-protected raw data; this only ever reads from it, never modifies it.
+2. **Edit each cast's ``info.cops.dat`` row** (position, absorption flag, ``time.window`` trim,
+   and per-instrument overrides) **and ``select.cops.dat`` row** (QC flag, Rrs method, SHALLOW) --
+   non-destructively, without hand-editing either file as text.
+
+For step 2: Simon's R workflow ends with ``cops.go(clean.files=TRUE)``: plot Depth vs. scan index,
+click the start of the good downcast and the end (or, for a shallow cast, where the instrument hit
+bottom), and R **overwrites the raw cast file** with just the trimmed rows. This tool reproduces
+the same researcher-facing task -- pick a start/end for each cast -- but non-destructively: it
+writes the choice into ``info.cops.dat``'s existing ``time.window`` field instead (see
 :func:`pycops.io.config.update_cast_info`), which :func:`pycops.processing.process_cast.process_cast`
 already applies as an early QC mask across every instrument (matching ``derived.data.R``'s
 ``Depth.good <- Depth.good & dates.good``) -- ``L2`` cast files themselves are never rewritten.
@@ -15,15 +19,15 @@ already applies as an early QC mask across every instrument (matching ``derived.
 plots against elapsed time in seconds, matching ``time.window``'s actual units. This is a
 documented design choice, not a divergence bug.
 
-Run with ``pycops-clean <deployment folder>`` (after ``uv sync --extra ui`` /
-``pip install pycops[ui]``), or directly via ``streamlit run src/pycops/ui/clean_app.py --
-<deployment folder>``.
+Run with ``pycops-clean [deployment folder]`` (after ``uv sync --extra ui`` /
+``pip install pycops[ui]``) -- the optional argument pre-fills step 2's deployment-folder field;
+step 1 always starts blank. Or directly via ``streamlit run src/pycops/ui/clean_app.py --
+[deployment folder]``.
 """
 
 from __future__ import annotations
 
 import sys
-import warnings
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -48,13 +52,12 @@ from pycops.io.discovery import (
     update_cast_selection,
 )
 from pycops.io.raw import parse_cast_filename, read_cast
-
-_CAST_GLOBS = ("*_URC.tsv", "*_URC.csv")
+from pycops.io.scaffold import discover_l1_casts, scaffold_station, validate_station_id
 
 # Per-instrument info.cops.dat override fields, edited as free-text comma-separated lists (one
 # value per instruments.optics entry, or "x" for "use init.cops.dat's default") since they're
 # rarely touched cast-by-cast and this matches the format researchers already know from hand-
-# editing the file -- see the "Overrides avancés" expander in run_app().
+# editing the file -- see the "Overrides avancés" expander in _render_clean_tab().
 _OVERRIDE_FIELDS = (
     ("sub_surface_removed_layer", "sub.surface.removed.layer"),
     ("tiltmax", "tiltmax"),
@@ -73,28 +76,6 @@ _FLAG_LABELS = {
 # Matches discovery.py's own _DEFAULT_METHOD (private there, so not imported directly).
 _METHOD_OPTIONS = ("Rrs.0p", "Rrs.0p.linear")
 _DEFAULT_METHOD = "Rrs.0p.linear"
-
-
-def _discover_casts(directory: Path) -> list[Path]:
-    """Cast files in ``directory``, sorted by their own recorded date/time.
-
-    Globs the established ``*_URC.tsv``/``.csv`` naming convention directly --
-    deliberately does not require ``info.cops.dat`` to exist yet, since this tool may be the one
-    that creates it. Files that don't parse (e.g. a stray non-cast file) are skipped with a
-    warning rather than aborting discovery, matching
-    :func:`pycops.io.discovery.read_deployment_casts`'s existing resilience pattern.
-    """
-    candidates = [p for pattern in _CAST_GLOBS for p in directory.glob(pattern)]
-    parsed: list[tuple[Path, object]] = []
-    for path in sorted(candidates):
-        try:
-            info = parse_cast_filename(path)
-        except ValueError as exc:
-            warnings.warn(f"skipping {path.name}: {exc}", stacklevel=2)
-            continue
-        parsed.append((path, info.date))
-    parsed.sort(key=lambda item: item[1])
-    return [path for path, _ in parsed]
 
 
 def _existing_info(info_path: Path, filename: str) -> CastInfo | None:
@@ -130,16 +111,90 @@ def _existing_selection(select_path: Path, filename: str) -> CastSelection | Non
     return None
 
 
-def run_app() -> None:
-    st.set_page_config(page_title="pycops -- cast cleaning", layout="wide")
-    st.title("pycops -- interactive cast cleaning")
+def _render_scaffold_tab() -> None:
     st.caption(
-        "Non-destructive: writes info.cops.dat's time.window field and a select.cops.dat row, "
-        "never rewrites the cast file."
+        "Copie les casts choisis d'un dossier L1 (lecture seule, jamais modifié) vers un "
+        "nouveau dossier de station L2/YYYYMMDD_StationXXX/cops/."
     )
 
+    l1_input = st.text_input("Dossier L1 source", key="scaffold_l1")
+    if not l1_input:
+        st.info("Entrer un dossier L1 pour commencer.")
+        return
+
+    l1_dir = Path(l1_input)
+    if not l1_dir.is_dir():
+        st.error(f"{l1_dir} n'est pas un dossier.")
+        return
+
+    casts = discover_l1_casts(l1_dir)
+    if not casts:
+        st.warning(f"Aucun fichier *_URC.tsv/.csv trouvé dans {l1_dir}.")
+        return
+
+    st.write(f"{len(casts)} cast(s) trouvé(s) -- décocher ceux qui n'appartiennent pas à cette station:")
+    selected: list[str] = []
+    for cast_path in casts:
+        info = parse_cast_filename(cast_path)
+        label = f"{cast_path.name} ({info.date.strftime('%Y-%m-%d %H:%M')})"
+        if st.checkbox(label, value=True, key=f"scaffold_cast_{cast_path.name}"):
+            selected.append(cast_path.name)
+
+    station_id_input = st.text_input("ID de la station (ex: MAN-F05)", key="scaffold_station_id")
+    l2_parent_input = st.text_input(
+        "Dossier L2 parent (le nouveau dossier de station sera créé dedans)", key="scaffold_l2_parent"
+    )
+    init_template_input = st.text_input(
+        "(Optionnel) copier init.cops.dat depuis une station existante", key="scaffold_init_template"
+    )
+    overwrite = st.checkbox("Écraser les fichiers déjà présents à destination", key="scaffold_overwrite")
+
+    if selected and l2_parent_input:
+        try:
+            preview_date = parse_cast_filename(l1_dir / selected[0]).date.date()
+            preview_id = validate_station_id(station_id_input) if station_id_input.strip() else "???"
+            st.caption(
+                f"Destination : {Path(l2_parent_input) / f'{preview_date:%Y%m%d}_Station{preview_id}' / 'cops'}"
+            )
+        except ValueError:
+            pass
+
+    if st.button("Créer la station", key="scaffold_create"):
+        if not selected:
+            st.error("Sélectionner au moins un cast.")
+            return
+        if not l2_parent_input:
+            st.error("Indiquer le dossier L2 parent.")
+            return
+        try:
+            result = scaffold_station(
+                l1_dir,
+                l2_parent_input,
+                station_id_input,
+                selected,
+                init_cops_dat_template=init_template_input or None,
+                overwrite=overwrite,
+            )
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+
+        st.success(f"Station créée : {result.destination}")
+        st.write(f"Casts copiés ({len(result.copied_casts)}): {result.copied_casts}")
+        if result.copied_gps_files:
+            st.write(f"Fichier(s) GPS copié(s): {result.copied_gps_files}")
+        if result.copied_init:
+            st.write("init.cops.dat copié depuis le gabarit fourni.")
+        if result.skipped_existing:
+            st.warning(
+                f"Déjà présents à destination, non écrasés (coche 'Écraser' pour forcer): "
+                f"{result.skipped_existing}"
+            )
+
+
+def _render_clean_tab() -> None:
     default_dir = sys.argv[1] if len(sys.argv) > 1 else ""
-    directory_input = st.text_input("Deployment folder (L2/.../COPS*)", value=default_dir)
+    directory_input = st.text_input("Deployment folder (L2/.../COPS*)", value=default_dir, key="clean_dir")
     if not directory_input:
         st.info("Enter a deployment folder to begin.")
         return
@@ -160,7 +215,7 @@ def run_app() -> None:
     depth_is_on = init["depth.is.on"]
     instruments = tuple(init["instruments.optics"])
 
-    casts = _discover_casts(directory)
+    casts = discover_l1_casts(directory)
     if not casts:
         st.warning(f"No *_URC.tsv/.csv cast files found in {directory}.")
         return
@@ -170,7 +225,7 @@ def run_app() -> None:
 
     labels = [p.name for p in casts]
     selected_label = st.selectbox(
-        f"Cast ({len(casts)} found)", labels, index=st.session_state["cast_idx"]
+        f"Cast ({len(casts)} found)", labels, index=st.session_state["cast_idx"], key="clean_cast_select"
     )
     st.session_state["cast_idx"] = labels.index(selected_label)
     cast_path = casts[st.session_state["cast_idx"]]
@@ -197,13 +252,18 @@ def run_app() -> None:
     st.subheader("Position & absorption")
     col_lon, col_lat, col_chl = st.columns(3)
     with col_lon:
-        lon_text = st.text_input("Longitude (deg, or NA)", value=_format_optional_float(info.longitude if info else None))
+        lon_text = st.text_input(
+            "Longitude (deg, or NA)", value=_format_optional_float(info.longitude if info else None), key="clean_lon"
+        )
     with col_lat:
-        lat_text = st.text_input("Latitude (deg, or NA)", value=_format_optional_float(info.latitude if info else None))
+        lat_text = st.text_input(
+            "Latitude (deg, or NA)", value=_format_optional_float(info.latitude if info else None), key="clean_lat"
+        )
     with col_chl:
         chl_text = st.text_input(
             "chl (>0=chlorophyll, 0=absorption.cops.dat, 999=Kd-derived, NA=no shadow correction)",
             value=_format_optional_float(info.chl_flag if info else None),
+            key="clean_chl",
         )
 
     existing_time_window = info.time_window if info else None
@@ -217,6 +277,7 @@ def run_app() -> None:
         max_value=total_duration,
         value=(default_start, default_end),
         step=max(total_duration / 500, 0.05),
+        key="clean_time_window",
     )
 
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -248,11 +309,14 @@ def run_app() -> None:
             flag_keys,
             index=flag_keys.index(default_flag),
             format_func=lambda k: _FLAG_LABELS[k],
+            key="clean_flag",
         )
     with col2:
-        method = st.selectbox("Rrs method", _METHOD_OPTIONS, index=_METHOD_OPTIONS.index(default_method))
+        method = st.selectbox(
+            "Rrs method", _METHOD_OPTIONS, index=_METHOD_OPTIONS.index(default_method), key="clean_method"
+        )
     with col3:
-        shallow = st.checkbox("Shallow (profile ends near bottom)", value=default_shallow)
+        shallow = st.checkbox("Shallow (profile ends near bottom)", value=default_shallow, key="clean_shallow")
 
     override_texts: dict[str, str] = {}
     with st.expander("Overrides avancés par instrument (rarement modifiés)"):
@@ -262,10 +326,10 @@ def run_app() -> None:
         )
         for attr, label in _OVERRIDE_FIELDS:
             override_texts[attr] = st.text_input(
-                label, value=_format_override(getattr(info, attr) if info else None)
+                label, value=_format_override(getattr(info, attr) if info else None), key=f"clean_override_{attr}"
             )
 
-    if st.button("Save && next"):
+    if st.button("Save && next", key="clean_save"):
         try:
             update_cast_info(
                 info_path,
@@ -283,6 +347,21 @@ def run_app() -> None:
         st.success(f"Saved info.cops.dat and select.cops.dat rows for {cast_path.name}")
         st.session_state["cast_idx"] = min(st.session_state["cast_idx"] + 1, len(casts) - 1)
         st.rerun()
+
+
+def run_app() -> None:
+    st.set_page_config(page_title="pycops -- cast cleaning", layout="wide")
+    st.title("pycops -- interactive station tools")
+
+    tab_scaffold, tab_clean = st.tabs(["1. Créer une station (L1 -> L2)", "2. Nettoyer les casts"])
+    with tab_scaffold:
+        _render_scaffold_tab()
+    with tab_clean:
+        st.caption(
+            "Non-destructive: writes info.cops.dat's time.window field and a select.cops.dat "
+            "row, never rewrites the cast file."
+        )
+        _render_clean_tab()
 
 
 def main() -> None:
