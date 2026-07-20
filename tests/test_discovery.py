@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from conftest import write_deployment, write_deployment_with_bad_cast
-from pycops.io.discovery import CastSelection, discover_deployment, read_deployment_casts
+from pycops.io.discovery import (
+    CastSelection,
+    discover_deployment,
+    read_deployment_casts,
+    read_select_cops,
+    update_cast_selection,
+)
 
 
 def test_cast_selection_shallow_true_for_flag_field():
@@ -12,6 +18,64 @@ def test_cast_selection_shallow_false_for_na_or_other():
     assert CastSelection(file="x", flag=1, method="Rrs.0p", extra="NA").shallow is False
     assert CastSelection(file="x", flag=1, method="Rrs.0p", extra="0").shallow is False
     assert CastSelection(file="x", flag=1, method="Rrs.0p", extra="").shallow is False
+
+
+def test_update_cast_selection_creates_missing_file(tmp_path):
+    path = tmp_path / "select.cops.dat"
+    update_cast_selection(path, "WISE_CAST_001_190817_220856_URC.csv", 1, "Rrs.0p", shallow=True)
+
+    entries = read_select_cops(path)
+    assert len(entries) == 1
+    assert entries[0].flag == 1
+    assert entries[0].method == "Rrs.0p"
+    assert entries[0].shallow is True
+
+
+def test_update_cast_selection_replaces_existing_row_preserving_others(tmp_path):
+    write_deployment(tmp_path)
+    path = tmp_path / "select.cops.dat"
+    before = path.read_text().splitlines()
+
+    update_cast_selection(path, "WISE_CAST_001_190817_220856_URC.csv", 0, "Rrs.0p.linear", shallow=False)
+
+    after = path.read_text().splitlines()
+    changed = [i for i in range(len(before)) if before[i] != after[i]]
+    assert len(changed) == 1
+
+    entries = read_select_cops(path)
+    updated = next(e for e in entries if e.file == "WISE_CAST_001_190817_220856_URC.csv")
+    assert updated.flag == 0
+    assert updated.method == "Rrs.0p.linear"
+    assert updated.shallow is False
+    # the other row (cast 002, untouched by write_deployment's SELECT_COPS_DAT) stays as-is
+    other = next(e for e in entries if e.file == "WISE_CAST_002_190817_221224_URC.csv")
+    assert other.flag == 0
+    assert other.method == "Rrs.0p.linear"
+
+
+def test_update_cast_selection_appends_row_when_cast_not_listed(tmp_path):
+    write_deployment(tmp_path)
+    path = tmp_path / "select.cops.dat"
+
+    update_cast_selection(path, "WISE_CAST_003_190817_221636_URC.csv", 1, "Rrs.0p", shallow=True)
+
+    entries = read_select_cops(path)
+    assert len(entries) == 3
+    new_entry = next(e for e in entries if e.file == "WISE_CAST_003_190817_221636_URC.csv")
+    assert new_entry.flag == 1
+    assert new_entry.shallow is True
+
+
+def test_update_cast_selection_preserves_crlf(tmp_path):
+    path = tmp_path / "select.cops.dat"
+    with path.open("w", newline="") as f:
+        f.write("WISE_CAST_001_190817_220856_URC.csv;1;Rrs.0p;NA\r\nWISE_CAST_002_x_y_URC.csv;1;Rrs.0p;NA\r\n")
+
+    update_cast_selection(path, "WISE_CAST_001_190817_220856_URC.csv", 0, "Rrs.0p.linear", shallow=False)
+
+    raw = path.read_bytes()
+    assert raw.count(b"\r\n") == 2
+    assert b"\n\n" not in raw.replace(b"\r\n", b"")
 
 
 def test_discover_deployment_reads_all_casts(tmp_path):

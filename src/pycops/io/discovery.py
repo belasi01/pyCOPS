@@ -61,6 +61,60 @@ def read_select_cops(path: str | Path) -> list[CastSelection]:
     return selections
 
 
+def update_cast_selection(path: str | Path, file: str, flag: int, method: str, shallow: bool = False) -> None:
+    """Write one ``select.cops.dat`` row (QC flag / Rrs method / SHALLOW), replacing it in place.
+
+    Unlike :func:`pycops.io.config.update_time_window` (which touches one field within a longer,
+    heavily-commented row), ``select.cops.dat`` rows are just these four fields with no comment
+    header in any real file seen so far -- so this replaces the *whole* row for ``file`` (creating
+    it if missing) rather than patching a single field. Still a surgical, line-level edit: every
+    other row is left byte-for-byte untouched, including its own line terminator -- real
+    deployments have been seen with both CRLF- and LF-only ``select.cops.dat`` files (even across
+    sibling stations of the same project), so this preserves whichever a given file already uses
+    rather than imposing one convention.
+    """
+    path = Path(path)
+    extra = "1" if shallow else "NA"
+    new_row = f"{file};{flag};{method};{extra}"
+
+    if not path.exists():
+        path.write_text(new_row + "\n")
+        return
+
+    with path.open(newline="") as f:
+        text = f.read()
+    lines = text.splitlines(keepends=True)
+
+    found = False
+    for i, line in enumerate(lines):
+        content = line.splitlines()[0] if line else line
+        terminator = line[len(content) :]
+        stripped = content.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if content.split(";", 1)[0].strip() != file:
+            continue
+        lines[i] = new_row + terminator
+        found = True
+        break
+
+    if not found:
+        terminator = "\n"
+        for line in reversed(lines):
+            if line.endswith("\r\n"):
+                terminator = "\r\n"
+                break
+            if line.endswith("\n"):
+                terminator = "\n"
+                break
+        if lines and not lines[-1].endswith(("\n", "\r\n", "\r")):
+            lines[-1] += terminator
+        lines.append(new_row + terminator)
+
+    with path.open("w", newline="") as f:
+        f.write("".join(lines))
+
+
 @dataclass(frozen=True)
 class CastRecord:
     """One cast in a deployment: its raw file path plus info/select metadata."""

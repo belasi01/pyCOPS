@@ -1,4 +1,5 @@
-"""Interactive Streamlit tool to set each cast's ``time.window`` (non-destructive trim).
+"""Interactive Streamlit tool to set each cast's ``time.window`` and ``select.cops.dat`` row
+(non-destructive trim + QC flag/Rrs method/SHALLOW selection).
 
 Simon's R workflow ends with ``cops.go(clean.files=TRUE)``: plot Depth vs. scan index, click the
 start of the good downcast and the end (or, for a shallow cast, where the instrument hit bottom),
@@ -8,6 +9,9 @@ choice into ``info.cops.dat``'s existing ``time.window`` field instead (see
 :func:`pycops.io.config.update_time_window`), which :func:`pycops.processing.process_cast.process_cast`
 already applies as an early QC mask across every instrument (matching ``derived.data.R``'s
 ``Depth.good <- Depth.good & dates.good``) -- ``L2`` cast files themselves are never rewritten.
+It also lets the researcher set each cast's ``select.cops.dat`` row (QC flag, Rrs method, SHALLOW)
+here instead of hand-editing that file as text (see
+:func:`pycops.io.discovery.update_cast_selection`).
 
 **Deliberate reinterpretation**: R's ``clean.cops.file()`` plots against raw scan index; this
 plots against elapsed time in seconds, matching ``time.window``'s actual units. This is a
@@ -29,9 +33,29 @@ import numpy as np
 import streamlit as st
 
 from pycops.io.config import read_info_cops, read_init_cops, update_time_window
+from pycops.io.discovery import (
+    FLAG_BIOSHADE,
+    FLAG_NORMAL,
+    FLAG_REJECTED,
+    FLAG_UNDER_ICE,
+    CastSelection,
+    read_select_cops,
+    update_cast_selection,
+)
 from pycops.io.raw import parse_cast_filename, read_cast
 
 _CAST_GLOBS = ("*_URC.tsv", "*_URC.csv")
+
+# select.cops.dat's flag values (see pycops.io.discovery), labeled for the UI.
+_FLAG_LABELS = {
+    FLAG_REJECTED: "Reject (0)",
+    FLAG_NORMAL: "Normal (1)",
+    FLAG_BIOSHADE: "BioShade (2)",
+    FLAG_UNDER_ICE: "Under ice (3)",
+}
+# Matches discovery.py's own _DEFAULT_METHOD (private there, so not imported directly).
+_METHOD_OPTIONS = ("Rrs.0p", "Rrs.0p.linear")
+_DEFAULT_METHOD = "Rrs.0p.linear"
 
 
 def _discover_casts(directory: Path) -> list[Path]:
@@ -65,11 +89,21 @@ def _existing_time_window(info_path: Path, filename: str) -> tuple[float, float]
     return None
 
 
+def _existing_selection(select_path: Path, filename: str) -> CastSelection | None:
+    if not select_path.exists():
+        return None
+    for entry in read_select_cops(select_path):
+        if entry.file == filename:
+            return entry
+    return None
+
+
 def run_app() -> None:
     st.set_page_config(page_title="pycops -- cast cleaning", layout="wide")
     st.title("pycops -- interactive cast cleaning")
     st.caption(
-        "Non-destructive: writes info.cops.dat's time.window field, never rewrites the cast file."
+        "Non-destructive: writes info.cops.dat's time.window field and a select.cops.dat row, "
+        "never rewrites the cast file."
     )
 
     default_dir = sys.argv[1] if len(sys.argv) > 1 else ""
@@ -150,9 +184,37 @@ def run_app() -> None:
     st.pyplot(fig)
     plt.close(fig)
 
+    select_path = directory / "select.cops.dat"
+    existing_selection = _existing_selection(select_path, cast_path.name)
+    default_flag = existing_selection.flag if existing_selection else FLAG_NORMAL
+    if default_flag not in _FLAG_LABELS:
+        default_flag = FLAG_NORMAL
+    default_method = existing_selection.method if existing_selection else _DEFAULT_METHOD
+    if default_method not in _METHOD_OPTIONS:
+        default_method = _DEFAULT_METHOD
+    default_shallow = existing_selection.shallow if existing_selection else False
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        flag_keys = list(_FLAG_LABELS)
+        flag = st.selectbox(
+            "QC flag",
+            flag_keys,
+            index=flag_keys.index(default_flag),
+            format_func=lambda k: _FLAG_LABELS[k],
+        )
+    with col2:
+        method = st.selectbox("Rrs method", _METHOD_OPTIONS, index=_METHOD_OPTIONS.index(default_method))
+    with col3:
+        shallow = st.checkbox("Shallow (profile ends near bottom)", value=default_shallow)
+
     if st.button("Save && next"):
         update_time_window(info_path, cast_path.name, (start, end))
-        st.success(f"Saved time.window = {start:g},{end:g} for {cast_path.name}")
+        update_cast_selection(select_path, cast_path.name, flag, method, shallow=shallow)
+        st.success(
+            f"Saved time.window = {start:g},{end:g} and select.cops.dat "
+            f"({flag};{method};{'1' if shallow else 'NA'}) for {cast_path.name}"
+        )
         st.session_state["cast_idx"] = min(st.session_state["cast_idx"] + 1, len(casts) - 1)
         st.rerun()
 
