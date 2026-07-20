@@ -143,3 +143,31 @@ def test_app_save_writes_select_cops_dat(tmp_path):
 
     select_text = (tmp_path / "select.cops.dat").read_text()
     assert "WISE_CAST_001_190817_220856_URC.csv;0;Rrs.0p.linear;1" in select_text
+
+
+def test_directory_browser_navigates_and_selects_without_crashing(tmp_path):
+    # A native tkinter dialog crashed the whole app on macOS (Streamlit runs script logic on a
+    # worker thread; Tk/AppKit windows must be created on the main thread) -- this in-app
+    # Streamlit-only browser replaced it; confirm descending, ascending, and picking all work.
+    (tmp_path / "sub_a").mkdir()
+    (tmp_path / "sub_a" / "sub_b").mkdir()
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="scaffold_l1").set_value(str(tmp_path)).run(timeout=30)
+
+    at.button(key="scaffold_l1_sub_sub_a").click().run(timeout=30)
+    assert not at.exception
+    assert any(str(tmp_path / "sub_a") in c.value for c in at.caption)
+
+    at.button(key="scaffold_l1_sub_sub_b").click().run(timeout=30)
+    assert not at.exception
+    assert any(str(tmp_path / "sub_a" / "sub_b") in c.value for c in at.caption)
+
+    at.button(key="scaffold_l1_up").click().run(timeout=30)
+    assert not at.exception
+    assert any(str(tmp_path / "sub_a") in c.value for c in at.caption)
+
+    at.button(key="scaffold_l1_choose").click().run(timeout=30)
+    assert not at.exception
+    assert at.text_input(key="scaffold_l1").value == str(tmp_path / "sub_a")

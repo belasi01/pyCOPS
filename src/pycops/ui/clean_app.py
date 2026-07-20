@@ -111,46 +111,68 @@ def _existing_selection(select_path: Path, filename: str) -> CastSelection | Non
     return None
 
 
-def _browse_directory(initial_dir: str = "") -> str | None:
-    """Open a native OS folder-picker dialog and return the chosen path (``None`` if cancelled).
+def _list_subdirs(directory: Path) -> list[str]:
+    try:
+        return sorted(p.name for p in directory.iterdir() if p.is_dir() and not p.name.startswith("."))
+    except (PermissionError, OSError):
+        return []
 
-    This app is meant to be run locally by the researcher on their own machine (``pycops-clean``),
-    so the Python process already has direct access to the same filesystem/display as the
-    browser -- a real native dialog, not a browser-sandboxed upload widget, is the right tool
-    here. ``tkinter`` ships with Python; if it's genuinely unavailable, falls back to ``None`` so
-    the caller can keep using the plain text field instead of crashing the app.
+
+def _directory_browser(key: str, chosen_key: str) -> None:
+    """An in-app directory browser, rendered entirely with Streamlit widgets.
+
+    A native OS dialog (``tkinter``) was tried first but crashes the whole app on macOS: Streamlit
+    runs script logic on a worker thread, while Tk/AppKit requires windows to be created on the
+    main thread (confirmed by a real crash -- ``NSInternalInconsistencyException: NSWindow should
+    only be instantiated on the main thread!``). This sidesteps that entirely -- no native GUI
+    calls, so no threading constraint to violate.
+
+    ``chosen_key`` (not ``key`` itself) is where the final pick is written: Streamlit forbids
+    writing to a widget's own ``session_state`` key after that widget has already been
+    instantiated earlier in the same run (which ``key``'s own text input always has been, by the
+    time this browser renders inside the popover) -- see :func:`_directory_input`, which applies
+    ``chosen_key`` to ``key`` at the very start of the *next* run, before the widget exists yet.
     """
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-    except ImportError:
-        return None
+    browse_key = f"{key}_browse_path"
+    current = st.session_state.get(browse_key) or st.session_state.get(key) or str(Path.home())
+    current_path = Path(current) if current else Path.home()
+    if not current_path.is_dir():
+        current_path = Path.home()
 
-    root = tk.Tk()
-    root.withdraw()
-    root.attributes("-topmost", True)
-    kwargs = {"title": "Choisir un dossier"}
-    if initial_dir and Path(initial_dir).is_dir():
-        kwargs["initialdir"] = initial_dir
-    try:
-        path = filedialog.askdirectory(**kwargs)
-    finally:
-        root.destroy()
-    return path or None
+    st.caption(f"📂 {current_path}")
+
+    if st.button("⬆️ Dossier parent", key=f"{key}_up", disabled=current_path.parent == current_path):
+        st.session_state[browse_key] = str(current_path.parent)
+        st.rerun()
+
+    subdirs = _list_subdirs(current_path)
+    if not subdirs:
+        st.caption("(aucun sous-dossier)")
+    for sub in subdirs:
+        if st.button(f"📁 {sub}", key=f"{key}_sub_{sub}", use_container_width=True):
+            st.session_state[browse_key] = str(current_path / sub)
+            st.rerun()
+
+    st.divider()
+    if st.button("✅ Choisir ce dossier", key=f"{key}_choose", type="primary"):
+        st.session_state[chosen_key] = str(current_path)
+        st.session_state.pop(browse_key, None)
+        st.rerun()
 
 
 def _directory_input(label: str, key: str, default: str = "") -> str:
-    """A text input paired with a "Parcourir..." button opening a native folder-picker dialog."""
+    """A text input paired with a popover-based in-app directory browser (see :func:`_directory_browser`)."""
+    chosen_key = f"{key}_chosen"
+    if chosen_key in st.session_state:
+        st.session_state[key] = st.session_state.pop(chosen_key)
+
     col_text, col_button = st.columns([5, 1])
     with col_text:
         value = st.text_input(label, value=default, key=key)
     with col_button:
-        st.write("")  # vertical spacer, roughly aligns the button with the text field
-        if st.button("📁 Parcourir", key=f"{key}_browse"):
-            chosen = _browse_directory(value)
-            if chosen:
-                st.session_state[key] = chosen
-                st.rerun()
+        st.write("")  # vertical spacer, roughly aligns the popover button with the text field
+        with st.popover("📁 Parcourir"):
+            _directory_browser(key, chosen_key)
     return value
 
 
