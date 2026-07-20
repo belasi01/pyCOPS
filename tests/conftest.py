@@ -80,11 +80,11 @@ bandwidth;numeric;10
 
 INFO_COPS_DAT = """\
 #######################################################################
-# file;lon;lat;chl_or_flag;time.window;sub_surface;tiltmax;depth_interval;darks...
+# file;lon;lat;chl_or_flag;time.window;sub_surface;tiltmax;depth_interval;linear.r2;linear.max.delta;darks...
 #######################################################################
 WISE_CAST_001_190817_220856_URC.csv;-68.11626;49.24872;0;x;x;x;x;;;;
 WISE_CAST_002_190817_221224_URC.csv;-68.11626;49.24872;NA;x;x;x;x;;;;
-WISE_CAST_003_190817_221636_URC.csv;-68.11626;49.24872;0.2;0,90;0.1,0.05,0.1,0;10,10,5,5;40,60,80,80;dark_001.csv
+WISE_CAST_003_190817_221636_URC.csv;-68.11626;49.24872;0.2;0,90;0.1,0.05,0.1,0;10,10,5,5;40,60,80,80;0.5,0.6,0.5,0.6;3,3,2.5,2.5;dark_001.csv
 """
 
 # Only covers casts 001 and 002 on purpose, to exercise the "missing row

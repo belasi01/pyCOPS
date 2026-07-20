@@ -9,6 +9,7 @@ from pycops.io.config import (
     read_absorption_cops,
     read_info_cops,
     read_init_cops,
+    update_cast_info,
     update_time_window,
 )
 
@@ -114,7 +115,34 @@ def test_read_info_cops(tmp_path):
     third = entries[2]
     assert third.time_window == (0.0, 90.0)
     assert third.sub_surface_removed_layer == [0.1, 0.05, 0.1, 0.0]
+    assert third.linear_r2_threshold == [0.5, 0.6, 0.5, 0.6]
+    assert third.linear_max_delta_depth == [3.0, 3.0, 2.5, 2.5]
     assert third.dark_files == ["dark_001.csv"]
+
+
+def test_read_info_cops_na_within_override_field(tmp_path):
+    # Real AlgaeWISE PME_CAST_019 row has "NA,0.5,0.5,0.6" for linear.fit.Rsquared.threshold
+    # (Ed0's threshold doesn't apply at the surface) -- same per-value NA sentinel init.cops.dat
+    # uses for its own per-instrument vectors.
+    path = tmp_path / "info.cops.dat"
+    path.write_text("PME_CAST_019_220705_152602_URC.csv;-64.3476;49.7745;999;x;x;10,5,7,5;x;NA,0.5,0.5,0.6;x\n")
+
+    entries = read_info_cops(path)
+
+    r2 = entries[0].linear_r2_threshold
+    assert r2[1:] == [0.5, 0.5, 0.6]
+    assert np.isnan(r2[0])
+
+
+def test_read_info_cops_blank_chl_field_is_none_not_a_crash(tmp_path):
+    # A short row (fewer than 4 fields) pads chl out to "" via read_info_cops's own padding --
+    # that must parse the same as an explicit "NA", not raise trying float("").
+    path = tmp_path / "info.cops.dat"
+    path.write_text("WISE_CAST_001_190817_220856_URC.csv;-68.11626;49.24872\n")
+
+    entries = read_info_cops(path)
+
+    assert entries[0].chl_flag is None
 
 
 def test_read_info_cops_na_longitude_latitude(tmp_path):
@@ -216,6 +244,112 @@ def test_update_time_window_preserves_crlf(tmp_path):
     # every line (including the untouched ones) still ends in CRLF
     for line in raw.split(b"\r\n")[:-1]:
         assert b"\n" not in line
+
+
+def test_update_cast_info_writes_na_sentinel_not_python_nan_repr(tmp_path):
+    path = tmp_path / "info.cops.dat"
+    update_cast_info(
+        path,
+        "PME_CAST_019_220705_152602_URC.csv",
+        linear_r2_threshold=[float("nan"), 0.5, 0.5, 0.6],
+    )
+
+    text = path.read_text()
+    assert "NA,0.5,0.5,0.6" in text
+    assert "nan" not in text  # no stray lowercase Python "nan" repr
+
+
+def test_update_cast_info_preserves_coordinate_precision(tmp_path):
+    # A plain "%g" format defaults to 6 significant figures and would silently truncate
+    # -68.11626 (7 sig figs) to -68.1163 -- real GPS decimal-degree precision needs more.
+    path = tmp_path / "info.cops.dat"
+    update_cast_info(path, "WISE_CAST_001_190817_220856_URC.csv", longitude=-68.11626, latitude=49.24872)
+
+    entries = read_info_cops(path)
+    assert entries[0].longitude == -68.11626
+    assert entries[0].latitude == 49.24872
+
+
+def test_update_cast_info_sets_multiple_fields_at_once(tmp_path):
+    path = tmp_path / "info.cops.dat"
+    path.write_text(INFO_COPS_DAT)
+
+    update_cast_info(
+        path,
+        "WISE_CAST_001_190817_220856_URC.csv",
+        longitude=1.5,
+        latitude=-2.5,
+        chl_flag=999.0,
+        tiltmax=[5.0, 5.0, 5.0, 5.0],
+    )
+
+    entries = read_info_cops(path)
+    updated = next(e for e in entries if e.file == "WISE_CAST_001_190817_220856_URC.csv")
+    assert updated.longitude == 1.5
+    assert updated.latitude == -2.5
+    assert updated.chl_flag == 999.0
+    assert updated.tiltmax == [5.0, 5.0, 5.0, 5.0]
+    assert updated.time_window is None  # untouched (field 5 sits before field 7, still padded "x")
+
+
+def test_update_cast_info_only_touches_passed_fields(tmp_path):
+    path = tmp_path / "info.cops.dat"
+    path.write_text(INFO_COPS_DAT)
+
+    update_cast_info(path, "WISE_CAST_003_190817_221636_URC.csv", chl_flag=5.0)
+
+    entries = read_info_cops(path)
+    third = next(e for e in entries if e.file == "WISE_CAST_003_190817_221636_URC.csv")
+    assert third.chl_flag == 5.0
+    # every other field on the same row stays exactly as it was
+    assert third.time_window == (0.0, 90.0)
+    assert third.sub_surface_removed_layer == [0.1, 0.05, 0.1, 0.0]
+    assert third.linear_r2_threshold == [0.5, 0.6, 0.5, 0.6]
+    assert third.dark_files == ["dark_001.csv"]
+
+
+def test_update_cast_info_explicit_none_clears_field(tmp_path):
+    path = tmp_path / "info.cops.dat"
+    path.write_text(INFO_COPS_DAT)
+
+    update_cast_info(path, "WISE_CAST_003_190817_221636_URC.csv", chl_flag=None, sub_surface_removed_layer=None)
+
+    entries = read_info_cops(path)
+    third = next(e for e in entries if e.file == "WISE_CAST_003_190817_221636_URC.csv")
+    assert third.chl_flag is None
+    assert third.sub_surface_removed_layer is None
+    assert third.time_window == (0.0, 90.0)  # still untouched
+
+
+def test_update_cast_info_no_kwargs_is_a_no_op(tmp_path):
+    path = tmp_path / "info.cops.dat"
+    path.write_text(INFO_COPS_DAT)
+    before = path.read_text()
+
+    update_cast_info(path, "WISE_CAST_001_190817_220856_URC.csv")
+
+    assert path.read_text() == before
+
+
+def test_update_cast_info_creates_new_row_with_only_given_fields_set(tmp_path):
+    path = tmp_path / "info.cops.dat"
+    path.write_text(INFO_COPS_DAT)
+
+    update_cast_info(
+        path,
+        "WISE_CAST_999_190817_235959_URC.csv",
+        longitude=10.0,
+        latitude=20.0,
+        linear_max_delta_depth=[1.0, 2.0, 3.0, 4.0],
+    )
+
+    entries = read_info_cops(path)
+    new_entry = next(e for e in entries if e.file == "WISE_CAST_999_190817_235959_URC.csv")
+    assert new_entry.longitude == 10.0
+    assert new_entry.latitude == 20.0
+    assert new_entry.chl_flag is None  # padded to "NA", not left unset
+    assert new_entry.linear_max_delta_depth == [1.0, 2.0, 3.0, 4.0]
+    assert new_entry.time_window is None  # padded to "x"
 
 
 ABSORPTION_COPS_DAT = """\

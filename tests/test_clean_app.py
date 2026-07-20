@@ -52,10 +52,12 @@ def test_app_save_writes_time_window(tmp_path):
     at.button[0].click().run(timeout=30)
 
     assert not at.exception
-    assert any("Saved time.window" in s.value for s in at.success)
+    assert any("Saved info.cops.dat" in s.value for s in at.success)
 
     info_text = (tmp_path / "info.cops.dat").read_text()
-    assert "WISE_CAST_001_190817_220856_URC.csv;-68.11626;49.24872;0;0,0.05" in info_text
+    # position/chl round-trip unchanged (full precision preserved), time.window updated; the
+    # Save button always resends every field, so untouched-but-blank fields canonicalize to "x".
+    assert "WISE_CAST_001_190817_220856_URC.csv;-68.11626;49.24872;0;0,0.05;x;x;x;x;x" in info_text
 
 
 def test_app_save_writes_select_cops_dat(tmp_path):

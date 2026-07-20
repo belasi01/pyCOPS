@@ -113,22 +113,39 @@ class CastInfo:
     tiltmax: list[float] | None
     depth_interval_for_smoothing: list[float] | None
     dark_files: list[str]
+    linear_r2_threshold: list[float] | None = None
+    linear_max_delta_depth: list[float] | None = None
 
 
-def _override(field: str) -> list[float] | None:
+def parse_override_field(field: str) -> list[float] | None:
+    """Parse an ``info.cops.dat`` per-instrument override field: ``"x"``/blank means no override.
+
+    Individual comma-separated values can themselves be ``"NA"`` -- e.g. a linear-fit threshold
+    that doesn't apply to the surface (Ed0) instrument, the same sentinel :func:`read_init_cops`
+    handles for `init.cops.dat`'s own per-instrument vectors -- confirmed on a real file
+    (`local_data/AlgaeWISE/.../info.cops.dat`'s `PME_CAST_019` row: `"NA,0.5,0.5,0.6"`).
+    """
     field = field.strip()
     if field in ("", "x"):
         return None
-    return [float(v) for v in field.split(",")]
+    return [_to_float(v) for v in field.split(",")]
 
 
-def _optional_float(field: str) -> float | None:
+def parse_optional_float(field: str) -> float | None:
+    """Parse an ``info.cops.dat`` scalar field: ``"NA"`` (or blank -- a short row padded out by
+    :func:`read_info_cops`) means unset."""
     field = field.strip()
-    return None if field.upper() == "NA" else float(field)
+    return None if field == "" or field.upper() == "NA" else float(field)
 
 
 def read_info_cops(path: str | Path) -> list[CastInfo]:
-    """Parse an ``info.cops.dat`` file into one :class:`CastInfo` per cast."""
+    """Parse an ``info.cops.dat`` file into one :class:`CastInfo` per cast.
+
+    Field layout (1-indexed, matching the file's own documented numbering):
+    1 file, 2 longitude, 3 latitude, 4 chl, 5 time.window, 6 sub.surface.removed.layer,
+    7 tiltmax, 8 depth.interval.for.smoothing, 9 linear.fit.Rsquared.threshold,
+    10 linear.fit.max.delta.depth, 11-14 (optional) dark-measurement file names.
+    """
     path = Path(path)
     entries: list[CastInfo] = []
 
@@ -138,21 +155,23 @@ def read_info_cops(path: str | Path) -> list[CastInfo]:
             if not line or line.startswith("#"):
                 continue
             fields = [f.strip() for f in line.split(";")]
-            fields += [""] * (12 - len(fields))
+            fields += [""] * (14 - len(fields))
 
-            time_window = _override(fields[4])
+            time_window = parse_override_field(fields[4])
 
             entries.append(
                 CastInfo(
                     file=fields[0],
-                    longitude=_optional_float(fields[1]),
-                    latitude=_optional_float(fields[2]),
-                    chl_flag=_optional_float(fields[3]),
+                    longitude=parse_optional_float(fields[1]),
+                    latitude=parse_optional_float(fields[2]),
+                    chl_flag=parse_optional_float(fields[3]),
                     time_window=tuple(time_window) if time_window else None,
-                    sub_surface_removed_layer=_override(fields[5]),
-                    tiltmax=_override(fields[6]),
-                    depth_interval_for_smoothing=_override(fields[7]),
-                    dark_files=[f for f in fields[8:12] if f],
+                    sub_surface_removed_layer=parse_override_field(fields[5]),
+                    tiltmax=parse_override_field(fields[6]),
+                    depth_interval_for_smoothing=parse_override_field(fields[7]),
+                    linear_r2_threshold=parse_override_field(fields[8]),
+                    linear_max_delta_depth=parse_override_field(fields[9]),
+                    dark_files=[f for f in fields[10:14] if f],
                 )
             )
 
@@ -210,33 +229,122 @@ _INFO_COPS_DAT_HEADER = [
 ]
 
 
-def _format_time_window(time_window: tuple[float, float]) -> str:
-    start, end = time_window
-    return f"{start:g},{end:g}"
+# 0-indexed field positions, matching read_info_cops's 1-indexed doc comment above.
+_FIELD_INDEX = {
+    "longitude": 1,
+    "latitude": 2,
+    "chl_flag": 3,
+    "time_window": 4,
+    "sub_surface_removed_layer": 5,
+    "tiltmax": 6,
+    "depth_interval_for_smoothing": 7,
+    "linear_r2_threshold": 8,
+    "linear_max_delta_depth": 9,
+}
+_NA_FIELDS = {"longitude", "latitude", "chl_flag"}  # unset -> "NA"; every other field -> "x"
+
+_UNSET = object()  # update_cast_info's "leave this field alone" sentinel (None means clear it)
 
 
-def update_time_window(path: str | Path, file: str, time_window: tuple[float, float]) -> None:
-    """Write a per-cast ``time.window`` override into ``info.cops.dat``, touching only that field.
+def _format_cast_info_field(name: str, value: object) -> str:
+    # ".10g" (not the default 6-sig-fig "g"): a plain "g" truncates a real coordinate like
+    # -68.11626 to -68.1163, silently losing precision that matters for GPS positions.
+    if value is None:
+        return "NA" if name in _NA_FIELDS else "x"
+    if name == "time_window":
+        start, end = value
+        return f"{start:.10g},{end:.10g}"
+    if name in _NA_FIELDS:
+        return f"{value:.10g}"
+    # Per-value "NA" (e.g. a linear-fit threshold that doesn't apply to the surface Ed0
+    # instrument, see parse_override_field) round-trips as the file's own sentinel, not
+    # Python's "nan" repr.
+    return ",".join("NA" if np.isnan(v) else f"{v:.10g}" for v in value)
+
+
+def _extend_row(fields: list[str], max_index: int) -> list[str]:
+    fields = list(fields)
+    index_to_name = {i: n for n, i in _FIELD_INDEX.items()}
+    while len(fields) <= max_index:
+        name_at_idx = index_to_name.get(len(fields))
+        fields.append("NA" if name_at_idx in _NA_FIELDS else "x")
+    return fields
+
+
+def _dominant_terminator(lines: list[str]) -> str:
+    for line in reversed(lines):
+        if line.endswith("\r\n"):
+            return "\r\n"
+        if line.endswith("\n"):
+            return "\n"
+    return "\r\n"
+
+
+def update_cast_info(
+    path: str | Path,
+    file: str,
+    *,
+    longitude: object = _UNSET,
+    latitude: object = _UNSET,
+    chl_flag: object = _UNSET,
+    time_window: object = _UNSET,
+    sub_surface_removed_layer: object = _UNSET,
+    tiltmax: object = _UNSET,
+    depth_interval_for_smoothing: object = _UNSET,
+    linear_r2_threshold: object = _UNSET,
+    linear_max_delta_depth: object = _UNSET,
+) -> None:
+    """Write any subset of an ``info.cops.dat`` row's fields (2-10), leaving the rest untouched.
 
     A surgical line-level edit rather than a full read-into-:class:`CastInfo`-then-rewrite-
     everything round trip, so it never disturbs a row/field/comment it doesn't own -- real files
-    carry a large hand-written comment header, and other fields (e.g. ``dark_files``) round-trip
-    imperfectly through :func:`read_info_cops` today. Real ``info.cops.dat`` files are
-    CRLF-terminated; this preserves whatever line ending each existing line already has (untouched
-    lines round-trip byte-for-byte) rather than normalizing the whole file to ``\\n``.
+    carry a large hand-written comment header. Real ``info.cops.dat`` files are CRLF-terminated;
+    this preserves whatever line ending each existing line already has (untouched lines round-trip
+    byte-for-byte) rather than normalizing the whole file.
 
-    If ``file`` already has a row, only its field 5 (``time.window``) is replaced -- padding the
-    row out to 5 fields with ``"x"`` first if it was shorter. If the file exists but has no row for
-    ``file``, one is appended (matching a real minimal row's shape: lon/lat/chl ``NA``, other
-    overrides ``"x"``). If ``path`` doesn't exist at all, it's created with the same header comment
-    block a real ``cops.go()``-generated file has, plus that one row.
+    Every keyword defaults to a private "leave alone" sentinel -- only fields explicitly passed
+    are written. Pass ``None`` to explicitly clear a field back to its ``"NA"``/``"x"`` sentinel
+    (``"NA"`` for ``longitude``/``latitude``/``chl_flag``, ``"x"`` -- "use init.cops.dat's
+    deployment-wide default" -- for the rest). ``time_window`` is ``(start, end)`` in elapsed
+    seconds; the per-instrument override fields are ``list[float]`` (one value per
+    ``instruments.optics`` entry).
+
+    If ``file`` already has a row, it's extended (with ``"NA"``/``"x"`` placeholders as
+    appropriate) only as far as the highest field index among the given updates, then those
+    fields are replaced in place. If the file exists but has no row for ``file``, one is appended
+    (matching a real minimal row's shape). If ``path`` doesn't exist at all, it's created with the
+    same header comment block a real ``cops.go()``-generated file has, plus that one row.
     """
+    updates = {
+        name: value
+        for name, value in (
+            ("longitude", longitude),
+            ("latitude", latitude),
+            ("chl_flag", chl_flag),
+            ("time_window", time_window),
+            ("sub_surface_removed_layer", sub_surface_removed_layer),
+            ("tiltmax", tiltmax),
+            ("depth_interval_for_smoothing", depth_interval_for_smoothing),
+            ("linear_r2_threshold", linear_r2_threshold),
+            ("linear_max_delta_depth", linear_max_delta_depth),
+        )
+        if value is not _UNSET
+    }
+    if not updates:
+        return
+
     path = Path(path)
-    formatted = _format_time_window(time_window)
+    max_index = max(_FIELD_INDEX[name] for name in updates)
+
+    def _apply(fields: list[str]) -> list[str]:
+        fields = _extend_row(fields, max_index)
+        for name, value in updates.items():
+            fields[_FIELD_INDEX[name]] = _format_cast_info_field(name, value)
+        return fields
 
     if not path.exists():
-        row = f"{file};NA;NA;NA;{formatted};x;x;x;x;x"
-        content = "\r\n".join([*_INFO_COPS_DAT_HEADER, row]) + "\r\n"
+        row = _apply([file])
+        content = "\r\n".join([*_INFO_COPS_DAT_HEADER, ";".join(row)]) + "\r\n"
         path.write_text(content, newline="")
         return
 
@@ -254,28 +362,24 @@ def update_time_window(path: str | Path, file: str, time_window: tuple[float, fl
         fields = content.split(";")
         if fields[0].strip() != file:
             continue
-        if len(fields) <= 4:
-            fields += ["x"] * (5 - len(fields))
-        fields[4] = formatted
-        lines[i] = ";".join(fields) + terminator
+        lines[i] = ";".join(_apply(fields)) + terminator
         found = True
         break
 
     if not found:
-        terminator = "\r\n"
-        for line in reversed(lines):
-            if line.endswith("\r\n"):
-                terminator = "\r\n"
-                break
-            if line.endswith("\n"):
-                terminator = "\n"
-                break
+        terminator = _dominant_terminator(lines)
         if lines and not lines[-1].endswith(("\n", "\r\n", "\r")):
             lines[-1] += terminator
-        lines.append(f"{file};NA;NA;NA;{formatted};x;x;x;x;x{terminator}")
+        lines.append(";".join(_apply([file])) + terminator)
 
     with path.open("w", newline="") as f:
         f.write("".join(lines))
+
+
+def update_time_window(path: str | Path, file: str, time_window: tuple[float, float]) -> None:
+    """Write a per-cast ``time.window`` override -- a thin, single-field wrapper over
+    :func:`update_cast_info`, kept as its own function since it's this app's most common edit."""
+    update_cast_info(path, file, time_window=time_window)
 
 
 def read_absorption_cops(path: str | Path) -> pd.DataFrame:
