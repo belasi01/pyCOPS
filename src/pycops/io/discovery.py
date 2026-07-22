@@ -140,6 +140,15 @@ class Deployment:
         return [c for c in self.casts if c.kept]
 
 
+def find_deployment_folders(parent: str | Path) -> list[Path]:
+    """Every directory under ``parent`` (including ``parent`` itself) holding an
+    ``init.cops.dat`` -- i.e. every processable deployment folder, found recursively so a parent
+    like ``L2/`` (with one ``YYYYMMDD_StationXXX/cops/`` per station) works directly, for batch
+    reprocessing across many stations at once."""
+    parent = Path(parent)
+    return sorted({p.parent for p in parent.rglob("init.cops.dat")})
+
+
 def discover_deployment(directory: str | Path) -> Deployment:
     """Parse a ``COPS*/`` folder's config files into a :class:`Deployment`.
 

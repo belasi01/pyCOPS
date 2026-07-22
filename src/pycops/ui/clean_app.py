@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import html
 import sys
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -52,12 +54,19 @@ from pycops.io.discovery import (
     FLAG_REJECTED,
     FLAG_UNDER_ICE,
     CastSelection,
+    discover_deployment,
+    find_deployment_folders,
+    read_deployment_casts,
     read_select_cops,
     update_cast_selection,
 )
+from pycops.io.netcdf import write_deployment_result
 from pycops.io.raw import parse_cast_filename, read_cast
 from pycops.io.scaffold import discover_l1_casts, scaffold_station, validate_station_id
-from pycops.processing.position import find_gps_file
+from pycops.processing.deployment import DeploymentProcessingResult, process_deployment
+from pycops.processing.position import find_gps_file, position_from_gps, read_gps_file
+from pycops.ui._common import _directory_input
+from pycops.ui.analyze_app import render_analyze_tab
 
 # Per-instrument info.cops.dat override fields, edited as free-text comma-separated lists (one
 # value per instruments.optics entry, or "x" for "use init.cops.dat's default") since they're
@@ -90,6 +99,8 @@ _METHOD_LABELS = {
 
 _TAB_SCAFFOLD = "1. Create a station (L1 -> L2)"
 _TAB_CLEAN = "2. Clean casts"
+_TAB_PROCESS = "3. Process casts"
+_TAB_ANALYZE = "4. Analyze results"
 
 # info.cops.dat's "chl" field selects the absorption model shadow correction uses (see
 # pycops.processing.shadow.resolve_absorption): 999 = derived from this cast's own fitted Kd
@@ -156,69 +167,24 @@ def _existing_selection(select_path: Path, filename: str) -> CastSelection | Non
     return None
 
 
-def _list_subdirs(directory: Path) -> list[str]:
-    try:
-        return sorted(p.name for p in directory.iterdir() if p.is_dir() and not p.name.startswith("."))
-    except (PermissionError, OSError):
-        return []
+def _cast_position_resolved_approx(cast_path: Path, info: CastInfo | None, gps_table) -> bool:
+    """Best-effort check of whether a cast's position can be resolved automatically -- used to
+    gate the "Next -> Process casts" button so a researcher can't move on to processing while a
+    cast still has no usable position (it would just silently skip shadow correction otherwise).
 
-
-def _directory_browser(key: str, chosen_key: str) -> None:
-    """An in-app directory browser, rendered entirely with Streamlit widgets.
-
-    A native OS dialog (``tkinter``) was tried first but crashes the whole app on macOS: Streamlit
-    runs script logic on a worker thread, while Tk/AppKit requires windows to be created on the
-    main thread (confirmed by a real crash -- ``NSInternalInconsistencyException: NSWindow should
-    only be instantiated on the main thread!``). This sidesteps that entirely -- no native GUI
-    calls, so no threading constraint to violate.
-
-    ``chosen_key`` (not ``key`` itself) is where the final pick is written: Streamlit forbids
-    writing to a widget's own ``session_state`` key after that widget has already been
-    instantiated earlier in the same run (which ``key``'s own text input always has been, by the
-    time this browser renders inside the popover) -- see :func:`_directory_input`, which applies
-    ``chosen_key`` to ``key`` at the very start of the *next* run, before the widget exists yet.
+    An explicit ``info.cops.dat`` lon/lat always counts. Otherwise, a GPS fix within +/-2 minutes
+    of the cast's filename-derived start time counts as resolvable -- a cheap stand-in for the
+    precise per-scan check (:func:`~pycops.processing.position.position_from_gps` against the
+    cast's own ``time`` coordinate) that real processing does, since checking every cast that
+    precisely here would mean reading every raw cast file just for this gate.
     """
-    browse_key = f"{key}_browse_path"
-    current = st.session_state.get(browse_key) or st.session_state.get(key) or str(Path.home())
-    current_path = Path(current) if current else Path.home()
-    if not current_path.is_dir():
-        current_path = Path.home()
-
-    st.caption(f"📂 {current_path}")
-
-    if st.button("⬆️ Parent folder", key=f"{key}_up", disabled=current_path.parent == current_path):
-        st.session_state[browse_key] = str(current_path.parent)
-        st.rerun()
-
-    subdirs = _list_subdirs(current_path)
-    if not subdirs:
-        st.caption("(no subfolders)")
-    for sub in subdirs:
-        if st.button(f"📁 {sub}", key=f"{key}_sub_{sub}", use_container_width=True):
-            st.session_state[browse_key] = str(current_path / sub)
-            st.rerun()
-
-    st.divider()
-    if st.button("✅ Choose this folder", key=f"{key}_choose", type="primary"):
-        st.session_state[chosen_key] = str(current_path)
-        st.session_state.pop(browse_key, None)
-        st.rerun()
-
-
-def _directory_input(label: str, key: str, default: str = "") -> str:
-    """A text input paired with a popover-based in-app directory browser (see :func:`_directory_browser`)."""
-    chosen_key = f"{key}_chosen"
-    if chosen_key in st.session_state:
-        st.session_state[key] = st.session_state.pop(chosen_key)
-
-    col_text, col_button = st.columns([5, 1])
-    with col_text:
-        value = st.text_input(label, value=default, key=key)
-    with col_button:
-        st.write("")  # vertical spacer, roughly aligns the popover button with the text field
-        with st.popover("📁 Browse"):
-            _directory_browser(key, chosen_key)
-    return value
+    if info is not None and info.longitude is not None and info.latitude is not None:
+        return True
+    if gps_table is None:
+        return False
+    cast_dt = np.datetime64(parse_cast_filename(cast_path).date)
+    margin = np.timedelta64(2, "m")
+    return position_from_gps(gps_table, np.array([cast_dt - margin, cast_dt + margin])) is not None
 
 
 _INIT_GEN_INSTRUMENT_PARAMS = (
@@ -289,33 +255,90 @@ def _render_init_cops_dat_generator_form() -> dict[str, object]:
     )
 
     with st.expander("Per-instrument default values (verify these)"):
-        header_cols = st.columns([2, *([1] * len(instruments))])
-        header_cols[0].write("")
-        for col, instr in zip(header_cols[1:], instruments):
-            col.write(f"**{instr}**")
-        for name, label in _INIT_GEN_INSTRUMENT_PARAMS:
-            row_cols = st.columns([2, *([1] * len(instruments))])
-            row_cols[0].caption(f"{label}  \n{INIT_COPS_DAT_HELP[name]}")
-            for col, instr in zip(row_cols[1:], instruments):
-                default_value = params[name][instr]
-                with col:
-                    if np.isnan(default_value):
-                        st.text_input(
-                            instr,
-                            value="NA",
-                            key=f"scaffold_init_{name}_{instr}",
-                            label_visibility="collapsed",
-                            disabled=True,
-                            help="Doesn't apply to the surface sensor (Ed0).",
-                        )
-                    else:
-                        params[name][instr] = st.number_input(
-                            instr,
-                            value=float(default_value),
-                            key=f"scaffold_init_{name}_{instr}",
-                            label_visibility="collapsed",
-                        )
+        _render_instrument_params_table(params, instruments, key_prefix="scaffold_init")
 
+    return params
+
+
+def _render_instrument_params_table(
+    params: dict[str, object], instruments: tuple[str, ...], *, key_prefix: str
+) -> None:
+    """One editable row per entry in :data:`_INIT_GEN_INSTRUMENT_PARAMS`, one column per
+    instrument -- mutates ``params[name][instr]`` in place from each widget's value. Shared by
+    the scaffold tab's brand-new-file generator and the clean tab's existing-file editor (see
+    ``_render_init_cops_dat_editor``) so both present the same table/help text."""
+    header_cols = st.columns([2, *([1] * len(instruments))])
+    header_cols[0].write("")
+    for col, instr in zip(header_cols[1:], instruments):
+        col.write(f"**{instr}**")
+    for name, label in _INIT_GEN_INSTRUMENT_PARAMS:
+        row_cols = st.columns([2, *([1] * len(instruments))])
+        row_cols[0].caption(f"{label}  \n{INIT_COPS_DAT_HELP[name]}")
+        for col, instr in zip(row_cols[1:], instruments):
+            current_value = params[name][instr]
+            with col:
+                if np.isnan(current_value):
+                    st.text_input(
+                        instr,
+                        value="NA",
+                        key=f"{key_prefix}_{name}_{instr}",
+                        label_visibility="collapsed",
+                        disabled=True,
+                        help="Doesn't apply to the surface sensor (Ed0).",
+                    )
+                else:
+                    params[name][instr] = st.number_input(
+                        instr,
+                        value=float(current_value),
+                        key=f"{key_prefix}_{name}_{instr}",
+                        label_visibility="collapsed",
+                    )
+
+
+def _render_init_cops_dat_editor(init: dict[str, object], *, key_prefix: str) -> dict[str, object]:
+    """Edit an *existing* ``init.cops.dat``'s values (clean tab), pre-filled from the file
+    already on disk rather than from :func:`default_init_cops_params`'s generic defaults.
+
+    ``instruments.optics``/``depth.is.on`` are shown read-only: changing which instruments are
+    present reshapes every per-instrument field and the rest of the clean tab (which reads them
+    once per run to decide what to plot/edit) -- regenerating the file from tab 1 is the
+    supported way to do that, not an in-place edit here.
+    """
+    instruments = tuple(init["instruments.optics"])
+    st.caption(
+        f"Instruments: {', '.join(instruments)} -- depth reference: {init['depth.is.on']}. "
+        "To change which instruments are present, regenerate this file from tab 1."
+    )
+
+    params = dict(init)
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        params["number.of.fields.before.date"] = st.number_input(
+            "Segments before the date in the file name",
+            min_value=1,
+            value=int(init["number.of.fields.before.date"]),
+            step=1,
+            key=f"{key_prefix}_n_fields",
+            help=INIT_COPS_DAT_HELP["number.of.fields.before.date"],
+        )
+    with col_b:
+        params["windspeed_ms"] = st.number_input(
+            "Default wind speed (m/s)",
+            min_value=0.0,
+            value=float(init["windspeed_ms"]),
+            key=f"{key_prefix}_windspeed",
+            help=INIT_COPS_DAT_HELP["windspeed_ms"],
+        )
+    with col_c:
+        params["bandwidth"] = st.number_input(
+            "Bandwidth (nm)",
+            min_value=0.0,
+            value=float(init["bandwidth"]),
+            key=f"{key_prefix}_bandwidth",
+            help=INIT_COPS_DAT_HELP["bandwidth"],
+        )
+
+    _render_instrument_params_table(params, instruments, key_prefix=key_prefix)
     return params
 
 
@@ -461,14 +484,32 @@ def _render_clean_tab() -> None:
     depth_is_on = init["depth.is.on"]
     instruments = tuple(init["instruments.optics"])
 
+    with st.expander("init.cops.dat"):
+        edited_init = _render_init_cops_dat_editor(init, key_prefix="clean_init")
+        if st.button("Save", key="clean_init_save"):
+            write_init_cops(init_path, edited_init, overwrite=True)
+            st.toast("Saved init.cops.dat")
+            st.rerun()
+
     casts = discover_l1_casts(directory)
     if not casts:
         st.warning(f"No *_URC.tsv/.csv cast files found in {directory}.")
         return
 
+    info_path = directory / "info.cops.dat"
+    select_path = directory / "select.cops.dat"
+
+    gps_path = find_gps_file(directory)
+    gps_table = None
+    if gps_path is not None:
+        try:
+            gps_table = read_gps_file(gps_path)
+        except Exception:  # noqa: BLE001 -- a bad GPS file just means "no GPS fallback" here
+            gps_table = None
+
     labels = [p.name for p in casts]
     # A widget's own session_state key can't be reassigned after it's been instantiated in the
-    # same run (Streamlit raises) -- so "advance to the next cast" (the Save && next button,
+    # same run (Streamlit raises) -- so "advance to the next cast" (the Save button,
     # below) stashes its target in this separate "_pending" key instead, applied here, *before*
     # the selectbox is created. Same trick _directory_input() already uses for its own browser.
     if "clean_cast_select_pending" in st.session_state:
@@ -481,7 +522,7 @@ def _render_clean_tab() -> None:
     cast_idx = labels.index(selected_label)
     cast_path = casts[cast_idx]
     # Every per-cast widget below is keyed with this suffix so switching casts (via this
-    # selectbox, or the "Save && next" button below) always shows *that* cast's own saved
+    # selectbox, or the "Save" button below) always shows *that* cast's own saved
     # values -- a fixed key shared across casts would otherwise stick to whatever was last typed
     # (Streamlit only honors a widget's `value=` the first time a given key appears).
     ck = lambda base: f"{base}::{cast_path.name}"  # noqa: E731
@@ -502,7 +543,6 @@ def _render_clean_tab() -> None:
     depth = ds[depth_var].values
     total_duration = float(elapsed.max())
 
-    info_path = directory / "info.cops.dat"
     info = _existing_info(info_path, cast_path.name)
 
     st.subheader("Position & absorption")
@@ -521,19 +561,40 @@ def _render_clean_tab() -> None:
         )
 
     if parse_optional_float(lon_text) is None or parse_optional_float(lat_text) is None:
-        gps_file = find_gps_file(directory)
-        if gps_file is not None:
+        # Actually resolve against the GPS file's real fixes (not just "a GPS file exists") --
+        # a GPS file that doesn't cover this cast's time (e.g. the logger was off, or this cast
+        # is a same-day revisit after the logger stopped) must not be reported as if position
+        # were handled automatically; Simon: "on ne doit pas être en mesure de passer au
+        # processing sans une position lat/lon."
+        resolved_via_gps = gps_table is not None and position_from_gps(gps_table, ds["time"].values) is not None
+        if resolved_via_gps:
+            st.caption(
+                f"📍 Position not entered above -- resolved automatically from the GPS file "
+                f"found in this folder ({gps_path.name}), at the cast's time."
+            )
+        elif gps_path is not None:
             st.markdown(
-                f"<span style='color:red; font-size:1.15rem;'>📍 Position not entered above -- "
-                f"will be taken automatically from the GPS file found in this folder "
-                f"({html.escape(gps_file.name)}), at the cast's time.</span>",
+                f"<span style='color:red; font-size:1.15rem;'>⚠️ Position not entered, and the "
+                f"GPS file found in this folder ({html.escape(gps_path.name)}) has no fix "
+                f"covering this cast's time -- shadow correction will be skipped unless a "
+                f"position is entered manually.</span>",
                 unsafe_allow_html=True,
             )
         else:
-            st.caption(
-                "⚠️ Position not entered and no GPS_*.tsv/.csv file found in this folder -- shadow "
-                "correction will be disabled for this cast until a position is available."
+            st.markdown(
+                "<span style='color:red; font-size:1.15rem;'>⚠️ Position not entered and no "
+                "GPS_*.tsv/.csv file found in this folder -- shadow correction will be skipped "
+                "unless a position is entered manually.</span>",
+                unsafe_allow_html=True,
             )
+    elif info is None or info.longitude != parse_optional_float(lon_text) or info.latitude != parse_optional_float(
+        lat_text
+    ):
+        # The warning above reacts to what's typed, not what's on disk -- without this, a
+        # researcher who types a valid position but never clicks Save sees the warning vanish
+        # and (reasonably) assumes it's already handled, even though "Next -> Process casts"
+        # below still won't appear until it's actually persisted.
+        st.caption("📍 Position entered above but not saved yet -- click Save below to record it.")
 
     with col_chl:
         default_chl_mode = _chl_mode_for_flag(info.chl_flag if info else None) if info else _CHL_MODE_KD
@@ -594,7 +655,6 @@ def _render_clean_tab() -> None:
     st.pyplot(fig)
     plt.close(fig)
 
-    select_path = directory / "select.cops.dat"
     existing_selection = _existing_selection(select_path, cast_path.name)
     default_flag = existing_selection.flag if existing_selection else FLAG_NORMAL
     if default_flag not in _FLAG_LABELS:
@@ -640,7 +700,7 @@ def _render_clean_tab() -> None:
                 key=ck(f"clean_override_{attr}"),
             )
 
-    if st.button("Save && next", key="clean_save"):
+    if st.button("Save", key="clean_save"):
         try:
             update_cast_info(
                 info_path,
@@ -665,20 +725,236 @@ def _render_clean_tab() -> None:
         st.session_state["clean_cast_select_pending"] = labels[next_idx]
         st.rerun()
 
+    # Bottom of the tab, not next to the per-cast Save button above: this jumps between
+    # *stations*, not casts, and Simon may want to prepare several stations' casts before
+    # processing any of them, so it deliberately doesn't nudge the researcher forward until every
+    # cast in this folder already has both a saved info.cops.dat and select.cops.dat row.
+    all_cleaned = all(
+        _existing_info(info_path, c.name) is not None and _existing_selection(select_path, c.name) is not None
+        for c in casts
+    )
+    if all_cleaned:
+        st.divider()
+        # Hard gate, not just an advisory note: a cast with no resolvable position would
+        # silently process with shadow correction skipped -- Simon wants that caught here,
+        # before processing, not discovered later in a shadow_correction_note.
+        missing_position = [
+            c.name for c in casts if not _cast_position_resolved_approx(c, _existing_info(info_path, c.name), gps_table)
+        ]
+        if missing_position:
+            st.error(
+                "Can't move to processing yet -- position unresolved for: "
+                f"{', '.join(missing_position)}. Enter a longitude/latitude for each above."
+            )
+        else:
+            st.success("Every cast in this folder has been cleaned, and every position resolves.")
+            col_next, col_another = st.columns(2)
+            with col_next:
+                if st.button("Next -> Process casts", key="clean_next_to_process", use_container_width=True):
+                    st.session_state["process_dir"] = str(directory)
+                    st.session_state["active_tab_pending"] = _TAB_PROCESS
+                    st.rerun()
+            with col_another:
+                # Supports preparing several stations before processing any of them (batch mode
+                # in tab 3) -- goes back to tab 1 rather than tab 3, folder fields left blank
+                # there since scaffolding a new station starts from a fresh L1 selection.
+                if st.button(
+                    "Save and prepare another station", key="clean_prepare_another", use_container_width=True
+                ):
+                    st.session_state["active_tab_pending"] = _TAB_SCAFFOLD
+                    st.rerun()
+
+
+@dataclass
+class _ProcessSummary:
+    """Outcome of running :func:`process_deployment` + :func:`write_deployment_result` on one
+    deployment folder, plus whatever :mod:`warnings` were raised along the way -- enough to
+    render one row/expander in the process tab for either a single folder or one entry of a
+    batch."""
+
+    directory: Path
+    result: DeploymentProcessingResult | None  # None if a deployment-level error occurred
+    output_dir: Path
+    n_written: int
+    captured_warnings: list[str]
+    error: str | None  # deployment-level failure (e.g. missing/malformed config), if any
+
+
+def _process_one_deployment(directory: Path) -> _ProcessSummary:
+    """Read, process, and write NetCDF output for one deployment folder.
+
+    A failure before/outside ``process_deployment``'s own per-cast isolation (e.g.
+    ``info.cops.dat`` missing entirely, so ``discover_deployment`` itself raises) is caught here
+    and recorded as ``_ProcessSummary.error`` instead of propagating -- so one broken folder in a
+    batch can't abort the rest, mirroring the per-cast failure isolation already built into
+    ``process_deployment``/``read_deployment_casts`` one level down.
+    """
+    output_dir = directory / "nc"
+    captured_warnings: list[str] = []
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            deployment = discover_deployment(directory)
+            read_result = read_deployment_casts(deployment)
+            result = process_deployment(directory)
+            written = write_deployment_result(result, output_dir, datasets=read_result.datasets)
+            captured_warnings = [str(w.message) for w in caught]
+    except Exception as exc:  # noqa: BLE001 -- isolate one bad deployment from the rest of a batch
+        return _ProcessSummary(
+            directory=directory,
+            result=None,
+            output_dir=output_dir,
+            n_written=0,
+            captured_warnings=captured_warnings,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+    return _ProcessSummary(
+        directory=directory,
+        result=result,
+        output_dir=output_dir,
+        n_written=len(written),
+        captured_warnings=captured_warnings,
+        error=None,
+    )
+
+
+def _render_process_summary(label: str, summary: _ProcessSummary, *, expanded: bool) -> None:
+    if summary.error is not None:
+        icon = "❌"
+    elif summary.result and (
+        summary.result.read_failures or summary.result.processing_failures or summary.captured_warnings
+    ):
+        icon = "⚠️"
+    else:
+        icon = "✅"
+
+    with st.expander(f"{icon} {label}", expanded=expanded):
+        if summary.error is not None:
+            st.error(summary.error)
+            return
+
+        result = summary.result
+        assert result is not None
+        st.write(
+            f"{len(result.cast_results)} cast(s) processed -> `{summary.output_dir}` "
+            f"({summary.n_written} file(s) written)"
+        )
+        if result.read_failures:
+            for failure in result.read_failures:
+                st.warning(f"Couldn't read {failure.file}: {failure.error}")
+        if result.processing_failures:
+            for failure in result.processing_failures:
+                st.warning(f"Couldn't process {failure.file}: {failure.error}")
+        if result.cast_results:
+            st.dataframe(
+                {
+                    "cast": list(result.cast_results.keys()),
+                    "Rrs source": [r.rrs_source or "-" for r in result.cast_results.values()],
+                    "shadow correction note": [
+                        r.shadow_correction_note or "" for r in result.cast_results.values()
+                    ],
+                },
+                width="stretch",
+                hide_index=True,
+            )
+        if summary.captured_warnings:
+            with st.expander("Warnings", expanded=False):
+                for message in summary.captured_warnings:
+                    st.caption(message)
+
+
+def _render_process_tab() -> None:
+    mode = st.radio(
+        "Mode", ("Single deployment", "Batch (multiple deployments)"), key="process_mode"
+    )
+
+    if mode == "Single deployment":
+        directory_input = _directory_input(
+            "Deployment folder (L2/.../COPS*)", key="process_dir"
+        )
+        if not directory_input:
+            st.info("Enter a deployment folder to begin.")
+            return
+        directory = Path(directory_input)
+        if not directory.is_dir():
+            st.error(f"{directory} is not a directory.")
+            return
+        if not (directory / "init.cops.dat").exists():
+            st.error(
+                f"No init.cops.dat in {directory}. This deployment's instrument config must "
+                "already exist (it's set up once per instrument system) -- create it before "
+                "processing casts."
+            )
+            return
+
+        if st.button("Process", key="process_single_run"):
+            with st.spinner(f"Processing {directory.name}..."):
+                summary = _process_one_deployment(directory)
+            _render_process_summary(directory.name, summary, expanded=True)
+        return
+
+    # Batch mode.
+    parent_input = _directory_input("Parent folder", key="process_parent")
+    if not parent_input:
+        st.info("Enter a parent folder to begin (searched recursively for init.cops.dat).")
+        return
+    parent = Path(parent_input)
+    if not parent.is_dir():
+        st.error(f"{parent} is not a directory.")
+        return
+
+    folders = find_deployment_folders(parent)
+    if not folders:
+        st.warning(f"No deployment folder (with init.cops.dat) found under {parent}.")
+        return
+
+    st.write(f"{len(folders)} deployment folder(s) found -- uncheck any to exclude them:")
+    checked: list[Path] = []
+    for folder in folders:
+        rel = folder.relative_to(parent)
+        if st.checkbox(str(rel), value=True, key=f"process_batch_{rel}"):
+            checked.append(folder)
+
+    if st.button(f"Process checked deployments ({len(checked)})", key="process_batch_run"):
+        if not checked:
+            st.error("Select at least one deployment.")
+            return
+        progress = st.progress(0.0)
+        status = st.empty()
+        n_ok = n_warn = n_failed = 0
+        for i, folder in enumerate(checked):
+            rel = folder.relative_to(parent)
+            status.write(f"Processing {rel} ({i + 1}/{len(checked)})...")
+            summary = _process_one_deployment(folder)
+            _render_process_summary(str(rel), summary, expanded=False)
+            if summary.error is not None:
+                n_failed += 1
+            elif summary.result and (summary.result.read_failures or summary.result.processing_failures):
+                n_warn += 1
+            else:
+                n_ok += 1
+            progress.progress((i + 1) / len(checked))
+        status.write(
+            f"Done: {n_ok} ok, {n_warn} with warnings, {n_failed} failed "
+            f"(of {len(checked)} processed)."
+        )
+
 
 def run_app() -> None:
     st.set_page_config(page_title="pycops -- cast cleaning", layout="wide")
     st.title("pycops -- interactive station tools")
 
     # key + on_change="rerun" makes the active tab a real, programmatically settable piece of
-    # state (st.session_state["active_tab"]) -- used by _render_scaffold_tab() to jump straight
-    # to the cleaning tab, with its folder pre-filled, right after a station is created. Applied
-    # via a "_pending" key (see clean_cast_select_pending above) since active_tab itself can't be
-    # reassigned after st.tabs() below has already instantiated it for this run.
+    # state (st.session_state["active_tab"]) -- used by _render_scaffold_tab() to jump straight to
+    # the cleaning tab (folder pre-filled) right after a station is created, and by
+    # _render_clean_tab() to jump to the process tab (folder pre-filled) once every cast in the
+    # folder has been cleaned. Applied via a "_pending" key (see clean_cast_select_pending above)
+    # since active_tab itself can't be reassigned after st.tabs() below has already instantiated
+    # it for this run.
     if "active_tab_pending" in st.session_state:
         st.session_state["active_tab"] = st.session_state.pop("active_tab_pending")
-    tab_scaffold, tab_clean = st.tabs(
-        [_TAB_SCAFFOLD, _TAB_CLEAN], key="active_tab", on_change="rerun"
+    tab_scaffold, tab_clean, tab_process, tab_analyze = st.tabs(
+        [_TAB_SCAFFOLD, _TAB_CLEAN, _TAB_PROCESS, _TAB_ANALYZE], key="active_tab", on_change="rerun"
     )
     with tab_scaffold:
         _render_scaffold_tab()
@@ -688,6 +964,18 @@ def run_app() -> None:
             "row, never rewrites the cast file."
         )
         _render_clean_tab()
+    with tab_process:
+        st.caption(
+            "Runs the full processing pipeline and writes one NetCDF file per cast into an "
+            "nc/ subfolder of each deployment folder -- overwriting any nc/ output already "
+            "there from a previous run."
+        )
+        _render_process_tab()
+    with tab_analyze:
+        st.caption(
+            "Read-only: browse a cast's already-processed results (nc/), one cast at a time."
+        )
+        render_analyze_tab()
 
 
 def main() -> None:
