@@ -28,18 +28,56 @@ _PER_INSTRUMENT_KEYS = (
     "linear.fit.max.delta.depth.optics",
 )
 
+_PER_INSTRUMENT_KEYS_INSTRUMENTS = ("Ed0", "EdZ", "LuZ", "EuZ")
+
+# Starting-point per-instrument values for a brand-new init.cops.dat (see
+# default_init_cops_params/write_init_cops below), taken from every real deployment cached in
+# local_data/*/*/COPS*/init.cops.dat. radius.instrument.optics is identical (0.035) in all four;
+# delta.capteur.optics is near-identical per instrument (Ed0=0, EdZ=-0.05, LuZ/EuZ~0.238) but is a
+# physical sensor-offset property -- a caller-facing form should still prompt the researcher to
+# confirm it against the instrument's own calibration sheet rather than trust this blindly.
+_INIT_COPS_DAT_INSTRUMENT_DEFAULTS: dict[str, dict[str, float]] = {
+    "tiltmax.optics": {"Ed0": 10.0, "EdZ": 5.0, "LuZ": 5.0, "EuZ": 5.0},
+    "depth.interval.for.smoothing.optics": {"Ed0": 10.0, "EdZ": 5.0, "LuZ": 5.0, "EuZ": 5.0},
+    "sub.surface.removed.layer.optics": {"Ed0": 0.0, "EdZ": 0.2, "LuZ": 0.0, "EuZ": 0.0},
+    "delta.capteur.optics": {"Ed0": 0.0, "EdZ": -0.05, "LuZ": 0.238, "EuZ": 0.238},
+    "radius.instrument.optics": {"Ed0": 0.035, "EdZ": 0.035, "LuZ": 0.035, "EuZ": 0.035},
+    # Same values read_init_cops backfills (with a warning) into older files missing these two --
+    # kept as one source of truth via _PER_INSTRUMENT_DEFAULTS below. Ed0 gets NaN: no linear-fit
+    # threshold applies at the surface.
+    "linear.fit.Rsquared.threshold.optics": {"Ed0": float("nan"), "EdZ": 0.5, "LuZ": 0.6, "EuZ": 0.6},
+    "linear.fit.max.delta.depth.optics": {"Ed0": float("nan"), "EdZ": 3.0, "LuZ": 2.5, "EuZ": 2.5},
+}
+
 # Fallback defaults for parameters added to the R package after many
 # init.cops.dat files were already written (read.init.R warns and injects
 # these same values -- and rewrites the file -- the first time it hits an
-# older file missing them). Ed0 gets NaN: no linear-fit threshold applies at
-# the surface.
+# older file missing them).
 _PER_INSTRUMENT_DEFAULTS = {
-    "linear.fit.Rsquared.threshold.optics": {"Ed0": float("nan"), "EdZ": 0.5, "LuZ": 0.6, "EuZ": 0.6},
-    "linear.fit.max.delta.depth.optics": {"Ed0": float("nan"), "EdZ": 3.0, "LuZ": 2.5, "EuZ": 2.5},
+    name: _INIT_COPS_DAT_INSTRUMENT_DEFAULTS[name]
+    for name in ("linear.fit.Rsquared.threshold.optics", "linear.fit.max.delta.depth.optics")
 }
 _SCALAR_DEFAULTS = {
     "bandwidth": 10.0,
     "windspeed_ms": 4.0,
+}
+
+# init.cops.dat parameters that are effectively constant across every real deployment cached in
+# local_data/*/*/COPS*/init.cops.dat, regardless of project or instrument system.
+_INIT_COPS_DAT_CONSTANTS: dict[str, object] = {
+    "verbose": True,
+    "indice.water": 1.34,
+    "rau.Fresnel": 0.043,
+    "win.width": 9.0,
+    "win.height": 7.0,
+    "format.date": "%m/%d/%Y %H:%M:%S",
+    "instruments.others": "NA",
+    "time.window": [0.0, 10000.0],
+    "depth.discretization": [
+        0.0, 0.01, 1.0, 0.02, 2.0, 0.05, 5.0, 0.1, 10.0, 0.2, 20.0, 0.5,
+        50.0, 1.0, 100.0, 2.0, 200.0, 5.0, 500.0,
+    ],
+    "bandwidth": _SCALAR_DEFAULTS["bandwidth"],
 }
 
 def _to_float(value: str) -> float:
@@ -98,6 +136,161 @@ def read_init_cops(path: str | Path) -> dict[str, object]:
             params[name] = default
 
     return params
+
+
+def default_init_cops_params(
+    instruments: list[str] | tuple[str, ...],
+    *,
+    depth_is_on: str | None = None,
+    number_of_fields_before_date: int = 3,
+    windspeed_ms: float = _SCALAR_DEFAULTS["windspeed_ms"],
+) -> dict[str, object]:
+    """Starting-point ``init.cops.dat`` parameters for a brand-new instrument system.
+
+    Returns a dict shaped exactly like :func:`read_init_cops`'s own output, pre-filled with
+    typical values seen across every real deployment cached in this project (see
+    ``_INIT_COPS_DAT_INSTRUMENT_DEFAULTS``/``_INIT_COPS_DAT_CONSTANTS``) -- so it round-trips
+    through :func:`write_init_cops` unchanged, and a caller only needs to override the handful of
+    fields that genuinely vary per project/instrument (``instruments``, ``depth_is_on``,
+    ``number_of_fields_before_date``, ``windspeed_ms``, or any per-instrument value in the
+    returned dict).
+
+    ``delta.capteur.optics``/``radius.instrument.optics`` are physical sensor properties, not
+    universal constants -- a caller presenting these to a researcher (e.g. the cast-cleaning UI's
+    generator form) should prompt them to confirm against the instrument's own calibration sheet
+    rather than trust the default blindly. ``windspeed_ms`` varies by weather/sea-state on the
+    day, not by instrument -- it's usually overridden later per station or even per cast.
+    """
+    instruments = tuple(instruments)
+    unknown = [instr for instr in instruments if instr not in _PER_INSTRUMENT_KEYS_INSTRUMENTS]
+    if unknown:
+        raise ValueError(
+            f"Unknown instrument(s) {unknown}; expected a subset of {_PER_INSTRUMENT_KEYS_INSTRUMENTS}"
+        )
+    if not instruments:
+        raise ValueError("instruments must be non-empty")
+
+    params: dict[str, object] = dict(_INIT_COPS_DAT_CONSTANTS)
+    params["instruments.optics"] = list(instruments)
+    params["depth.is.on"] = depth_is_on or ("LuZ" if "LuZ" in instruments else instruments[0])
+    params["number.of.fields.before.date"] = float(number_of_fields_before_date)
+    params["windspeed_ms"] = windspeed_ms
+    for name, defaults_by_instrument in _INIT_COPS_DAT_INSTRUMENT_DEFAULTS.items():
+        params[name] = {instr: defaults_by_instrument[instr] for instr in instruments}
+    return params
+
+
+# One short, researcher-facing explanation per init.cops.dat parameter -- for a UI form (e.g. the
+# cast-cleaning app's generator) to show next to each field.
+INIT_COPS_DAT_HELP: dict[str, str] = {
+    "instruments.optics": "Optical sensors present on this system (Ed0 = surface irradiance, "
+    "always required as a reference).",
+    "depth.is.on": "Depth/pressure sensor used as the reference -- normally LuZ.",
+    "number.of.fields.before.date": "Number of '_'-separated segments before the date in cast file "
+    "names (e.g. 3 for 'SITE_CAST_001_190818_195137_URC.tsv'). pycops usually detects this "
+    "automatically from the file name -- this value is only used as a cross-check hint.",
+    "windspeed_ms": "Wind speed (m/s) at deployment time -- varies with weather, not with the "
+    "instrument; adjust per station or per cast if known.",
+    "tiltmax.optics": "Maximum tilt (degrees) beyond which a scan is rejected.",
+    "depth.interval.for.smoothing.optics": "Depth interval (m) used for profile smoothing.",
+    "sub.surface.removed.layer.optics": "Thickness (m) of the sub-surface layer excluded from "
+    "fitting (turbulence/wake near the boat).",
+    "delta.capteur.optics": "Depth offset (m) between this sensor and the reference sensor -- a "
+    "physical property of the instrument, verify against its calibration sheet.",
+    "radius.instrument.optics": "Radius of the sensor housing (m) -- a physical property of the "
+    "instrument.",
+    "linear.fit.Rsquared.threshold.optics": "Minimum R² to accept the linear surface fit (NA for "
+    "Ed0 -- doesn't apply to the surface sensor).",
+    "linear.fit.max.delta.depth.optics": "Maximum depth extent (m) of the linear surface fit window "
+    "(NA for Ed0).",
+    "bandwidth": "Bandwidth (nm) used when computing extraterrestrial irradiance.",
+}
+
+# Verbatim header comment block from a real init.cops.dat (local_data/AlgaeWISE/
+# 20220705_StationPME6/COPS/init.cops.dat) -- so a freshly generated file looks like one the R
+# package's own workflow would produce.
+_INIT_COPS_DAT_HEADER = [
+    "#" * 127,
+    "# lines beginning with # are comments; blank lines are skipped",
+    '# EACH LINE HAS THREE FIELDS DELIMITED BY ";"' + " " * 81 + "#",
+    "# DO NOT MODIFY THE FIRST TWO FIELDS" + " " * 90 + "#",
+    '# IF THE THIRD FIELD CONTAINS SEVERAL VALUES, THESE VALUES ARE SEPARARTED BY ","' + " " * 46 + "#",
+    '# IF THE TYPE OF THE THIRD FIELD (GIVEN BY THE SECOND FIELD) IS "character", THE BLANK '
+    'CHARACTERS (" ") ARE TAKEN INTO ACCOUNT#',
+    "#" * 127,
+]
+
+
+def _format_init_value(name: str, kind: str, value: object, instruments: tuple[str, ...]) -> str:
+    if name in _PER_INSTRUMENT_KEYS:
+        values = [value[instr] for instr in instruments]
+    elif isinstance(value, list):
+        values = value
+    else:
+        values = [value]
+
+    if kind == "logical":
+        return ",".join("TRUE" if v else "FALSE" for v in values)
+    if kind == "character":
+        return ",".join(str(v) for v in values)
+    return ",".join("NA" if (isinstance(v, float) and np.isnan(v)) else f"{v:.10g}" for v in values)
+
+
+# (name, kind, section-comment-or-None) in the same order/grouping as a real init.cops.dat.
+_INIT_COPS_DAT_LAYOUT = [
+    ("verbose", "logical", None),
+    ("indice.water", "numeric", "constants"),
+    ("rau.Fresnel", "numeric", None),
+    ("win.width", "numeric", "width and height of graphics windows"),
+    ("win.height", "numeric", None),
+    ("instruments.optics", "character", "optics description"),
+    ("tiltmax.optics", "numeric", None),
+    ("depth.interval.for.smoothing.optics", "numeric", None),
+    ("sub.surface.removed.layer.optics", "numeric", None),
+    ("delta.capteur.optics", "numeric", None),
+    ("radius.instrument.optics", "numeric", None),
+    ("linear.fit.Rsquared.threshold.optics", "numeric", None),
+    ("linear.fit.max.delta.depth.optics", "numeric", None),
+    ("format.date", "character", "look INTO a data file"),
+    ("instruments.others", "character", None),
+    ("depth.is.on", "character", None),
+    ("number.of.fields.before.date", "numeric", "look at the NAME of a data file"),
+    ("time.window", "numeric", "time window : 2 values (unit = second) first = beginning, second = end"),
+    ("depth.discretization", "numeric", "for smoothing purpose"),
+    ("bandwidth", "numeric", "bandwidth : the size of the window (nanometers) around each wavelength"),
+    ("windspeed_ms", "numeric", "Environmental conditions"),
+]
+
+
+def format_init_cops_dat(params: dict[str, object]) -> str:
+    """Render an ``init.cops.dat`` params dict (:func:`read_init_cops`'s own shape, e.g. from
+    :func:`default_init_cops_params`) back into the file's text format."""
+    instruments = tuple(params["instruments.optics"])
+    lines = list(_INIT_COPS_DAT_HEADER)
+    lines.append("")
+    for name, kind, section in _INIT_COPS_DAT_LAYOUT:
+        if name not in params:
+            continue
+        if section:
+            lines.append("")
+            lines.append(f"# {section} " + "#" * max(0, 50 - len(section)))
+        lines.append(f"{name};{kind};{_format_init_value(name, kind, params[name], instruments)}")
+    lines.append("")
+    return "\r\n".join(lines)
+
+
+def write_init_cops(path: str | Path, params: dict[str, object], *, overwrite: bool = False) -> None:
+    """Write a brand-new ``init.cops.dat`` from a params dict (see :func:`default_init_cops_params`).
+
+    Refuses to clobber an existing file unless ``overwrite=True`` -- unlike
+    :func:`update_cast_info`'s surgical per-field edits, this always writes the whole file, so
+    silently overwriting one that already has a researcher's own tuned values would be a real
+    data-loss risk.
+    """
+    path = Path(path)
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"{path} already exists; pass overwrite=True to replace it")
+    path.write_text(format_init_cops_dat(params), newline="")
 
 
 @dataclass(frozen=True)

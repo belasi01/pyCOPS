@@ -27,6 +27,7 @@ step 1 always starts blank. Or directly via ``streamlit run src/pycops/ui/clean_
 
 from __future__ import annotations
 
+import html
 import sys
 from pathlib import Path
 
@@ -35,12 +36,15 @@ import numpy as np
 import streamlit as st
 
 from pycops.io.config import (
+    INIT_COPS_DAT_HELP,
     CastInfo,
+    default_init_cops_params,
     parse_optional_float,
     parse_override_field,
     read_info_cops,
     read_init_cops,
     update_cast_info,
+    write_init_cops,
 )
 from pycops.io.discovery import (
     FLAG_BIOSHADE,
@@ -53,11 +57,12 @@ from pycops.io.discovery import (
 )
 from pycops.io.raw import parse_cast_filename, read_cast
 from pycops.io.scaffold import discover_l1_casts, scaffold_station, validate_station_id
+from pycops.processing.position import find_gps_file
 
 # Per-instrument info.cops.dat override fields, edited as free-text comma-separated lists (one
 # value per instruments.optics entry, or "x" for "use init.cops.dat's default") since they're
 # rarely touched cast-by-cast and this matches the format researchers already know from hand-
-# editing the file -- see the "Overrides avancés" expander in _render_clean_tab().
+# editing the file -- see the "Advanced per-instrument overrides" expander in _render_clean_tab().
 _OVERRIDE_FIELDS = (
     ("sub_surface_removed_layer", "sub.surface.removed.layer"),
     ("tiltmax", "tiltmax"),
@@ -68,14 +73,54 @@ _OVERRIDE_FIELDS = (
 
 # select.cops.dat's flag values (see pycops.io.discovery), labeled for the UI.
 _FLAG_LABELS = {
-    FLAG_REJECTED: "Reject (0)",
-    FLAG_NORMAL: "Normal (1)",
-    FLAG_BIOSHADE: "BioShade (2)",
-    FLAG_UNDER_ICE: "Under ice (3)",
+    FLAG_REJECTED: "Invalid (0)",
+    FLAG_NORMAL: "Valid Light profile (1)",
+    FLAG_BIOSHADE: "Bioshade (2)",
+    FLAG_UNDER_ICE: "UnderIce profile (3)",
 }
-# Matches discovery.py's own _DEFAULT_METHOD (private there, so not imported directly).
+# Matches discovery.py's own _DEFAULT_METHOD (private there, so not imported directly). The file
+# still stores these R-package-native values ("Rrs.0p"/"Rrs.0p.linear") -- only the UI label
+# changes (see _METHOD_LABELS).
 _METHOD_OPTIONS = ("Rrs.0p", "Rrs.0p.linear")
 _DEFAULT_METHOD = "Rrs.0p.linear"
+_METHOD_LABELS = {
+    "Rrs.0p": "LOESS (non-linear)",
+    "Rrs.0p.linear": "Linear",
+}
+
+_TAB_SCAFFOLD = "1. Create a station (L1 -> L2)"
+_TAB_CLEAN = "2. Clean casts"
+
+# info.cops.dat's "chl" field selects the absorption model shadow correction uses (see
+# pycops.processing.shadow.resolve_absorption): 999 = derived from this cast's own fitted Kd
+# (Morel & Maritorena 2001 eq. 8'), >0 = Morel & Maritorena case-1-waters model from a manually
+# entered chlorophyll concentration, 0 = a per-wavelength table read from absorption.cops.dat, NA
+# = shadow correction skipped entirely. Presented as a dropdown instead of a raw numeric-sentinel
+# text field, matching how flag/method are already dropdowns below.
+_CHL_MODE_KD = "Kd-derived (default)"
+_CHL_MODE_MOREL = "Morel & Maritorena (chlorophyll)"
+_CHL_MODE_FILE = "From a file (absorption.cops.dat)"
+_CHL_MODE_NONE = "No shadow correction"
+_CHL_MODES = (_CHL_MODE_KD, _CHL_MODE_MOREL, _CHL_MODE_FILE, _CHL_MODE_NONE)
+
+
+def _chl_mode_for_flag(chl_flag: float | None) -> str:
+    """Maps an *existing* info.cops.dat row's chl value to its dropdown mode.
+
+    Must faithfully reflect the file's actual content -- the Save button resends whichever mode
+    is shown, so this is never allowed to silently reinterpret a value already on disk (e.g.
+    turning a real chl=0 into a saved chl=999). The "default for a brand-new cast with no
+    info.cops.dat row at all" case (999/Kd-derived, per Simon) is handled separately by the
+    caller (`_render_clean_tab`), which only falls back to this function when `info` exists.
+    """
+    if chl_flag is None:
+        return _CHL_MODE_NONE
+    if chl_flag == 999:
+        return _CHL_MODE_KD
+    if chl_flag > 0:
+        return _CHL_MODE_MOREL
+    # chl_flag == 0: the file's own "read absorption.cops.dat" sentinel.
+    return _CHL_MODE_FILE
 
 
 def _existing_info(info_path: Path, filename: str) -> CastInfo | None:
@@ -141,20 +186,20 @@ def _directory_browser(key: str, chosen_key: str) -> None:
 
     st.caption(f"📂 {current_path}")
 
-    if st.button("⬆️ Dossier parent", key=f"{key}_up", disabled=current_path.parent == current_path):
+    if st.button("⬆️ Parent folder", key=f"{key}_up", disabled=current_path.parent == current_path):
         st.session_state[browse_key] = str(current_path.parent)
         st.rerun()
 
     subdirs = _list_subdirs(current_path)
     if not subdirs:
-        st.caption("(aucun sous-dossier)")
+        st.caption("(no subfolders)")
     for sub in subdirs:
         if st.button(f"📁 {sub}", key=f"{key}_sub_{sub}", use_container_width=True):
             st.session_state[browse_key] = str(current_path / sub)
             st.rerun()
 
     st.divider()
-    if st.button("✅ Choisir ce dossier", key=f"{key}_choose", type="primary"):
+    if st.button("✅ Choose this folder", key=f"{key}_choose", type="primary"):
         st.session_state[chosen_key] = str(current_path)
         st.session_state.pop(browse_key, None)
         st.rerun()
@@ -171,65 +216,178 @@ def _directory_input(label: str, key: str, default: str = "") -> str:
         value = st.text_input(label, value=default, key=key)
     with col_button:
         st.write("")  # vertical spacer, roughly aligns the popover button with the text field
-        with st.popover("📁 Parcourir"):
+        with st.popover("📁 Browse"):
             _directory_browser(key, chosen_key)
     return value
 
 
-def _render_scaffold_tab() -> None:
+_INIT_GEN_INSTRUMENT_PARAMS = (
+    ("tiltmax.optics", "Max. tilt (°)"),
+    ("depth.interval.for.smoothing.optics", "Smoothing interval (m)"),
+    ("sub.surface.removed.layer.optics", "Sub-surface layer excluded (m)"),
+    ("delta.capteur.optics", "Depth offset (m)"),
+    ("radius.instrument.optics", "Housing radius (m)"),
+    ("linear.fit.Rsquared.threshold.optics", "Min. R² (linear fit)"),
+    ("linear.fit.max.delta.depth.optics", "Max. linear-fit window (m)"),
+)
+
+
+def _render_init_cops_dat_generator_form() -> dict[str, object]:
+    """Form for a brand-new ``init.cops.dat``, pre-filled with :func:`default_init_cops_params`'s
+    typical starting values and one help caption per field (:data:`INIT_COPS_DAT_HELP`)."""
     st.caption(
-        "Copie les casts choisis d'un dossier L1 (lecture seule, jamais modifié) vers un "
-        "nouveau dossier de station L2/YYYYMMDD_StationXXX/cops/."
+        "Typical starting values, taken from real deployments -- verify these, especially the "
+        "depth offset and housing radius (physical properties of each sensor, see its "
+        "calibration sheet)."
     )
 
-    l1_input = _directory_input("Dossier L1 source", key="scaffold_l1")
+    st.write("Optical sensors present")
+    st.caption(INIT_COPS_DAT_HELP["instruments.optics"])
+    cols = st.columns(4)
+    instrument_checked = {"Ed0": True}
+    with cols[0]:
+        st.checkbox("Ed0", value=True, disabled=True, key="scaffold_init_instr_Ed0")
+    for col, instr, default in zip(cols[1:], ("EdZ", "LuZ", "EuZ"), (True, True, False)):
+        with col:
+            instrument_checked[instr] = st.checkbox(
+                instr, value=default, key=f"scaffold_init_instr_{instr}"
+            )
+    instruments = tuple(instr for instr in ("Ed0", "EdZ", "LuZ", "EuZ") if instrument_checked[instr])
+
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        depth_is_on = st.selectbox(
+            "Reference depth sensor",
+            instruments,
+            index=instruments.index("LuZ") if "LuZ" in instruments else 0,
+            key="scaffold_init_depth_is_on",
+            help=INIT_COPS_DAT_HELP["depth.is.on"],
+        )
+    with col_b:
+        number_of_fields_before_date = st.number_input(
+            "Segments before the date in the file name",
+            min_value=1,
+            value=3,
+            step=1,
+            key="scaffold_init_n_fields",
+            help=INIT_COPS_DAT_HELP["number.of.fields.before.date"],
+        )
+    with col_c:
+        windspeed_ms = st.number_input(
+            "Default wind speed (m/s)",
+            min_value=0.0,
+            value=4.0,
+            key="scaffold_init_windspeed",
+            help=INIT_COPS_DAT_HELP["windspeed_ms"],
+        )
+
+    params = default_init_cops_params(
+        instruments,
+        depth_is_on=depth_is_on,
+        number_of_fields_before_date=int(number_of_fields_before_date),
+        windspeed_ms=windspeed_ms,
+    )
+
+    with st.expander("Per-instrument default values (verify these)"):
+        header_cols = st.columns([2, *([1] * len(instruments))])
+        header_cols[0].write("")
+        for col, instr in zip(header_cols[1:], instruments):
+            col.write(f"**{instr}**")
+        for name, label in _INIT_GEN_INSTRUMENT_PARAMS:
+            row_cols = st.columns([2, *([1] * len(instruments))])
+            row_cols[0].caption(f"{label}  \n{INIT_COPS_DAT_HELP[name]}")
+            for col, instr in zip(row_cols[1:], instruments):
+                default_value = params[name][instr]
+                with col:
+                    if np.isnan(default_value):
+                        st.text_input(
+                            instr,
+                            value="NA",
+                            key=f"scaffold_init_{name}_{instr}",
+                            label_visibility="collapsed",
+                            disabled=True,
+                            help="Doesn't apply to the surface sensor (Ed0).",
+                        )
+                    else:
+                        params[name][instr] = st.number_input(
+                            instr,
+                            value=float(default_value),
+                            key=f"scaffold_init_{name}_{instr}",
+                            label_visibility="collapsed",
+                        )
+
+    return params
+
+
+def _render_scaffold_tab() -> None:
+    st.caption(
+        "Copies the chosen casts from an L1 folder (read-only, never modified) into a new "
+        "L2/YYYYMMDD_StationXXX/cops/ station folder."
+    )
+
+    l1_input = _directory_input("Source L1 folder", key="scaffold_l1")
     if not l1_input:
-        st.info("Entrer un dossier L1 pour commencer.")
+        st.info("Enter an L1 folder to begin.")
         return
 
     l1_dir = Path(l1_input)
     if not l1_dir.is_dir():
-        st.error(f"{l1_dir} n'est pas un dossier.")
+        st.error(f"{l1_dir} is not a directory.")
         return
 
     casts = discover_l1_casts(l1_dir)
     if not casts:
-        st.warning(f"Aucun fichier *_URC.tsv/.csv trouvé dans {l1_dir}.")
+        st.warning(f"No *_URC.tsv/.csv file found in {l1_dir}.")
         return
 
-    st.write(f"{len(casts)} cast(s) trouvé(s) -- décocher ceux qui n'appartiennent pas à cette station:")
+    st.write(f"{len(casts)} cast(s) found -- check the ones that belong to this station:")
     selected: list[str] = []
     for cast_path in casts:
         info = parse_cast_filename(cast_path)
         label = f"{cast_path.name} ({info.date.strftime('%Y-%m-%d %H:%M')})"
-        if st.checkbox(label, value=True, key=f"scaffold_cast_{cast_path.name}"):
+        if st.checkbox(label, value=False, key=f"scaffold_cast_{cast_path.name}"):
             selected.append(cast_path.name)
 
-    station_id_input = st.text_input("ID de la station (ex: MAN-F05)", key="scaffold_station_id")
+    station_id_input = st.text_input("Station ID (e.g. MAN-F05)", key="scaffold_station_id")
     l2_parent_input = _directory_input(
-        "Dossier L2 parent (le nouveau dossier de station sera créé dedans)", key="scaffold_l2_parent"
+        "Parent L2 folder (the new station folder will be created inside it)", key="scaffold_l2_parent"
     )
-    init_template_input = st.text_input(
-        "(Optionnel) copier init.cops.dat depuis une station existante", key="scaffold_init_template"
+    st.markdown("**init.cops.dat** (processing parameters, one per instrument system)")
+    init_mode = st.radio(
+        "How should init.cops.dat be obtained for this station?",
+        ("Do nothing", "Copy from an existing station", "Generate a new file"),
+        key="scaffold_init_mode",
+        help="This file rarely changes from one deployment to the next for the same instrument "
+        "system -- copying an existing file is usually faster than re-entering everything. Only "
+        "choose 'Generate' for a brand-new instrument system.",
     )
-    overwrite = st.checkbox("Écraser les fichiers déjà présents à destination", key="scaffold_overwrite")
+    init_template_input = ""
+    init_params: dict[str, object] | None = None
+    if init_mode == "Copy from an existing station":
+        init_template_input = st.text_input(
+            "Path to an existing init.cops.dat", key="scaffold_init_template"
+        )
+    elif init_mode == "Generate a new file":
+        init_params = _render_init_cops_dat_generator_form()
+
+    overwrite = st.checkbox("Overwrite files already present at the destination", key="scaffold_overwrite")
 
     if selected and l2_parent_input:
         try:
             preview_date = parse_cast_filename(l1_dir / selected[0]).date.date()
             preview_id = validate_station_id(station_id_input) if station_id_input.strip() else "???"
             st.caption(
-                f"Destination : {Path(l2_parent_input) / f'{preview_date:%Y%m%d}_Station{preview_id}' / 'cops'}"
+                f"Destination: {Path(l2_parent_input) / f'{preview_date:%Y%m%d}_Station{preview_id}' / 'cops'}"
             )
         except ValueError:
             pass
 
-    if st.button("Créer la station", key="scaffold_create"):
+    if st.button("Create station", key="scaffold_create"):
         if not selected:
-            st.error("Sélectionner au moins un cast.")
+            st.error("Select at least one cast.")
             return
         if not l2_parent_input:
-            st.error("Indiquer le dossier L2 parent.")
+            st.error("Enter the parent L2 folder.")
             return
         try:
             result = scaffold_station(
@@ -244,17 +402,40 @@ def _render_scaffold_tab() -> None:
             st.error(str(exc))
             return
 
-        st.success(f"Station créée : {result.destination}")
-        st.write(f"Casts copiés ({len(result.copied_casts)}): {result.copied_casts}")
+        has_warning = bool(result.skipped_existing)
+        if init_params is not None:
+            init_dest = result.destination / "init.cops.dat"
+            if init_dest.exists() and not overwrite:
+                st.warning(
+                    f"init.cops.dat already exists at {init_dest} -- not overwritten (check "
+                    "'Overwrite' to force it)."
+                )
+                has_warning = True
+            else:
+                write_init_cops(init_dest, init_params, overwrite=True)
+                st.write("init.cops.dat generated from the form.")
+
+        st.success(f"Station created: {result.destination}")
+        st.write(f"Casts copied ({len(result.copied_casts)}): {result.copied_casts}")
         if result.copied_gps_files:
-            st.write(f"Fichier(s) GPS copié(s): {result.copied_gps_files}")
+            st.write(f"GPS file(s) copied: {result.copied_gps_files}")
         if result.copied_init:
-            st.write("init.cops.dat copié depuis le gabarit fourni.")
+            st.write("init.cops.dat copied from the supplied template.")
         if result.skipped_existing:
             st.warning(
-                f"Déjà présents à destination, non écrasés (coche 'Écraser' pour forcer): "
-                f"{result.skipped_existing}"
+                f"Already present at the destination, not overwritten (check 'Overwrite' to "
+                f"force it): {result.skipped_existing}"
             )
+
+        if not has_warning:
+            # Nothing needs a second look -- jump straight to the cleaning tab instead of
+            # making the researcher go find the folder they just created (st.toast survives
+            # this rerun, unlike st.success/st.write, so the confirmation isn't lost).
+            st.session_state["clean_dir"] = str(result.destination)
+            st.session_state.pop("clean_cast_select", None)
+            st.session_state["active_tab_pending"] = _TAB_CLEAN
+            st.toast(f"Station created: {result.destination}", icon="✅")
+            st.rerun()
 
 
 def _render_clean_tab() -> None:
@@ -285,15 +466,25 @@ def _render_clean_tab() -> None:
         st.warning(f"No *_URC.tsv/.csv cast files found in {directory}.")
         return
 
-    st.session_state.setdefault("cast_idx", 0)
-    st.session_state["cast_idx"] = min(st.session_state["cast_idx"], len(casts) - 1)
-
     labels = [p.name for p in casts]
-    selected_label = st.selectbox(
-        f"Cast ({len(casts)} found)", labels, index=st.session_state["cast_idx"], key="clean_cast_select"
-    )
-    st.session_state["cast_idx"] = labels.index(selected_label)
-    cast_path = casts[st.session_state["cast_idx"]]
+    # A widget's own session_state key can't be reassigned after it's been instantiated in the
+    # same run (Streamlit raises) -- so "advance to the next cast" (the Save && next button,
+    # below) stashes its target in this separate "_pending" key instead, applied here, *before*
+    # the selectbox is created. Same trick _directory_input() already uses for its own browser.
+    if "clean_cast_select_pending" in st.session_state:
+        st.session_state["clean_cast_select"] = st.session_state.pop("clean_cast_select_pending")
+    st.session_state.setdefault("clean_cast_select", labels[0])
+    if st.session_state["clean_cast_select"] not in labels:
+        st.session_state["clean_cast_select"] = labels[0]
+
+    selected_label = st.selectbox(f"Cast ({len(casts)} found)", labels, key="clean_cast_select")
+    cast_idx = labels.index(selected_label)
+    cast_path = casts[cast_idx]
+    # Every per-cast widget below is keyed with this suffix so switching casts (via this
+    # selectbox, or the "Save && next" button below) always shows *that* cast's own saved
+    # values -- a fixed key shared across casts would otherwise stick to whatever was last typed
+    # (Streamlit only honors a widget's `value=` the first time a given key appears).
+    ck = lambda base: f"{base}::{cast_path.name}"  # noqa: E731
 
     try:
         ds = read_cast(cast_path, instruments=instruments)
@@ -318,17 +509,64 @@ def _render_clean_tab() -> None:
     col_lon, col_lat, col_chl = st.columns(3)
     with col_lon:
         lon_text = st.text_input(
-            "Longitude (deg, or NA)", value=_format_optional_float(info.longitude if info else None), key="clean_lon"
+            "Longitude (deg, or NA)",
+            value=_format_optional_float(info.longitude if info else None),
+            key=ck("clean_lon"),
         )
     with col_lat:
         lat_text = st.text_input(
-            "Latitude (deg, or NA)", value=_format_optional_float(info.latitude if info else None), key="clean_lat"
+            "Latitude (deg, or NA)",
+            value=_format_optional_float(info.latitude if info else None),
+            key=ck("clean_lat"),
         )
+
+    if parse_optional_float(lon_text) is None or parse_optional_float(lat_text) is None:
+        gps_file = find_gps_file(directory)
+        if gps_file is not None:
+            st.markdown(
+                f"<span style='color:red; font-size:1.15rem;'>📍 Position not entered above -- "
+                f"will be taken automatically from the GPS file found in this folder "
+                f"({html.escape(gps_file.name)}), at the cast's time.</span>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.caption(
+                "⚠️ Position not entered and no GPS_*.tsv/.csv file found in this folder -- shadow "
+                "correction will be disabled for this cast until a position is available."
+            )
+
     with col_chl:
+        default_chl_mode = _chl_mode_for_flag(info.chl_flag if info else None) if info else _CHL_MODE_KD
+        if default_chl_mode not in _CHL_MODES:
+            default_chl_mode = _CHL_MODE_KD
+        chl_mode = st.selectbox(
+            "Shadow correction (absorption)",
+            _CHL_MODES,
+            index=_CHL_MODES.index(default_chl_mode),
+            key=ck("clean_chl_mode"),
+            help="Absorption model used for the LuZ/EuZ shadow correction.",
+        )
+
+    if chl_mode == _CHL_MODE_NONE:
+        chl_text = "NA"
+    elif chl_mode == _CHL_MODE_KD:
+        chl_text = "999"
+    elif chl_mode == _CHL_MODE_FILE:
+        chl_text = "0"
+        absorption_path = directory / "absorption.cops.dat"
+        if absorption_path.exists():
+            st.caption(f"Uses {absorption_path.name} (already present in this folder).")
+        else:
+            st.caption(
+                "⚠️ No absorption.cops.dat found in this folder. File selection is coming later -- "
+                "for now, place one manually in the station's folder."
+            )
+    else:  # _CHL_MODE_MOREL
+        default_conc = info.chl_flag if (info and info.chl_flag and info.chl_flag > 0) else 1.0
         chl_text = st.text_input(
-            "chl (>0=chlorophyll, 0=absorption.cops.dat, 999=Kd-derived, NA=no shadow correction)",
-            value=_format_optional_float(info.chl_flag if info else None),
-            key="clean_chl",
+            "Chlorophyll concentration (mg/m³)",
+            value=_format_optional_float(default_conc),
+            key=ck("clean_chl_conc"),
         )
 
     existing_time_window = info.time_window if info else None
@@ -342,10 +580,10 @@ def _render_clean_tab() -> None:
         max_value=total_duration,
         value=(default_start, default_end),
         step=max(total_duration / 500, 0.05),
-        key="clean_time_window",
+        key=ck("clean_time_window"),
     )
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(9, 3.2))
     ax.plot(elapsed, depth, ".", markersize=2, color="tab:blue")
     ax.axvspan(0, start, color="gray", alpha=0.3)
     ax.axvspan(end, total_duration, color="gray", alpha=0.3)
@@ -374,24 +612,32 @@ def _render_clean_tab() -> None:
             flag_keys,
             index=flag_keys.index(default_flag),
             format_func=lambda k: _FLAG_LABELS[k],
-            key="clean_flag",
+            key=ck("clean_flag"),
         )
     with col2:
         method = st.selectbox(
-            "Rrs method", _METHOD_OPTIONS, index=_METHOD_OPTIONS.index(default_method), key="clean_method"
+            "Subsurface extrapolation of upwelling Lu/Eu",
+            _METHOD_OPTIONS,
+            index=_METHOD_OPTIONS.index(default_method),
+            format_func=lambda k: _METHOD_LABELS[k],
+            key=ck("clean_method"),
         )
     with col3:
-        shallow = st.checkbox("Shallow (profile ends near bottom)", value=default_shallow, key="clean_shallow")
+        shallow = st.checkbox(
+            "Shallow (profile ends near bottom)", value=default_shallow, key=ck("clean_shallow")
+        )
 
     override_texts: dict[str, str] = {}
-    with st.expander("Overrides avancés par instrument (rarement modifiés)"):
+    with st.expander("Advanced per-instrument overrides (rarely changed)"):
         st.caption(
-            f"Valeurs séparées par virgule, une par instrument ({', '.join(instruments)}), "
-            "ou 'x' pour garder la valeur par défaut de init.cops.dat."
+            f"Comma-separated values, one per instrument ({', '.join(instruments)}), or 'x' to "
+            "keep init.cops.dat's default value."
         )
         for attr, label in _OVERRIDE_FIELDS:
             override_texts[attr] = st.text_input(
-                label, value=_format_override(getattr(info, attr) if info else None), key=f"clean_override_{attr}"
+                label,
+                value=_format_override(getattr(info, attr) if info else None),
+                key=ck(f"clean_override_{attr}"),
             )
 
     if st.button("Save && next", key="clean_save"):
@@ -409,8 +655,14 @@ def _render_clean_tab() -> None:
             st.error(f"Couldn't parse a field: {exc}")
             return
         update_cast_selection(select_path, cast_path.name, flag, method, shallow=shallow)
-        st.success(f"Saved info.cops.dat and select.cops.dat rows for {cast_path.name}")
-        st.session_state["cast_idx"] = min(st.session_state["cast_idx"] + 1, len(casts) - 1)
+        # A plain st.success() here would be discarded by the st.rerun() below before the
+        # browser ever renders it (this was previously read as the button "not doing anything");
+        # st.toast() is explicitly designed to survive one rerun.
+        st.toast(f"Saved info.cops.dat and select.cops.dat rows for {cast_path.name}")
+        # Advance by writing the selectbox's own key (not a separate index variable) -- that's
+        # the only way Streamlit actually honors a programmatic change to a stateful widget.
+        next_idx = min(cast_idx + 1, len(casts) - 1)
+        st.session_state["clean_cast_select_pending"] = labels[next_idx]
         st.rerun()
 
 
@@ -418,7 +670,16 @@ def run_app() -> None:
     st.set_page_config(page_title="pycops -- cast cleaning", layout="wide")
     st.title("pycops -- interactive station tools")
 
-    tab_scaffold, tab_clean = st.tabs(["1. Créer une station (L1 -> L2)", "2. Nettoyer les casts"])
+    # key + on_change="rerun" makes the active tab a real, programmatically settable piece of
+    # state (st.session_state["active_tab"]) -- used by _render_scaffold_tab() to jump straight
+    # to the cleaning tab, with its folder pre-filled, right after a station is created. Applied
+    # via a "_pending" key (see clean_cast_select_pending above) since active_tab itself can't be
+    # reassigned after st.tabs() below has already instantiated it for this run.
+    if "active_tab_pending" in st.session_state:
+        st.session_state["active_tab"] = st.session_state.pop("active_tab_pending")
+    tab_scaffold, tab_clean = st.tabs(
+        [_TAB_SCAFFOLD, _TAB_CLEAN], key="active_tab", on_change="rerun"
+    )
     with tab_scaffold:
         _render_scaffold_tab()
     with tab_clean:
