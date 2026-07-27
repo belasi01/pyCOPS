@@ -33,7 +33,6 @@ import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 
@@ -42,8 +41,6 @@ from pycops.io.config import (
     CastInfo,
     default_init_cops_params,
     parse_optional_float,
-    parse_override_field,
-    read_info_cops,
     read_init_cops,
     update_cast_info,
     write_init_cops,
@@ -53,11 +50,9 @@ from pycops.io.discovery import (
     FLAG_NORMAL,
     FLAG_REJECTED,
     FLAG_UNDER_ICE,
-    CastSelection,
     discover_deployment,
     find_deployment_folders,
     read_deployment_casts,
-    read_select_cops,
     update_cast_selection,
 )
 from pycops.io.netcdf import write_deployment_result
@@ -65,20 +60,15 @@ from pycops.io.raw import parse_cast_filename, read_cast
 from pycops.io.scaffold import discover_l1_casts, scaffold_station, validate_station_id
 from pycops.processing.deployment import DeploymentProcessingResult, process_deployment
 from pycops.processing.position import find_gps_file, position_from_gps, read_gps_file
-from pycops.ui._common import _directory_input
-from pycops.ui.analyze_app import render_analyze_tab
-
-# Per-instrument info.cops.dat override fields, edited as free-text comma-separated lists (one
-# value per instruments.optics entry, or "x" for "use init.cops.dat's default") since they're
-# rarely touched cast-by-cast and this matches the format researchers already know from hand-
-# editing the file -- see the "Advanced per-instrument overrides" expander in _render_clean_tab().
-_OVERRIDE_FIELDS = (
-    ("sub_surface_removed_layer", "sub.surface.removed.layer"),
-    ("tiltmax", "tiltmax"),
-    ("depth_interval_for_smoothing", "depth.interval.for.smoothing"),
-    ("linear_r2_threshold", "linear.fit.Rsquared.threshold"),
-    ("linear_max_delta_depth", "linear.fit.max.delta.depth"),
+from pycops.ui._common import (
+    _directory_input,
+    existing_info,
+    existing_selection,
+    parsed_override_fields,
+    render_override_fields_editor,
+    render_time_window_editor,
 )
+from pycops.ui.analyze_app import render_analyze_tab
 
 # select.cops.dat's flag values (see pycops.io.discovery), labeled for the UI.
 _FLAG_LABELS = {
@@ -134,37 +124,11 @@ def _chl_mode_for_flag(chl_flag: float | None) -> str:
     return _CHL_MODE_FILE
 
 
-def _existing_info(info_path: Path, filename: str) -> CastInfo | None:
-    if not info_path.exists():
-        return None
-    for entry in read_info_cops(info_path):
-        if entry.file == filename:
-            return entry
-    return None
-
-
 def _format_optional_float(value: float | None) -> str:
     # ".10g", not the default 6-sig-fig "g": a plain "g" truncates a real coordinate like
     # -68.11626 down to -68.1163 in the text box, silently losing precision before the user
     # even hits Save.
     return "NA" if value is None else f"{value:.10g}"
-
-
-def _format_override(value: list[float] | None) -> str:
-    if value is None:
-        return "x"
-    # Matches the file's own "NA" sentinel for a per-value override that doesn't apply
-    # (e.g. a linear-fit threshold at the surface Ed0 instrument) -- not Python's "nan" repr.
-    return ",".join("NA" if np.isnan(v) else f"{v:.10g}" for v in value)
-
-
-def _existing_selection(select_path: Path, filename: str) -> CastSelection | None:
-    if not select_path.exists():
-        return None
-    for entry in read_select_cops(select_path):
-        if entry.file == filename:
-            return entry
-    return None
 
 
 def _cast_position_resolved_approx(cast_path: Path, info: CastInfo | None, gps_table) -> bool:
@@ -347,6 +311,13 @@ def _render_scaffold_tab() -> None:
         "Copies the chosen casts from an L1 folder (read-only, never modified) into a new "
         "L2/YYYYMMDD_StationXXX/cops/ station folder."
     )
+
+    _directory_input(
+        "Project parent folder (optional -- every 'Browse' button below, and on the other tabs, "
+        "starts here instead of your home folder)",
+        key="project_root_dir",
+    )
+    st.divider()
 
     l1_input = _directory_input("Source L1 folder", key="scaffold_l1")
     if not l1_input:
@@ -541,9 +512,8 @@ def _render_clean_tab() -> None:
     time = ds["time"].values
     elapsed = (time - time.min()) / np.timedelta64(1, "s")
     depth = ds[depth_var].values
-    total_duration = float(elapsed.max())
 
-    info = _existing_info(info_path, cast_path.name)
+    info = existing_info(info_path, cast_path.name)
 
     st.subheader("Position & absorption")
     col_lon, col_lat, col_chl = st.columns(3)
@@ -631,38 +601,23 @@ def _render_clean_tab() -> None:
         )
 
     existing_time_window = info.time_window if info else None
-    default_start, default_end = existing_time_window if existing_time_window is not None else (0.0, total_duration)
-    default_start = max(0.0, min(default_start, total_duration))
-    default_end = max(default_start, min(default_end, total_duration))
-
-    start, end = st.slider(
-        "Time window kept (seconds elapsed from first scan)",
-        min_value=0.0,
-        max_value=total_duration,
-        value=(default_start, default_end),
-        step=max(total_duration / 500, 0.05),
+    start, end = render_time_window_editor(
+        elapsed,
+        depth,
+        f"{depth_is_on} depth (m)",
+        cast_path.name,
+        existing_time_window,
         key=ck("clean_time_window"),
     )
 
-    fig, ax = plt.subplots(figsize=(9, 3.2))
-    ax.plot(elapsed, depth, ".", markersize=2, color="tab:blue")
-    ax.axvspan(0, start, color="gray", alpha=0.3)
-    ax.axvspan(end, total_duration, color="gray", alpha=0.3)
-    ax.set_xlabel("Elapsed time (s)")
-    ax.set_ylabel(f"{depth_is_on} depth (m)")
-    ax.invert_yaxis()
-    ax.set_title(cast_path.name)
-    st.pyplot(fig)
-    plt.close(fig)
-
-    existing_selection = _existing_selection(select_path, cast_path.name)
-    default_flag = existing_selection.flag if existing_selection else FLAG_NORMAL
+    current_selection = existing_selection(select_path, cast_path.name)
+    default_flag = current_selection.flag if current_selection else FLAG_NORMAL
     if default_flag not in _FLAG_LABELS:
         default_flag = FLAG_NORMAL
-    default_method = existing_selection.method if existing_selection else _DEFAULT_METHOD
+    default_method = current_selection.method if current_selection else _DEFAULT_METHOD
     if default_method not in _METHOD_OPTIONS:
         default_method = _DEFAULT_METHOD
-    default_shallow = existing_selection.shallow if existing_selection else False
+    default_shallow = current_selection.shallow if current_selection else False
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -687,18 +642,8 @@ def _render_clean_tab() -> None:
             "Shallow (profile ends near bottom)", value=default_shallow, key=ck("clean_shallow")
         )
 
-    override_texts: dict[str, str] = {}
     with st.expander("Advanced per-instrument overrides (rarely changed)"):
-        st.caption(
-            f"Comma-separated values, one per instrument ({', '.join(instruments)}), or 'x' to "
-            "keep init.cops.dat's default value."
-        )
-        for attr, label in _OVERRIDE_FIELDS:
-            override_texts[attr] = st.text_input(
-                label,
-                value=_format_override(getattr(info, attr) if info else None),
-                key=ck(f"clean_override_{attr}"),
-            )
+        override_texts = render_override_fields_editor(info, instruments, key_prefix=ck("clean_override"))
 
     if st.button("Save", key="clean_save"):
         try:
@@ -709,7 +654,7 @@ def _render_clean_tab() -> None:
                 latitude=parse_optional_float(lat_text),
                 chl_flag=parse_optional_float(chl_text),
                 time_window=(start, end),
-                **{attr: parse_override_field(override_texts[attr]) for attr, _ in _OVERRIDE_FIELDS},
+                **parsed_override_fields(override_texts),
             )
         except ValueError as exc:
             st.error(f"Couldn't parse a field: {exc}")
@@ -730,7 +675,7 @@ def _render_clean_tab() -> None:
     # processing any of them, so it deliberately doesn't nudge the researcher forward until every
     # cast in this folder already has both a saved info.cops.dat and select.cops.dat row.
     all_cleaned = all(
-        _existing_info(info_path, c.name) is not None and _existing_selection(select_path, c.name) is not None
+        existing_info(info_path, c.name) is not None and existing_selection(select_path, c.name) is not None
         for c in casts
     )
     if all_cleaned:
@@ -739,7 +684,7 @@ def _render_clean_tab() -> None:
         # silently process with shadow correction skipped -- Simon wants that caught here,
         # before processing, not discovered later in a shadow_correction_note.
         missing_position = [
-            c.name for c in casts if not _cast_position_resolved_approx(c, _existing_info(info_path, c.name), gps_table)
+            c.name for c in casts if not _cast_position_resolved_approx(c, existing_info(info_path, c.name), gps_table)
         ]
         if missing_position:
             st.error(
@@ -891,6 +836,12 @@ def _render_process_tab() -> None:
             with st.spinner(f"Processing {directory.name}..."):
                 summary = _process_one_deployment(directory)
             _render_process_summary(directory.name, summary, expanded=True)
+
+        st.divider()
+        if st.button("Analyze this station's results ->", key="process_to_analyze"):
+            st.session_state["analyze_dir"] = str(directory)
+            st.session_state["active_tab_pending"] = _TAB_ANALYZE
+            st.rerun()
         return
 
     # Batch mode.
@@ -946,11 +897,12 @@ def run_app() -> None:
 
     # key + on_change="rerun" makes the active tab a real, programmatically settable piece of
     # state (st.session_state["active_tab"]) -- used by _render_scaffold_tab() to jump straight to
-    # the cleaning tab (folder pre-filled) right after a station is created, and by
+    # the cleaning tab (folder pre-filled) right after a station is created, by
     # _render_clean_tab() to jump to the process tab (folder pre-filled) once every cast in the
-    # folder has been cleaned. Applied via a "_pending" key (see clean_cast_select_pending above)
-    # since active_tab itself can't be reassigned after st.tabs() below has already instantiated
-    # it for this run.
+    # folder has been cleaned, and by _render_process_tab() to jump to the analyze tab (folder
+    # pre-filled) once a station's been processed. Applied via a "_pending" key (see
+    # clean_cast_select_pending above) since active_tab itself can't be reassigned after
+    # st.tabs() below has already instantiated it for this run.
     if "active_tab_pending" in st.session_state:
         st.session_state["active_tab"] = st.session_state.pop("active_tab_pending")
     tab_scaffold, tab_clean, tab_process, tab_analyze = st.tabs(

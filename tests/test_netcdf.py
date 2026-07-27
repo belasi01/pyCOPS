@@ -162,6 +162,28 @@ def test_write_cast_result_round_trips_through_netcdf(tmp_path):
         reloaded.close()
 
 
+def test_cast_result_to_dataset_records_excluded_wavelengths(tmp_path):
+    ds = _make_dataset()
+    result = process_cast(ds, _make_init(), excluded_wavelengths=[380.0])
+    path = tmp_path / "cast.nc"
+
+    write_cast_result(result, path, ds=ds)
+    reloaded = xr.open_dataset(path)
+    try:
+        assert reloaded.attrs["excluded_wavelengths"] == "380"
+    finally:
+        reloaded.close()
+
+
+def test_cast_result_to_dataset_no_excluded_wavelengths_is_empty_string():
+    ds = _make_dataset()
+    result = process_cast(ds, _make_init())
+
+    out = cast_result_to_dataset(result, ds=ds)
+
+    assert out.attrs["excluded_wavelengths"] == ""
+
+
 def test_cast_result_to_dataset_no_luz_still_builds(tmp_path):
     ds = _make_dataset(include_edz=True)
     ds = ds.drop_vars("LuZ")

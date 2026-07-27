@@ -103,6 +103,22 @@ def test_process_cast_ds_attrs_time_window_overrides_init_default():
     assert result.instrument_fits["LuZ"].kept[0]  # not excluded by the (unused) init default
 
 
+def test_process_cast_applies_info_cops_dat_sub_surface_removed_layer_override():
+    """Regression test: info.cops.dat's 5 per-cast override fields were parsed and editable in
+    the UI but process_cast() never actually applied them -- this confirms the fix (a stricter
+    sub.surface.removed.layer.optics for LuZ excludes more scans than the deployment default)."""
+    init = _make_init()
+    init["instruments.optics"] = ("Ed0", "LuZ")
+
+    baseline = process_cast(_make_dataset_with_time(include_edz=False), init)
+
+    overridden_ds = _make_dataset_with_time(include_edz=False)
+    overridden_ds.attrs["sub_surface_removed_layer"] = [0.0, 4.0]  # Ed0, LuZ -- default LuZ is 0.0
+    overridden = process_cast(overridden_ds, init)
+
+    assert overridden.instrument_fits["LuZ"].kept.sum() < baseline.instrument_fits["LuZ"].kept.sum()
+
+
 def test_process_cast_fits_every_present_instrument():
     ds = _make_dataset(include_edz=True)
     result = process_cast(ds, _make_init())
@@ -127,6 +143,36 @@ def test_process_cast_computes_rrs_when_luz_present():
     # gentler-attenuation wavelengths should give finite, positive Rrs
     assert np.all(result.rrs_linear.rrs_0p[2:] > 0)
     assert np.all(np.isfinite(result.rrs_linear.rrs_0p[2:]))
+
+
+def test_process_cast_excludes_specified_wavelengths_from_both_rrs_methods():
+    """Simon's request: a final QC step to NaN out a specific bad band (e.g. 380 nm) from the
+    final Rrs regardless of which extrapolation method (LOESS/linear) ends up recommended."""
+    ds = _make_dataset()
+    result = process_cast(ds, _make_init(), excluded_wavelengths=[380.0])
+
+    assert np.isnan(result.rrs_loess.rrs_0p[1])  # WAVES[1] == 380.0
+    assert np.isnan(result.rrs_linear.rrs_0p[1])
+    assert np.isnan(result.rrs_loess.lw_0p[1])
+    # untouched wavelengths still finite
+    assert np.isfinite(result.rrs_loess.rrs_0p[2])
+    assert np.isfinite(result.rrs_linear.rrs_0p[2])
+    assert result.excluded_wavelengths == (380.0,)
+
+
+def test_process_cast_excluded_wavelengths_matches_within_floating_tolerance():
+    ds = _make_dataset()
+    result = process_cast(ds, _make_init(), excluded_wavelengths=[380.0000001])
+
+    assert np.isnan(result.rrs_loess.rrs_0p[1])
+
+
+def test_process_cast_no_excluded_wavelengths_by_default():
+    ds = _make_dataset()
+    result = process_cast(ds, _make_init())
+
+    assert result.excluded_wavelengths == ()
+    assert np.all(np.isfinite(result.rrs_loess.rrs_0p[2:]))
 
 
 def test_process_cast_rrs_none_without_luz():

@@ -8,7 +8,7 @@ import xarray as xr
 import pycops.processing.deployment as deployment_module
 from pycops.io.config import CastInfo
 from pycops.io.discovery import CastRecord, CastReadFailure, CastSelection, Deployment, DeploymentCastsResult
-from pycops.processing.deployment import process_deployment
+from pycops.processing.deployment import process_deployment, reprocess_single_cast
 from pycops.processing.position import PositionOverride
 
 GPS_TSV_FOR_PROFILE = (
@@ -179,6 +179,79 @@ def test_process_deployment_finds_and_uses_bioshade(tmp_path, monkeypatch):
         cast_result.shadow_corrections["LuZ"].edif,
         np.interp(np.array(WAVES), result.bioshade_used.waves, result.bioshade_used.ed0_dif),
     )
+
+
+def test_reprocess_single_cast_matches_process_deployment(tmp_path, monkeypatch):
+    """reprocess_single_cast() must give exactly the same result process_deployment() would for
+    that one cast -- it exists purely to avoid re-reading every sibling cast's raw file, not to
+    take a different path through the actual processing logic."""
+    deployment = _make_deployment(tmp_path)
+    datasets = {
+        PROFILE_CAST: _with_position_attrs(_with_real_time(_make_profile_dataset()), 999.0),
+        BIOSHADE_CAST: _make_bioshade_dataset(),
+    }
+    _patch_discovery(monkeypatch, deployment, datasets)
+    full_result = process_deployment(tmp_path)
+
+    # reprocess_single_cast() calls discover_deployment()/read_one_cast() directly, not
+    # read_deployment_casts() -- patch those two instead.
+    monkeypatch.setattr(deployment_module, "discover_deployment", lambda directory: deployment)
+    monkeypatch.setattr(deployment_module, "read_one_cast", lambda record, init: datasets[record.info.file])
+
+    reprocessed = reprocess_single_cast(tmp_path, PROFILE_CAST)
+    single = reprocessed.result
+
+    assert reprocessed.ds is datasets[PROFILE_CAST]
+    assert single.rrs_source == full_result.cast_results[PROFILE_CAST].rrs_source
+    np.testing.assert_allclose(
+        single.recommended_rrs.rrs_0p, full_result.cast_results[PROFILE_CAST].recommended_rrs.rrs_0p
+    )
+    assert single.shadow_correction_note == full_result.cast_results[PROFILE_CAST].shadow_correction_note
+
+
+def test_process_deployment_applies_saved_wavelength_exclusions(tmp_path, monkeypatch):
+    from pycops.io.exclusions import update_wavelength_exclusions
+
+    deployment = _make_deployment(tmp_path)
+    datasets = {
+        PROFILE_CAST: _with_position_attrs(_with_real_time(_make_profile_dataset()), 999.0),
+        BIOSHADE_CAST: _make_bioshade_dataset(),
+    }
+    _patch_discovery(monkeypatch, deployment, datasets)
+    update_wavelength_exclusions(tmp_path / "rrs_wavelength_exclusions.cops.dat", PROFILE_CAST, [380.0])
+
+    result = process_deployment(tmp_path)
+
+    cast_result = result.cast_results[PROFILE_CAST]
+    assert cast_result.excluded_wavelengths == (380.0,)
+    assert np.isnan(cast_result.rrs_linear.rrs_0p[1])  # WAVES[1] == 380.0
+    assert np.isfinite(cast_result.rrs_linear.rrs_0p[2])
+
+
+def test_reprocess_single_cast_applies_saved_wavelength_exclusions(tmp_path, monkeypatch):
+    from pycops.io.exclusions import update_wavelength_exclusions
+
+    deployment = _make_deployment(tmp_path)
+    datasets = {
+        PROFILE_CAST: _with_position_attrs(_with_real_time(_make_profile_dataset()), 999.0),
+        BIOSHADE_CAST: _make_bioshade_dataset(),
+    }
+    monkeypatch.setattr(deployment_module, "discover_deployment", lambda directory: deployment)
+    monkeypatch.setattr(deployment_module, "read_one_cast", lambda record, init: datasets[record.info.file])
+    update_wavelength_exclusions(tmp_path / "rrs_wavelength_exclusions.cops.dat", PROFILE_CAST, [380.0])
+
+    reprocessed = reprocess_single_cast(tmp_path, PROFILE_CAST)
+
+    assert reprocessed.result.excluded_wavelengths == (380.0,)
+    assert np.isnan(reprocessed.result.rrs_linear.rrs_0p[1])
+
+
+def test_reprocess_single_cast_unknown_file_raises(tmp_path, monkeypatch):
+    deployment = _make_deployment(tmp_path)
+    monkeypatch.setattr(deployment_module, "discover_deployment", lambda directory: deployment)
+
+    with pytest.raises(ValueError, match="not found"):
+        reprocess_single_cast(tmp_path, "no_such_cast.csv")
 
 
 def test_process_deployment_matches_manual_process_cast_with_bioshade(tmp_path, monkeypatch):

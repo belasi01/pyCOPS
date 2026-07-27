@@ -195,34 +195,51 @@ class DeploymentCastsResult:
     failures: list[CastReadFailure]
 
 
+def read_one_cast(record: CastRecord, init: dict[str, object]) -> xr.Dataset:
+    """Read one cast and annotate it with its ``info.cops.dat``/``select.cops.dat`` attrs.
+
+    Sets position, chlorophyll/absorption-source flag, QC flag/method, and the ``time.window``
+    and five per-instrument override fields (``sub_surface_removed_layer``/``tiltmax``/
+    ``depth_interval_for_smoothing``/``linear_r2_threshold``/``linear_max_delta_depth``) --
+    ``process_cast()`` merges the overrides present here into its own copy of ``init`` before
+    fitting, the same way it already does for ``time_window``.
+    """
+    instruments = tuple(init["instruments.optics"])
+    n_fields = int(init["number.of.fields.before.date"])
+    ds = read_cast(record.path, instruments=instruments, number_of_fields_before_date=n_fields)
+    ds.attrs.update(
+        longitude=record.info.longitude,
+        latitude=record.info.latitude,
+        chl_flag=record.info.chl_flag,
+        qc_flag=record.selection.flag,
+        rrs_method=record.selection.method,
+        shallow=record.selection.shallow,
+        time_window=record.info.time_window,
+        sub_surface_removed_layer=record.info.sub_surface_removed_layer,
+        tiltmax=record.info.tiltmax,
+        depth_interval_for_smoothing=record.info.depth_interval_for_smoothing,
+        linear_r2_threshold=record.info.linear_r2_threshold,
+        linear_max_delta_depth=record.info.linear_max_delta_depth,
+    )
+    return ds
+
+
 def read_deployment_casts(deployment: Deployment, only_kept: bool = True) -> DeploymentCastsResult:
     """Read every (kept) cast of a :class:`Deployment` into an ``xarray.Dataset``.
 
-    Each dataset is annotated with its ``info.cops.dat`` position, chlorophyll/
-    absorption-source flag, and ``select.cops.dat`` QC flag/method as attrs,
-    keyed by cast file name. A cast that fails to read (e.g. an unparseable
-    file name, given how much raw file-naming conventions vary across ~15
-    years of deployments) doesn't abort the rest of the batch: it's recorded
-    in the result's ``failures`` list with a warning instead.
+    Each dataset is annotated (see :func:`read_one_cast`) with its ``info.cops.dat`` position,
+    chlorophyll/absorption-source flag, ``select.cops.dat`` QC flag/method, and per-cast override
+    fields, keyed by cast file name. A cast that fails to read (e.g. an unparseable file name,
+    given how much raw file-naming conventions vary across ~15 years of deployments) doesn't
+    abort the rest of the batch: it's recorded in the result's ``failures`` list with a warning
+    instead.
     """
-    instruments = tuple(deployment.init["instruments.optics"])
-    n_fields = int(deployment.init["number.of.fields.before.date"])
-
     records = deployment.kept_casts() if only_kept else deployment.casts
     datasets: dict[str, xr.Dataset] = {}
     failures: list[CastReadFailure] = []
     for record in records:
         try:
-            ds = read_cast(record.path, instruments=instruments, number_of_fields_before_date=n_fields)
-            ds.attrs.update(
-                longitude=record.info.longitude,
-                latitude=record.info.latitude,
-                chl_flag=record.info.chl_flag,
-                qc_flag=record.selection.flag,
-                rrs_method=record.selection.method,
-                shallow=record.selection.shallow,
-                time_window=record.info.time_window,
-            )
+            ds = read_one_cast(record, deployment.init)
         except Exception as exc:  # noqa: BLE001 -- deliberately broad: isolate one bad cast from the rest
             error = f"{type(exc).__name__}: {exc}"
             warnings.warn(

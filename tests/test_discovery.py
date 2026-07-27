@@ -181,6 +181,28 @@ def test_read_deployment_casts_sets_time_window_attr(tmp_path):
     assert result.datasets["WISE_CAST_002_190817_221224_URC.csv"].attrs["time_window"] is None
 
 
+def test_read_deployment_casts_sets_per_cast_override_attrs(tmp_path):
+    """Regression test: these 5 fields were parsed and editable in the UI but never actually
+    reached process_cast() -- confirms read_one_cast()/read_deployment_casts() now set them."""
+    write_deployment(tmp_path)
+    deployment = discover_deployment(tmp_path)
+
+    result = read_deployment_casts(deployment, only_kept=False)
+
+    # cast 003's real fixture row: sub_surface=0.1,0.05,0.1,0; tiltmax=10,10,5,5; etc.
+    ds3 = result.datasets["WISE_CAST_003_190817_221636_URC.csv"]
+    assert ds3.attrs["sub_surface_removed_layer"] == [0.1, 0.05, 0.1, 0.0]
+    assert ds3.attrs["tiltmax"] == [10.0, 10.0, 5.0, 5.0]
+    assert ds3.attrs["depth_interval_for_smoothing"] == [40.0, 60.0, 80.0, 80.0]
+    assert ds3.attrs["linear_r2_threshold"] == [0.5, 0.6, 0.5, 0.6]
+    assert ds3.attrs["linear_max_delta_depth"] == [3.0, 3.0, 2.5, 2.5]
+
+    # casts 001/002 have "x" (no override) for all of these in the fixture.
+    ds1 = result.datasets["WISE_CAST_001_190817_220856_URC.csv"]
+    assert ds1.attrs["sub_surface_removed_layer"] is None
+    assert ds1.attrs["tiltmax"] is None
+
+
 def test_read_deployment_casts_continues_after_one_bad_cast(tmp_path, recwarn):
     write_deployment_with_bad_cast(tmp_path)
     deployment = discover_deployment(tmp_path)

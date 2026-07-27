@@ -158,6 +158,7 @@ def cast_result_to_dataset(cast_result: CastResult, ds: xr.Dataset | None = None
     attrs["rrs_source"] = cast_result.rrs_source or ""
     attrs["shadow_correction_note"] = cast_result.shadow_correction_note or ""
     attrs["bottom_note"] = cast_result.bottom_note or ""
+    attrs["excluded_wavelengths"] = ",".join(f"{w:.10g}" for w in cast_result.excluded_wavelengths)
 
     if ds is not None:
         for key, missing in (("chl_flag", float("nan")), ("qc_flag", -1)):

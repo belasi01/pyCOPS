@@ -555,6 +555,21 @@ def test_directory_browser_navigates_and_selects_without_crashing(tmp_path):
     assert at.text_input(key="scaffold_l1").value == str(tmp_path / "sub_a")
 
 
+def test_directory_browsers_default_to_project_root_instead_of_home(tmp_path):
+    """Simon: landing in $HOME every time a Browse popover opens was annoying since every real
+    project folder lives elsewhere -- setting the project-root folder once (tab 1) should become
+    every other, still-empty directory input's own Browse default, not just its own."""
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="project_root_dir").set_value(str(tmp_path)).run(timeout=30)
+
+    assert not at.exception
+    # scaffold_l2_parent (tab 1) and process_parent (tab 3) are both still empty -- their own
+    # Browse popovers must fall back to the just-set project root, not str(Path.home()).
+    matching = [c for c in at.caption if str(tmp_path) in c.value]
+    assert len(matching) >= 2
+
+
 def test_process_tab_single_deployment_writes_nc_files(tmp_path, monkeypatch):
     _patch_successful_processing(monkeypatch)
     (tmp_path / "init.cops.dat").write_text("")
@@ -567,6 +582,22 @@ def test_process_tab_single_deployment_writes_nc_files(tmp_path, monkeypatch):
     assert not at.exception
     assert (tmp_path / "nc" / f"{Path(CAST_1).stem}.nc").exists()
     assert any("1 cast(s) processed" in m.value for m in at.markdown)
+
+
+def test_process_tab_analyze_button_jumps_to_analyze_tab_with_folder_prefilled(tmp_path, monkeypatch):
+    from pycops.ui.clean_app import _TAB_ANALYZE
+
+    _patch_successful_processing(monkeypatch)
+    (tmp_path / "init.cops.dat").write_text("")
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="process_dir").set_value(str(tmp_path)).run(timeout=30)
+    at.button(key="process_to_analyze").click().run(timeout=30)
+
+    assert not at.exception
+    assert at.session_state["active_tab"] == _TAB_ANALYZE
+    assert at.text_input(key="analyze_dir").value == str(tmp_path)
 
 
 def test_process_tab_missing_init_cops_dat_shows_error(tmp_path):

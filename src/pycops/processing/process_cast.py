@@ -13,7 +13,8 @@ diagnostics, and (when EuZ is present) ``Ed0.0m``/``R.0m`` (see
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
@@ -43,6 +44,38 @@ _SHADOWABLE_INSTRUMENTS = ("LuZ", "EuZ")
 _METHOD_LOESS = "Rrs.0p"
 _METHOD_LINEAR = "Rrs.0p.linear"
 
+# ds.attrs name (set by discovery.read_one_cast, straight from info.cops.dat's CastInfo) ->
+# the init.cops.dat per-instrument key it overrides.
+_OVERRIDE_ATTR_TO_INIT_KEY = {
+    "sub_surface_removed_layer": "sub.surface.removed.layer.optics",
+    "tiltmax": "tiltmax.optics",
+    "depth_interval_for_smoothing": "depth.interval.for.smoothing.optics",
+    "linear_r2_threshold": "linear.fit.Rsquared.threshold.optics",
+    "linear_max_delta_depth": "linear.fit.max.delta.depth.optics",
+}
+
+
+def _apply_info_overrides(init: dict[str, object], ds: xr.Dataset) -> dict[str, object]:
+    """Merge ``info.cops.dat``'s per-cast override fields (if any) into a copy of ``init``.
+
+    Port of ``process.cops.R``'s per-cast merge (e.g. ``cops.init$tiltmax.optics <-
+    tiltmax.optics``): each override, when present, replaces the *whole* per-instrument dict for
+    that key (one value per ``instruments.optics`` entry, same shape ``init`` itself uses), not
+    just a single instrument's value -- matching ``CastInfo``'s own one-array-per-field shape.
+    Was previously read and editable in the UI but never actually applied here, so a researcher
+    adjusting these in ``info.cops.dat`` had no effect at all until this fix.
+    """
+    overrides = {
+        attr: ds.attrs[attr] for attr in _OVERRIDE_ATTR_TO_INIT_KEY if ds.attrs.get(attr) is not None
+    }
+    if not overrides:
+        return init
+    instruments = tuple(init["instruments.optics"])
+    merged = dict(init)
+    for attr, values in overrides.items():
+        merged[_OVERRIDE_ATTR_TO_INIT_KEY[attr]] = dict(zip(instruments, values))
+    return merged
+
 
 @dataclass(frozen=True)
 class CastResult:
@@ -67,6 +100,20 @@ class CastResult:
     bottom_note: str | None  # why bottom_reflectance is empty despite a SHALLOW-flagged cast, if so
     resolved_longitude: float | None  # position actually used for shadow correction/Ed0.0m, if resolved
     resolved_latitude: float | None  # (may differ from ds.attrs -- e.g. a position_override or GPS file)
+    excluded_wavelengths: tuple[float, ...] = ()  # final-Rrs bands manually NaN'd out (see io.exclusions)
+
+
+def _mask_rrs_wavelengths(rrs: RrsResult, mask: np.ndarray) -> RrsResult:
+    """Return a copy of ``rrs`` with every wavelength where ``mask`` is ``True`` set to ``NaN``
+    in ``lw_0p``/``rrs_0p``/``nlw_0p`` -- a final, post-fit QC override (Simon: a band can be bad
+    for a specific cast, e.g. UV noise at 380 nm, regardless of which method produced it), not a
+    re-fit: whichever method (LOESS/linear) ends up chosen, the excluded band stays ``NaN``."""
+    if not np.any(mask):
+        return rrs
+    lw_0p = np.where(mask, np.nan, rrs.lw_0p)
+    rrs_0p = np.where(mask, np.nan, rrs.rrs_0p)
+    nlw_0p = np.where(mask, np.nan, rrs.nlw_0p) if rrs.nlw_0p is not None else None
+    return replace(rrs, lw_0p=lw_0p, rrs_0p=rrs_0p, nlw_0p=nlw_0p)
 
 
 def _cast_sun_geometry(
@@ -172,6 +219,7 @@ def process_cast(
     absorption_values: np.ndarray | None = None,
     bioshade: BioShadeResult | None = None,
     position_override: PositionOverride | None = None,
+    excluded_wavelengths: Sequence[float] | None = None,
 ) -> CastResult:
     """Fit Ed0 plus every depth-profiled instrument present in ``ds``, shadow-correct, and Rrs/Lw.
 
@@ -246,6 +294,13 @@ def process_cast(
     for this cast, even though ``select.cops.dat`` recorded the linear
     method as the researcher's general preference for the station).
 
+    ``excluded_wavelengths``, if given, is a final, post-fit QC override (see
+    :mod:`pycops.io.exclusions` -- a pycops-only feature, no R equivalent):
+    every wavelength in it gets NaN'd out of ``rrs_loess``/``rrs_linear`` (and
+    their ``lw_0p``/``nlw_0p``), regardless of which one ``recommended_rrs``
+    ends up picking, matching within ``waves`` to 1e-6 nm. Recorded verbatim
+    on ``CastResult.excluded_wavelengths`` for display/export.
+
     Each available ``RrsResult`` also gets its normalized water-leaving
     radiance (``nlw_0p``, from ``init.cops.dat``'s ``bandwidth``) and, on
     ``CastResult``, its Forel-Ule/QWIP quality-control diagnostics
@@ -273,6 +328,7 @@ def process_cast(
     empty if flagged ``SHALLOW`` but EdZ or the ``depth.is.on`` reference
     instrument isn't available.
     """
+    init = _apply_info_overrides(init, ds)
     waves = ds["wavelength"].values
     time_window = ds.attrs.get("time_window") or (
         tuple(init["time.window"]) if "time.window" in init else None
@@ -341,6 +397,13 @@ def process_cast(
         rrs_linear = compute_rrs(
             luz_value_at_surface, ed0_fit.value_at_0, indice_water, rau_fresnel, waves, bandwidth
         )
+        if excluded_wavelengths:
+            exclude_mask = np.any(
+                np.isclose(waves[:, None], np.asarray(excluded_wavelengths, dtype=float)[None, :], atol=1e-6),
+                axis=1,
+            )
+            rrs_loess = _mask_rrs_wavelengths(rrs_loess, exclude_mask)
+            rrs_linear = _mask_rrs_wavelengths(rrs_linear, exclude_mask)
         if np.any(np.isfinite(rrs_loess.rrs_0p)):
             qwip_loess = compute_qwip(waves, rrs_loess.rrs_0p)
         if np.any(np.isfinite(rrs_linear.rrs_0p)):
@@ -419,4 +482,5 @@ def process_cast(
         bottom_note=bottom_note,
         resolved_longitude=lon,
         resolved_latitude=lat,
+        excluded_wavelengths=tuple(excluded_wavelengths) if excluded_wavelengths else (),
     )
