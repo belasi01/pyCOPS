@@ -4,6 +4,7 @@ from conftest import write_deployment, write_deployment_with_bad_cast
 from pycops.io.discovery import (
     CastSelection,
     discover_deployment,
+    kept_nc_files,
     read_deployment_casts,
     read_select_cops,
     update_cast_selection,
@@ -218,3 +219,15 @@ def test_read_deployment_casts_continues_after_one_bad_cast(tmp_path, recwarn):
     assert failure.file == "WISE_CAST_002_notadate_notatime_URC.csv"
     assert failure.error
     assert any("failed to read cast" in str(w.message) for w in recwarn.list)
+
+
+def test_kept_nc_files_excludes_rejected_defaults_missing_row_to_kept(tmp_path):
+    nc_dir = tmp_path / "nc"
+    nc_dir.mkdir()
+    for name in ("CAST_001", "CAST_002", "CAST_003"):
+        (nc_dir / f"{name}.nc").write_text("")
+    (tmp_path / "select.cops.dat").write_text("CAST_001.csv;1;Rrs.0p;NA\nCAST_002.csv;0;Rrs.0p;NA\n")
+
+    kept = kept_nc_files(tmp_path, nc_dir)
+
+    assert [p.stem for p in kept] == ["CAST_001", "CAST_003"]

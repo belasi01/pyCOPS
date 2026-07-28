@@ -61,6 +61,27 @@ def read_select_cops(path: str | Path) -> list[CastSelection]:
     return selections
 
 
+def kept_nc_files(directory: Path, nc_dir: Path) -> list[Path]:
+    """Every ``.nc`` file in ``nc_dir`` whose matching ``select.cops.dat`` row (looked up by file
+    *stem*, so this doesn't need the original raw cast file to still be present) isn't flagged
+    rejected -- a row missing entirely defaults to kept, matching ``discover_deployment()``'s own
+    fallback. Shared by ``analyze_app.py``'s per-station Rrs/Kd comparison view and the
+    mission-database aggregator (:mod:`pycops.processing.database`), both of which need exactly
+    this "which .nc files actually count for this station" filter.
+    """
+    select_path = directory / "select.cops.dat"
+    selections_by_stem = {}
+    if select_path.exists():
+        selections_by_stem = {Path(s.file).stem: s for s in read_select_cops(select_path)}
+
+    kept = []
+    for nc_path in sorted(nc_dir.glob("*.nc")):
+        selection = selections_by_stem.get(nc_path.stem)
+        if selection is None or selection.flag in _KEPT_FLAGS:
+            kept.append(nc_path)
+    return kept
+
+
 def update_cast_selection(path: str | Path, file: str, flag: int, method: str, shallow: bool = False) -> None:
     """Write one ``select.cops.dat`` row (QC flag / Rrs method / SHALLOW), replacing it in place.
 

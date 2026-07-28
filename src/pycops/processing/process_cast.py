@@ -20,6 +20,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from pycops.processing.attenuation import kd_at_light_fraction
 from pycops.processing.bioshade import BioShadeResult
 from pycops.processing.bottom import BottomReflectanceResult, compute_bottom_depth, compute_bottom_reflectance
 from pycops.processing.cast_fit import InstrumentFit, fit_cast, fit_ed0_for_cast
@@ -96,10 +97,14 @@ class CastResult:
     ed0_0m: np.ndarray | None  # Ed0(0-), diffuse/direct-decomposed -- diagnostic only, Rrs doesn't need it
     r0m_loess: np.ndarray | None  # EuZ.0m(LOESS) / Ed0.0m -- subsurface irradiance reflectance
     r0m_linear: np.ndarray | None  # EuZ.0m(linear) / Ed0.0m
+    kd_1pct: np.ndarray | None  # mean Kd from surface to the 1% light level, EdZ only
+    kd_10pct: np.ndarray | None  # mean Kd from surface to the 10% light level
+    kd_pd: np.ndarray | None  # mean Kd from surface to the penetration depth (1/e light level)
     bottom_reflectance: dict[str, BottomReflectanceResult]  # by instrument ("LuZ"/"EuZ"), only for SHALLOW casts
     bottom_note: str | None  # why bottom_reflectance is empty despite a SHALLOW-flagged cast, if so
     resolved_longitude: float | None  # position actually used for shadow correction/Ed0.0m, if resolved
     resolved_latitude: float | None  # (may differ from ds.attrs -- e.g. a position_override or GPS file)
+    resolved_sun_zenith_deg: float | None  # sun zenith angle (degrees) at the cast's mean time/position
     excluded_wavelengths: tuple[float, ...] = ()  # final-Rrs bands manually NaN'd out (see io.exclusions)
 
 
@@ -271,9 +276,9 @@ def process_cast(
     (see :mod:`pycops.io.netcdf`) need the position actually used, not just
     what ``info.cops.dat`` originally said. Position/sun-geometry resolution
     doesn't depend on ``chl_flag`` (matching ``derived.data.R``), so
-    ``resolved_longitude``/``.resolved_latitude`` can be set even when
-    ``shadow_correction_note`` explains shadow correction itself was skipped
-    for an unrelated (``chl``-only) reason.
+    ``resolved_longitude``/``.resolved_latitude``/``.resolved_sun_zenith_deg``
+    can be set even when ``shadow_correction_note`` explains shadow correction
+    itself was skipped for an unrelated (``chl``-only) reason.
 
     Rrs comes from LuZ when present (``rrs_source == "LuZ"``); for a cast with
     EuZ but no LuZ sensor, it's derived instead as ``LuZ.0m = EuZ.0m /
@@ -317,6 +322,14 @@ def process_cast(
     preferred, matching ``compute.aops.R``'s block order when both are
     present), or a fresh Gregg & Carder clear-sky estimate when neither did
     -- unlike shadow correction, this doesn't require ``chl_flag``.
+
+    When EdZ is present, ``CastResult`` also gets ``kd_1pct``/``kd_10pct``/``kd_pd`` -- mean
+    diffuse attenuation from the surface down to the 1%/10%/penetration-depth (1/e) light levels
+    (see :func:`pycops.processing.attenuation.kd_at_light_fraction`), a port of
+    ``generate.cops.DB.R``'s inline Kd computation used for the mission-wide database export.
+    Uses ``ed0_0m`` (subsurface Ed0) as the reference when available, matching R exactly;
+    otherwise falls back to ``Ed0.0p`` (``ed0_fit.value_at_0``) rather than leaving these ``None``
+    for every EuZ-less cast -- a documented deviation, since R always requires ``Ed0.0m``.
 
     When ``ds`` is flagged ``SHALLOW`` (``select.cops.dat``'s 4th field,
     ``"1"`` -- see :attr:`~pycops.io.discovery.CastSelection.shallow`),
@@ -438,6 +451,18 @@ def process_cast(
         r0m_loess = ed0_sub.r0m_loess
         r0m_linear = ed0_sub.r0m_linear
 
+    kd_1pct = kd_10pct = kd_pd = None
+    if "EdZ" in instrument_fits:
+        edz_fit = instrument_fits["EdZ"]
+        # R's generate.cops.DB.R always uses Ed0.0m (subsurface, diffuse/direct-decomposed); that
+        # needs EuZ + resolved sun geometry, which not every cast has, so this falls back to
+        # Ed0.0p (ed0_fit.value_at_0) rather than leaving these NaN for every EuZ-less cast --
+        # a deliberate, documented deviation from a literal port.
+        ed0_subsurface = ed0_0m if ed0_0m is not None else ed0_fit.value_at_0
+        kd_1pct = kd_at_light_fraction(edz_fit.aop_fitted, edz_fit.depth_grid, ed0_subsurface, 0.01)
+        kd_10pct = kd_at_light_fraction(edz_fit.aop_fitted, edz_fit.depth_grid, ed0_subsurface, 0.1)
+        kd_pd = kd_at_light_fraction(edz_fit.aop_fitted, edz_fit.depth_grid, ed0_subsurface, 1 / np.e)
+
     bottom_reflectance: dict[str, BottomReflectanceResult] = {}
     bottom_note: str | None = None
     if ds.attrs.get("shallow"):
@@ -478,9 +503,13 @@ def process_cast(
         ed0_0m=ed0_0m,
         r0m_loess=r0m_loess,
         r0m_linear=r0m_linear,
+        kd_1pct=kd_1pct,
+        kd_10pct=kd_10pct,
+        kd_pd=kd_pd,
         bottom_reflectance=bottom_reflectance,
         bottom_note=bottom_note,
         resolved_longitude=lon,
         resolved_latitude=lat,
+        resolved_sun_zenith_deg=sun_zenith_deg,
         excluded_wavelengths=tuple(excluded_wavelengths) if excluded_wavelengths else (),
     )

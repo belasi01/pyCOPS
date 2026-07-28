@@ -127,6 +127,30 @@ def test_process_cast_fits_every_present_instrument():
     assert "EuZ" not in result.instrument_fits
 
 
+def test_process_cast_computes_kd_light_level_metrics_when_edz_present():
+    ds = _make_dataset(include_edz=True)
+    result = process_cast(ds, _make_init())
+
+    assert result.kd_1pct is not None
+    assert result.kd_10pct is not None
+    assert result.kd_pd is not None
+    assert result.kd_1pct.shape == (len(WAVES),)
+    # 380 nm attenuates fast enough (K_TRUE=0.9) over this fixture's 6 m depth range to actually
+    # reach every light level searched for -- a concrete, non-vacuous finite check.
+    assert np.isfinite(result.kd_1pct[1])
+    assert np.isfinite(result.kd_10pct[1])
+    assert np.isfinite(result.kd_pd[1])
+
+
+def test_process_cast_kd_light_level_metrics_none_without_edz():
+    ds = _make_dataset(include_edz=False)
+    result = process_cast(ds, _make_init())
+
+    assert result.kd_1pct is None
+    assert result.kd_10pct is None
+    assert result.kd_pd is None
+
+
 def test_process_cast_skips_absent_instrument():
     ds = _make_dataset(include_edz=False)
     result = process_cast(ds, _make_init())
@@ -408,6 +432,7 @@ def test_process_cast_resolved_position_matches_attrs_when_no_override():
 
     assert result.resolved_longitude == -68.108833
     assert result.resolved_latitude == 49.13445
+    assert result.resolved_sun_zenith_deg is not None
 
 
 def test_process_cast_resolved_position_reflects_override_not_attrs():
@@ -431,6 +456,7 @@ def test_process_cast_resolved_position_none_when_shadow_correction_skipped():
 
     assert result.resolved_longitude is None
     assert result.resolved_latitude is None
+    assert result.resolved_sun_zenith_deg is None
 
 
 def _make_euz_dataset(n=300, ed0_level=100.0):

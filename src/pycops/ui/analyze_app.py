@@ -24,7 +24,7 @@ import streamlit as st
 import xarray as xr
 
 from pycops.io.config import CastInfo, read_init_cops, update_cast_info
-from pycops.io.discovery import FLAG_NORMAL, FLAG_REJECTED, _KEPT_FLAGS, read_select_cops, update_cast_selection
+from pycops.io.discovery import FLAG_NORMAL, FLAG_REJECTED, kept_nc_files, update_cast_selection
 from pycops.io.exclusions import read_wavelength_exclusions, update_wavelength_exclusions
 from pycops.io.netcdf import write_cast_result
 from pycops.io.raw import read_cast
@@ -761,23 +761,6 @@ def _k0_at_adaptive_depth(k0: np.ndarray, depth_grid: np.ndarray, z_interval: np
     return values
 
 
-def _kept_nc_files(directory: Path, nc_dir: Path) -> list[Path]:
-    """Every ``.nc`` file whose matching ``select.cops.dat`` row (looked up by file *stem*, so
-    this doesn't need the original raw cast file to still be present) isn't flagged rejected --
-    a row missing entirely defaults to kept, matching ``discover_deployment()``'s own fallback."""
-    select_path = directory / "select.cops.dat"
-    selections_by_stem = {}
-    if select_path.exists():
-        selections_by_stem = {Path(s.file).stem: s for s in read_select_cops(select_path)}
-
-    kept = []
-    for nc_path in sorted(nc_dir.glob("*.nc")):
-        selection = selections_by_stem.get(nc_path.stem)
-        if selection is None or selection.flag in _KEPT_FLAGS:
-            kept.append(nc_path)
-    return kept
-
-
 def _render_station_comparison(directory: Path) -> None:
     st.caption(
         "Every currently-kept cast (select.cops.dat flag != 0) in this station, overlaid -- "
@@ -789,7 +772,7 @@ def _render_station_comparison(directory: Path) -> None:
         st.error(f"No nc/ subfolder in {directory} -- process this station in tab 3 first.")
         return
 
-    kept_files = _kept_nc_files(directory, nc_dir)
+    kept_files = kept_nc_files(directory, nc_dir)
     if not kept_files:
         st.warning(f"No kept casts with .nc output found in {nc_dir}.")
         return

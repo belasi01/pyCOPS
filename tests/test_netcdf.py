@@ -135,6 +135,7 @@ def test_cast_result_to_dataset_carries_over_cast_attrs():
     assert out.attrs["longitude"] == -68.108833
     assert out.attrs["latitude"] == 49.13445
     assert out.attrs["qc_flag"] == 1
+    assert np.isfinite(out.attrs["sun_zenith_deg"])
 
 
 def test_cast_result_to_dataset_without_ds_still_works():
@@ -158,6 +159,8 @@ def test_write_cast_result_round_trips_through_netcdf(tmp_path):
         np.testing.assert_allclose(reloaded["rrs_0p_linear"].values, result.rrs_linear.rrs_0p, equal_nan=True)
         np.testing.assert_allclose(reloaded["LuZ_value_at_0"].values, result.instrument_fits["LuZ"].value_at_0)
         assert reloaded.attrs["chl_flag"] == 999.0
+        np.testing.assert_allclose(reloaded["kd_1pct"].values, result.kd_1pct, equal_nan=True)
+        np.testing.assert_allclose(reloaded["kd_pd"].values, result.kd_pd, equal_nan=True)
     finally:
         reloaded.close()
 

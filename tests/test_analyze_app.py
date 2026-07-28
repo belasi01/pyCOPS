@@ -18,7 +18,6 @@ from pycops.ui.analyze_app import (  # noqa: E402
     _effective_tiltmax,
     _effective_time_window,
     _k0_at_adaptive_depth,
-    _kept_nc_files,
     _mask_negligible_rb,
     _raw_scan_values,
     _visible_band_ylim,
@@ -576,16 +575,6 @@ def test_k0_at_adaptive_depth_falls_back_to_2m_when_any_z_interval_nan():
     np.testing.assert_allclose(result, [3.0, 30.0])  # depth nearest 2 m -> index 2, both bands
 
 
-def test_kept_nc_files_excludes_rejected_defaults_missing_row_to_kept(tmp_path):
-    nc_dir = tmp_path / "nc"
-    nc_dir.mkdir()
-    for name in ("CAST_001", "CAST_002", "CAST_003"):
-        (nc_dir / f"{name}.nc").write_text("")
-    (tmp_path / "select.cops.dat").write_text("CAST_001.csv;1;Rrs.0p;NA\nCAST_002.csv;0;Rrs.0p;NA\n")
-
-    kept = _kept_nc_files(tmp_path, nc_dir)
-
-    assert [p.stem for p in kept] == ["CAST_001", "CAST_003"]
 
 
 def test_analyze_tab_station_comparison_overlays_kept_casts(tmp_path):

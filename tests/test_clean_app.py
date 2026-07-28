@@ -676,3 +676,127 @@ def test_process_tab_batch_isolates_a_broken_deployment(tmp_path, monkeypatch):
     assert not (parent / "StationBad" / "cops" / "nc").exists()
     assert any("simulated broken deployment" in e.value for e in at.error)
     assert any("1 ok, 0 with warnings, 1 failed" in m.value for m in at.markdown)
+
+
+# -- Tab 5: "Generate database" ---------------------------------------------------------------
+
+
+def _write_fake_station(directory, cast_specs, select_rows=None):
+    """A station folder with real, minimal .nc files aggregate_station() can read directly --
+    no monkeypatching needed (unlike tab 3's tests) since aggregating already-written .nc files
+    is cheap and deterministic, matching test_database.py's own fixture pattern."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "init.cops.dat").write_text("")
+    nc_dir = directory / "nc"
+    nc_dir.mkdir()
+    waves = np.array([443.0, 555.0])
+    for stem, (rrs, ed0) in cast_specs.items():
+        ds = xr.Dataset(
+            {
+                "rrs_0p_recommended": ("wavelength", np.asarray(rrs, dtype=float)),
+                "ed0_value_at_0": ("wavelength", np.asarray(ed0, dtype=float)),
+            },
+            coords={"wavelength": waves, "time": pd.date_range("2019-08-17T12:00:00", periods=2, freq="s")},
+        )
+        ds.attrs["rrs_method"] = "Rrs.0p"
+        ds.attrs["qwip_loess_fu"] = 5.0
+        ds.attrs["sun_zenith_deg"] = 45.0
+        ds.attrs["longitude"] = -68.1
+        ds.attrs["latitude"] = 49.1
+        ds.attrs["chl_flag"] = float("nan")
+        ds.to_netcdf(nc_dir / f"{stem}.nc", engine="netcdf4")
+    if select_rows is not None:
+        (directory / "select.cops.dat").write_text(select_rows)
+
+
+def test_database_tab_discovers_stations_with_kept_cast_counts(tmp_path):
+    parent = tmp_path / "L2"
+    _write_fake_station(parent / "20200101_StationA" / "cops", {"CAST_001": ([1.0, 2.0], [100.0, 100.0])})
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="database_parent").set_value(str(parent)).run(timeout=30)
+
+    assert not at.exception
+    rel = Path("20200101_StationA") / "cops"
+    assert at.checkbox(key=f"database_station_{rel}").value is True
+
+
+def test_database_tab_generate_writes_netcdf_csv_and_seabass_files(tmp_path):
+    parent = tmp_path / "L2"
+    _write_fake_station(parent / "20200101_StationA" / "cops", {"CAST_001": ([1.0, 2.0], [100.0, 100.0])})
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="database_parent").set_value(str(parent)).run(timeout=30)
+    at.text_input(key="database_mission").set_value("TestMission").run(timeout=30)
+    at.button(key="database_generate").click().run(timeout=30)
+
+    assert not at.exception
+    assert (parent / "TestMission.nc").exists()
+    assert (parent / "TestMission.csv").exists()
+    assert (parent / "seabass" / "A_cops.sb").exists()
+    assert any("Wrote TestMission.nc" in s.value for s in at.success)
+
+
+def test_database_tab_seabass_filenames_dont_collide_for_same_station_id(tmp_path):
+    """Regression test for a real bug found while smoke-testing against real WISEMan data: two
+    sibling deployment folders at the same physical station (different instrument operators,
+    e.g. COPS_FJSaucier vs. COPS_Kildir) share one station_id -- writing .sb files named just
+    "<station_id>.sb" silently overwrote one with the other."""
+    parent = tmp_path / "L2"
+    _write_fake_station(
+        parent / "20190817_StationBDA-01" / "COPS_FJSaucier", {"CAST_001": ([1.0, 2.0], [100.0, 100.0])}
+    )
+    _write_fake_station(
+        parent / "20190817_StationBDA-01" / "COPS_Kildir", {"CAST_001": ([3.0, 4.0], [200.0, 200.0])}
+    )
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="database_parent").set_value(str(parent)).run(timeout=30)
+    at.text_input(key="database_mission").set_value("TestMission").run(timeout=30)
+    at.button(key="database_generate").click().run(timeout=30)
+
+    assert not at.exception
+    sb_files = sorted(p.name for p in (parent / "seabass").glob("*.sb"))
+    assert sb_files == ["BDA-01_COPS_FJSaucier.sb", "BDA-01_COPS_Kildir.sb"]
+    df = pd.read_csv(parent / "TestMission.csv")
+    assert len(df) == 2  # both stations still contribute a distinct row to the CSV/NetCDF
+
+
+def test_database_tab_unchecking_excludes_station(tmp_path):
+    parent = tmp_path / "L2"
+    _write_fake_station(parent / "20200101_StationA" / "cops", {"CAST_001": ([1.0, 2.0], [100.0, 100.0])})
+    _write_fake_station(parent / "20200101_StationB" / "cops", {"CAST_001": ([3.0, 4.0], [200.0, 200.0])})
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="database_parent").set_value(str(parent)).run(timeout=30)
+    at.text_input(key="database_mission").set_value("TestMission").run(timeout=30)
+    rel_b = Path("20200101_StationB") / "cops"
+    at.checkbox(key=f"database_station_{rel_b}").set_value(False).run(timeout=30)
+    at.button(key="database_generate").click().run(timeout=30)
+
+    assert not at.exception
+    df = pd.read_csv(parent / "TestMission.csv")
+    assert list(df["station_id"]) == ["A"]
+
+
+def test_database_tab_isolates_a_station_missing_nc_folder(tmp_path):
+    parent = tmp_path / "L2"
+    _write_fake_station(parent / "20200101_StationGood" / "cops", {"CAST_001": ([1.0, 2.0], [100.0, 100.0])})
+    bad = parent / "20200101_StationBad" / "cops"
+    bad.mkdir(parents=True)
+    (bad / "init.cops.dat").write_text("")  # discovered, but no nc/ -> aggregate_station() raises
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="database_parent").set_value(str(parent)).run(timeout=30)
+    at.text_input(key="database_mission").set_value("TestMission").run(timeout=30)
+    at.button(key="database_generate").click().run(timeout=30)
+
+    assert not at.exception
+    df = pd.read_csv(parent / "TestMission.csv")
+    assert list(df["station_id"]) == ["Good"]
+    assert any("Skipped 1 station" in e.label for e in at.expander)

@@ -69,6 +69,7 @@ from pycops.ui._common import (
     render_time_window_editor,
 )
 from pycops.ui.analyze_app import render_analyze_tab
+from pycops.ui.database_app import render_database_tab
 
 # select.cops.dat's flag values (see pycops.io.discovery), labeled for the UI.
 _FLAG_LABELS = {
@@ -91,6 +92,7 @@ _TAB_SCAFFOLD = "1. Create a station (L1 -> L2)"
 _TAB_CLEAN = "2. Clean casts"
 _TAB_PROCESS = "3. Process casts"
 _TAB_ANALYZE = "4. Analyze results"
+_TAB_DATABASE = "5. Generate database"
 
 # info.cops.dat's "chl" field selects the absorption model shadow correction uses (see
 # pycops.processing.shadow.resolve_absorption): 999 = derived from this cast's own fitted Kd
@@ -905,8 +907,10 @@ def run_app() -> None:
     # st.tabs() below has already instantiated it for this run.
     if "active_tab_pending" in st.session_state:
         st.session_state["active_tab"] = st.session_state.pop("active_tab_pending")
-    tab_scaffold, tab_clean, tab_process, tab_analyze = st.tabs(
-        [_TAB_SCAFFOLD, _TAB_CLEAN, _TAB_PROCESS, _TAB_ANALYZE], key="active_tab", on_change="rerun"
+    tab_scaffold, tab_clean, tab_process, tab_analyze, tab_database = st.tabs(
+        [_TAB_SCAFFOLD, _TAB_CLEAN, _TAB_PROCESS, _TAB_ANALYZE, _TAB_DATABASE],
+        key="active_tab",
+        on_change="rerun",
     )
     with tab_scaffold:
         _render_scaffold_tab()
@@ -928,6 +932,12 @@ def run_app() -> None:
             "Read-only: browse a cast's already-processed results (nc/), one cast at a time."
         )
         render_analyze_tab()
+    with tab_database:
+        st.caption(
+            "Aggregates every checked station's kept casts (mean/sd of Rrs, nLw, Ed0.0p, Kd, "
+            "Rb) into one mission-wide NetCDF/CSV, plus one SeaBASS-compliant .sb file per station."
+        )
+        render_database_tab()
 
 
 def main() -> None:
