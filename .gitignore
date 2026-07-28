@@ -10,3 +10,6 @@ dist/
 # Real field data cached locally from sabre.uqar.ca for offline dev/testing.
 # Never commit this -- it's Simon's research data, not project source.
 local_data/
+
+# Internal development notes -- not published in the public repo.
+CLAUDE.md
