@@ -25,7 +25,10 @@ the QWIP/Forel-Ule scalar diagnostics (``qwip_loess_*``/``qwip_linear_*``)
 when available; nLw (``nlw_0p_loess``/``nlw_0p_linear``/``nlw_0p_recommended``),
 ``ed0_0m``/``r0m_loess``/``r0m_linear`` (see
 :mod:`pycops.processing.ed0_0m`), ``kd_1pct``/``kd_10pct``/``kd_pd`` (see
-:mod:`pycops.processing.attenuation`), and ``<instrument>_rb``/``_rb_extrapolated``
+:mod:`pycops.processing.attenuation`), ``par_d_profile``/``par_u_profile``/``kz_par``/``k0_par``
+(``EdZ_depth``-dimensioned; ``kz_par``/``k0_par`` leading-NaN-padded like ``KZ``/``K0``) plus the
+scalar attrs ``par_0``/``kd_par_1pct``/``kd_par_10pct``/``kd_par_pd`` (see
+:mod:`pycops.processing.par`), and ``<instrument>_rb``/``_rb_extrapolated``
 (see :mod:`pycops.processing.bottom`, plus per-instrument ``bottom_depth``/
 ``rb_depth_over_bottom`` attrs) are written whenever they were computed (nLw
 needs ``init.cops.dat``'s ``bandwidth``, see :mod:`pycops.processing.nlw`;
@@ -147,6 +150,21 @@ def cast_result_to_dataset(cast_result: CastResult, ds: xr.Dataset | None = None
         data_vars["kd_10pct"] = ("wavelength", cast_result.kd_10pct)
     if cast_result.kd_pd is not None:
         data_vars["kd_pd"] = ("wavelength", cast_result.kd_pd)
+
+    if cast_result.par_d_profile is not None:
+        data_vars["par_d_profile"] = ("EdZ_depth", cast_result.par_d_profile)
+    if cast_result.par_u_profile is not None:
+        data_vars["par_u_profile"] = ("EdZ_depth", cast_result.par_u_profile)
+    if cast_result.kz_par is not None:
+        data_vars["kz_par"] = ("EdZ_depth", np.concatenate([[np.nan], cast_result.kz_par]))
+    if cast_result.k0_par is not None:
+        data_vars["k0_par"] = ("EdZ_depth", np.concatenate([[np.nan], cast_result.k0_par]))
+    if cast_result.par_0 is not None:
+        attrs["par_0"] = cast_result.par_0
+    for name in ("kd_par_1pct", "kd_par_10pct", "kd_par_pd"):
+        value = getattr(cast_result, name)
+        if value is not None:
+            attrs[name] = value
 
     for label, qwip in (("loess", cast_result.qwip_loess), ("linear", cast_result.qwip_linear)):
         if qwip is None:

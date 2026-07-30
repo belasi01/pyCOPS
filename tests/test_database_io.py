@@ -7,7 +7,7 @@ import pandas as pd
 import xarray as xr
 
 from pycops.io.database import write_mission_database_csv, write_mission_database_netcdf
-from pycops.processing.database import MeanSd, MissionDatabase, StationAggregate
+from pycops.processing.database import MeanSd, MissionDatabase, ScalarMeanSd, StationAggregate
 
 WAVES = np.array([443.0, 555.0])
 
@@ -34,6 +34,10 @@ def _make_station(station_id, rrs_mean, ed0_mean, n_casts=2):
         kd_10pct=zeros,
         kd_pd=zeros,
         ed0_0p=MeanSd(mean=np.asarray(ed0_mean, dtype=float), sd=np.array([1.0, 2.0])),
+        par_0=ScalarMeanSd(mean=500.0, sd=10.0),
+        kd_par_1pct=ScalarMeanSd(mean=0.5, sd=0.05),
+        kd_par_10pct=ScalarMeanSd(mean=0.6, sd=0.06),
+        kd_par_pd=ScalarMeanSd(mean=0.55, sd=0.055),
     )
 
 
@@ -61,6 +65,8 @@ def test_write_mission_database_netcdf_round_trips(tmp_path):
         np.testing.assert_allclose(reloaded["Ed0.0p_mean"].values, [[100.0, 200.0], [110.0, 210.0]])
         np.testing.assert_allclose(reloaded["wavelength"].values, WAVES)
         assert bool(np.all(np.isnan(reloaded["Rb_mean"].values)))
+        np.testing.assert_allclose(reloaded["PAR0_mean"].values, [500.0, 500.0])
+        np.testing.assert_allclose(reloaded["KdPAR1pct_sd"].values, [0.05, 0.05])
     finally:
         reloaded.close()
 
@@ -78,6 +84,9 @@ def test_write_mission_database_csv_column_naming(tmp_path):
     assert "Ed0.0p_555_mean" in df.columns
     np.testing.assert_allclose(df["Rrs_443_mean"], [1.0, 2.0])
     np.testing.assert_allclose(df["Rrs_555_mean"], [10.0, 20.0])
+    assert "PAR0_mean" in df.columns
+    assert "KdPAR10pct_sd" in df.columns
+    np.testing.assert_allclose(df["PAR0_mean"], [500.0, 500.0])
 
 
 def test_write_mission_database_netcdf_handles_empty_mission(tmp_path):

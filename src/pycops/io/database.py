@@ -27,6 +27,16 @@ _WAVELENGTH_METRICS = (
     ("ed0_0p", "Ed0.0p"),
 )
 
+# (attribute name on StationAggregate, output-name prefix) for every scalar (non-wavelength) PAR/
+# Kd(PAR) metric -- broadband, so unlike _WAVELENGTH_METRICS these get one mean/sd column each,
+# not one per wavelength.
+_SCALAR_METRICS = (
+    ("par_0", "PAR0"),
+    ("kd_par_1pct", "KdPAR1pct"),
+    ("kd_par_10pct", "KdPAR10pct"),
+    ("kd_par_pd", "KdPARpd"),
+)
+
 
 def _station_field(stations: list[StationAggregate], attr: str, missing: object) -> np.ndarray:
     return np.array([getattr(s, attr) if getattr(s, attr) is not None else missing for s in stations])
@@ -70,6 +80,12 @@ def write_mission_database_netcdf(db: MissionDatabase, path: str | Path) -> None
     data_vars["bottom_depth"] = ("station", _station_field(db.stations, "bottom_depth_mean", np.nan))
     data_vars["directory"] = ("station", [str(s.directory) for s in db.stations])
 
+    for attr, prefix in _SCALAR_METRICS:
+        mean_arr = np.array([getattr(s, attr).mean for s in db.stations]) if n_stations else np.empty(0)
+        sd_arr = np.array([getattr(s, attr).sd for s in db.stations]) if n_stations else np.empty(0)
+        data_vars[f"{prefix}_mean"] = ("station", mean_arr)
+        data_vars[f"{prefix}_sd"] = ("station", sd_arr)
+
     ds = xr.Dataset(data_vars=data_vars, coords=coords, attrs={"mission": db.mission})
     ds.to_netcdf(Path(path), engine="netcdf4")
 
@@ -91,6 +107,10 @@ def write_mission_database_csv(db: MissionDatabase, path: str | Path) -> None:
             "shadow_correction_method": station.shadow_correction_method,
             "bottom_depth": station.bottom_depth_mean,
         }
+        for attr, prefix in _SCALAR_METRICS:
+            scalar = getattr(station, attr)
+            row[f"{prefix}_mean"] = scalar.mean
+            row[f"{prefix}_sd"] = scalar.sd
         for attr, prefix in _WAVELENGTH_METRICS:
             mean_sd = getattr(station, attr)
             for wave, mean_value in zip(db.waves, mean_sd.mean):

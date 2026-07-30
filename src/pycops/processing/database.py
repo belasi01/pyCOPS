@@ -52,6 +52,16 @@ class MeanSd:
 
 
 @dataclass(frozen=True)
+class ScalarMeanSd:
+    """Mean and sample standard deviation of a single (non-wavelength-indexed) broadband metric
+    across a station's kept casts -- e.g. PAR/Kd(PAR), which unlike Rrs/nLw/Kd/etc. have no
+    wavelength dimension at all (PAR is already integrated over the whole 400-700 nm band)."""
+
+    mean: float
+    sd: float  # NaN when fewer than 2 casts contributed a finite value
+
+
+@dataclass(frozen=True)
 class StationAggregate:
     """One station's worth of ``generate.cops.DB()``-style aggregated AOPs."""
 
@@ -73,6 +83,10 @@ class StationAggregate:
     kd_10pct: MeanSd
     kd_pd: MeanSd
     ed0_0p: MeanSd
+    par_0: ScalarMeanSd  # broadband PAR of Ed0's surface reference (see pycops.processing.par)
+    kd_par_1pct: ScalarMeanSd
+    kd_par_10pct: ScalarMeanSd
+    kd_par_pd: ScalarMeanSd
 
 
 @dataclass(frozen=True)
@@ -129,6 +143,15 @@ def _mean_of(values: list[float | None]) -> float | None:
     return float(np.mean(finite)) if finite else None
 
 
+def _scalar_mean_sd(values: list[float | None]) -> ScalarMeanSd:
+    finite = [v for v in values if v is not None and not (isinstance(v, float) and np.isnan(v))]
+    if not finite:
+        return ScalarMeanSd(mean=np.nan, sd=np.nan)
+    mean = float(np.mean(finite))
+    sd = float(np.std(finite, ddof=1)) if len(finite) >= 2 else np.nan
+    return ScalarMeanSd(mean=mean, sd=sd)
+
+
 def aggregate_station(directory: str | Path) -> StationAggregate:
     """Aggregate one station folder's kept casts (per ``select.cops.dat``, via
     :func:`pycops.io.discovery.kept_nc_files`) from its already-written ``nc/`` folder.
@@ -160,6 +183,10 @@ def aggregate_station(directory: str | Path) -> StationAggregate:
     fus: list[float | None] = []
     bottom_depths: list[float | None] = []
     chl_flags: list[float | None] = []
+    par_0_values: list[float | None] = []
+    kd_par_1pct_values: list[float | None] = []
+    kd_par_10pct_values: list[float | None] = []
+    kd_par_pd_values: list[float | None] = []
 
     for nc_path in nc_paths:
         with xr.open_dataset(nc_path) as nc:
@@ -212,6 +239,10 @@ def aggregate_station(directory: str | Path) -> StationAggregate:
             lat = nc.attrs.get("latitude")
             lats.append(lat if lat is not None and not np.isnan(lat) else None)
             chl_flags.append(nc.attrs.get("chl_flag"))
+            par_0_values.append(nc.attrs.get("par_0"))
+            kd_par_1pct_values.append(nc.attrs.get("kd_par_1pct"))
+            kd_par_10pct_values.append(nc.attrs.get("kd_par_10pct"))
+            kd_par_pd_values.append(nc.attrs.get("kd_par_pd"))
 
     def _mean_sd(rows: list[np.ndarray]) -> MeanSd:
         stacked = np.asarray(rows)
@@ -233,6 +264,10 @@ def aggregate_station(directory: str | Path) -> StationAggregate:
         kd_10pct = _mean_sd(kd10_rows)
         kd_pd = _mean_sd(kdpd_rows)
         ed0_0p = _mean_sd(ed0_rows)
+        par_0 = _scalar_mean_sd(par_0_values)
+        kd_par_1pct = _scalar_mean_sd(kd_par_1pct_values)
+        kd_par_10pct = _scalar_mean_sd(kd_par_10pct_values)
+        kd_par_pd = _scalar_mean_sd(kd_par_pd_values)
 
     return StationAggregate(
         station_id=_station_id_from_path(directory),
@@ -253,6 +288,10 @@ def aggregate_station(directory: str | Path) -> StationAggregate:
         kd_10pct=kd_10pct,
         kd_pd=kd_pd,
         ed0_0p=ed0_0p,
+        par_0=par_0,
+        kd_par_1pct=kd_par_1pct,
+        kd_par_10pct=kd_par_10pct,
+        kd_par_pd=kd_par_pd,
     )
 
 

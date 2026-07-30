@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 from pycops.io.seabass import SeaBASSHeaderFields, write_seabass_station_file
-from pycops.processing.database import MeanSd, StationAggregate
+from pycops.processing.database import MeanSd, ScalarMeanSd, StationAggregate
 
 WAVES = np.array([443.0, 555.0])
 
@@ -33,6 +33,10 @@ def _make_aggregate(rrs_mean=(1.0, np.nan), rrs_sd=(0.1, 0.2)):
         kd_10pct=zeros,
         kd_pd=zeros,
         ed0_0p=MeanSd(mean=np.array([100.0, 200.0]), sd=np.array([1.0, 2.0])),
+        par_0=ScalarMeanSd(mean=500.0, sd=10.0),
+        kd_par_1pct=ScalarMeanSd(mean=0.5, sd=0.05),
+        kd_par_10pct=ScalarMeanSd(mean=0.6, sd=0.06),
+        kd_par_pd=ScalarMeanSd(mean=0.55, sd=0.055),
     )
 
 
@@ -77,6 +81,11 @@ def test_write_seabass_station_file_fields_and_units_lengths_match(tmp_path):
     assert "Rrs443" in fields
     assert "Rrs443_sd" in fields
     assert "Kd1pct443" in fields  # non-standard, but present and clearly named
+    assert "PAR0" in fields
+    assert "PAR0_sd" in fields
+    assert "KdPAR1pct" in fields
+    assert "KdPAR10pct" in fields
+    assert "KdPARpd" in fields
 
 
 def test_write_seabass_station_file_nan_becomes_missing_sentinel(tmp_path):
@@ -113,3 +122,23 @@ def test_write_seabass_station_file_notes_non_standard_kd_fields(tmp_path):
 
     lines, _ = _read_sb(path)
     assert any(line.startswith("!") and "Kd1pct" in line for line in lines)
+
+
+def test_write_seabass_station_file_scalar_par_values_and_missing_sentinel(tmp_path):
+    path = tmp_path / "MAN-F05.sb"
+    header = SeaBASSHeaderFields(missing=-9999)
+    write_seabass_station_file(
+        _make_aggregate(),
+        header,
+        WAVES,
+        path,
+    )
+
+    lines, data_row = _read_sb(path)
+    fields_line = next(line for line in lines if line.startswith("/fields="))
+    fields = fields_line[len("/fields=") :].split(",")
+    values = data_row.split(",")
+
+    assert values[fields.index("PAR0")] == "500"
+    assert values[fields.index("KdPAR1pct")] == "0.5"
+    assert any(line.startswith("!") and "PAR0" in line for line in lines)

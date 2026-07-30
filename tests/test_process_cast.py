@@ -151,6 +151,68 @@ def test_process_cast_kd_light_level_metrics_none_without_edz():
     assert result.kd_pd is None
 
 
+def test_process_cast_computes_par_and_kd_par_when_edz_present():
+    ds = _make_dataset(include_edz=True)
+    result = process_cast(ds, _make_init())
+
+    assert result.par_0 is not None and result.par_0 > 0
+    assert result.par_d_profile is not None
+    assert result.par_d_profile.shape == result.instrument_fits["EdZ"].depth_grid.shape
+    # LuZ is present in this fixture (no EuZ) -- par_u_profile should come from LuZ * Q.sun.nadir,
+    # aligned onto EdZ's own depth grid.
+    assert result.par_u_profile is not None
+    assert result.par_u_profile.shape == result.par_d_profile.shape
+    assert result.kz_par is not None
+    assert result.k0_par is not None
+    assert result.kz_par.shape == (len(result.instrument_fits["EdZ"].depth_grid) - 1,)
+    # This shared fixture's Ed0/EdZ absolute scales aren't physically matched (a pre-existing
+    # fixture quirk, not new to this test -- Ed0 is a flat 100.0 while EdZ's own X0 values are
+    # 50-300), so PAR.d can start *above* PAR.0 rather than decaying from it; kd_par_* may
+    # legitimately be NaN here (kd_at_light_fraction's own documented "fraction never reached"
+    # behavior). This test only checks the fields are wired through (present, not None) --
+    # physical correctness is checked separately against real R output and real cast data.
+    assert result.kd_par_1pct is not None
+    assert result.kd_par_10pct is not None
+    assert result.kd_par_pd is not None
+    # PAR should decrease monotonically with depth for this fixture's pure-exponential-decay profile.
+    assert np.all(np.diff(result.par_d_profile) <= 0)
+
+
+def test_process_cast_par_none_without_edz():
+    ds = _make_dataset(include_edz=False)
+    result = process_cast(ds, _make_init())
+
+    assert result.par_0 is None
+    assert result.par_d_profile is None
+    assert result.par_u_profile is None
+    assert result.kz_par is None
+    assert result.k0_par is None
+    assert result.kd_par_1pct is None
+    assert result.kd_par_10pct is None
+    assert result.kd_par_pd is None
+
+
+def test_process_cast_par_u_profile_none_without_luz_or_euz():
+    ds = xr.Dataset(
+        {
+            "Ed0": (("time", "wavelength"), np.full((300, 4), 100.0)),
+            "EdZ": (("time", "wavelength"), np.full((300, 4), 50.0)),
+            "Ed0_Roll": ("time", np.zeros(300)),
+            "Ed0_Pitch": ("time", np.zeros(300)),
+            "EdZ_Roll": ("time", np.zeros(300)),
+            "EdZ_Pitch": ("time", np.zeros(300)),
+            "LuZ_Depth": ("time", np.linspace(0.05, 6.0, 300)),
+        },
+        coords={"time": np.arange(300), "wavelength": np.array(WAVES)},
+    )
+
+    result = process_cast(ds, _make_init())
+
+    assert set(result.instrument_fits) == {"EdZ"}
+    assert result.par_d_profile is not None  # EdZ alone is still enough for PAR.d/Kd(PAR)
+    assert result.par_u_profile is None
+
+
 def test_process_cast_skips_absent_instrument():
     ds = _make_dataset(include_edz=False)
     result = process_cast(ds, _make_init())

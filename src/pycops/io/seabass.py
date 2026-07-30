@@ -40,6 +40,15 @@ _WAVELENGTH_FIELDS = (
     ("kd_pd", "Kdpd", "1/m"),
 )
 
+# (StationAggregate scalar attr, SeaBASS field-name, units) -- broadband PAR/Kd(PAR), no
+# wavelength dimension, so one mean/sd column pair each rather than one per wavelength.
+_SCALAR_FIELDS = (
+    ("par_0", "PAR0", "uEin/m^2/s"),
+    ("kd_par_1pct", "KdPAR1pct", "1/m"),
+    ("kd_par_10pct", "KdPAR10pct", "1/m"),
+    ("kd_par_pd", "KdPARpd", "1/m"),
+)
+
 
 @dataclass
 class SeaBASSHeaderFields:
@@ -101,10 +110,24 @@ def write_seabass_station_file(
         "!Kd1pct/Kd10pct/Kdpd are pycops-derived (mean diffuse attenuation from the surface to "
         "the 1%/10%/penetration-depth light levels), not standard SeaBASS fields."
     )
+    header_lines.append(
+        "!PAR0/KdPAR1pct/KdPAR10pct/KdPARpd are pycops-derived broadband (400-700nm) PAR and its "
+        "diffuse attenuation at the 1%/10%/penetration-depth light levels, not standard SeaBASS "
+        "fields."
+    )
 
     field_names = ["date", "time", "lat", "lon", "station"]
     units = ["yyyymmdd", "hh:mm:ss", "degrees", "degrees", "none"]
     row_values = [date_str, time_str, lat_str, lon_str, aggregate.station_id]
+
+    for attr, name, unit in _SCALAR_FIELDS:
+        scalar = getattr(aggregate, attr)
+        field_names.append(name)
+        units.append(unit)
+        row_values.append(_format_value(scalar.mean, header.missing))
+        field_names.append(f"{name}_sd")
+        units.append(unit)
+        row_values.append(_format_value(scalar.sd, header.missing))
 
     for attr, prefix, unit in _WAVELENGTH_FIELDS:
         mean_sd = getattr(aggregate, attr)

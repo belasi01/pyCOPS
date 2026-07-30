@@ -245,6 +245,61 @@ def _render_attenuation(nc: xr.Dataset, instrument: str) -> None:
     _show(fig)
 
 
+def _render_par_and_kd_par(nc: xr.Dataset, selected: str) -> None:
+    """Vertical PAR profile + Kd(PAR) -- port of ``compute.PAR.fitted.R``'s own plot, one of the
+    richer diagnostics from Simon's R PDF report that pycops didn't have until now. ``PAR.0`` is a
+    single scalar here (a vertical reference line), not a depth profile like R's: pycops fits Ed0
+    at one point only (see ``par_0``'s own docstring in ``process_cast.py``), and the per-scan
+    illumination-change diagnostic R's own ``PAR.0(z)`` plot doubles as is already covered by the
+    "Ed0 stability" section above.
+    """
+    depth = nc["EdZ_depth"].values
+    par_d = nc["par_d_profile"].values
+    par_0 = float(nc.attrs["par_0"])
+
+    fig, ax = _new_fig((7, 5))
+    ax.plot(par_d, depth, color="tab:blue", lw=2, label="PAR_d (downwelling)")
+    if "par_u_profile" in nc.data_vars:
+        ax.plot(nc["par_u_profile"].values, depth, color="tab:orange", lw=2, label="PAR_u (upwelling)")
+    ax.axvline(par_0, color="gray", ls="--", lw=1.5, label="PAR_0 (surface reference)")
+    ax.set_xscale("log")
+    ax.invert_yaxis()
+    ax.set_xlabel("PAR (µEin.m⁻².s⁻¹, log scale)")
+    ax.set_ylabel("Depth (m)")
+    ax.legend(loc="best", fontsize="small")
+    _show(fig)
+
+    st.caption("Kd(PAR): mean diffuse attenuation of broadband PAR from the surface to a given depth.")
+    fraction_table = {
+        "light level": ["1%", "10%", "penetration depth (1/e)"],
+        "Kd(PAR) (m⁻¹)": [nc.attrs["kd_par_1pct"], nc.attrs["kd_par_10pct"], nc.attrs["kd_par_pd"]],
+    }
+    st.dataframe(fraction_table, hide_index=True)
+
+    if "kd_1pct" in nc.data_vars:
+        st.caption("Spectral Kd (per wavelength), for comparison:")
+        spectral_table = {
+            "wavelength (nm)": nc["wavelength"].values,
+            "Kd 1% (m⁻¹)": nc["kd_1pct"].values,
+            "Kd 10% (m⁻¹)": nc["kd_10pct"].values,
+            "Kd penetration depth (m⁻¹)": nc["kd_pd"].values,
+        }
+        st.dataframe(spectral_table, hide_index=True)
+
+    k0_depth = depth[1:]  # k0_par[0] is a leading-NaN pad, matching K0's own depth_grid[1:] alignment
+    k0_values = nc["k0_par"].values[1:]
+    if len(k0_depth) > 1:
+        chosen_depth = st.slider(
+            "Depth for Kd(PAR) integrated from the surface",
+            min_value=float(k0_depth.min()),
+            max_value=float(k0_depth.max()),
+            value=float(k0_depth.min()),
+            key=f"analyze_kdpar_depth_slider::{selected}",
+        )
+        kd_at_depth = np.interp(chosen_depth, k0_depth, k0_values)
+        st.metric(f"Kd(PAR) at {chosen_depth:.2f} m", f"{kd_at_depth:.4f} m⁻¹" if np.isfinite(kd_at_depth) else "NA")
+
+
 def _render_extrapolation_comparison(
     nc: xr.Dataset,
     raw_ds: xr.Dataset | None,
@@ -923,6 +978,10 @@ def _render_single_cast(directory: Path) -> None:
             _render_depth_profile(nc, raw_ds, depth_is_on, delta_capteur_optics.get(instrument), instrument)
         with st.expander(f"{instrument} attenuation (K)"):
             _render_attenuation(nc, instrument)
+
+    if "par_d_profile" in nc.data_vars:
+        with st.expander("PAR & Kd(PAR)"):
+            _render_par_and_kd_par(nc, selected)
 
     for instrument in _SHADOW_INSTRUMENTS:
         if f"{instrument}_surface_value_at_surface" in nc.data_vars:

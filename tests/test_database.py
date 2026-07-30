@@ -28,6 +28,10 @@ def _write_fake_nc(
     lon=None,
     lat=None,
     time=None,
+    par_0=None,
+    kd_par_1pct=None,
+    kd_par_10pct=None,
+    kd_par_pd=None,
 ):
     """A minimal, hand-built .nc matching just the fields aggregate_station() reads -- avoids
     needing a full synthetic radiometric profile through process_cast() for every test case,
@@ -47,6 +51,14 @@ def _write_fake_nc(
     ds.attrs["longitude"] = lon if lon is not None else float("nan")
     ds.attrs["latitude"] = lat if lat is not None else float("nan")
     ds.attrs["chl_flag"] = chl_flag if chl_flag is not None else float("nan")
+    if par_0 is not None:
+        ds.attrs["par_0"] = par_0
+    if kd_par_1pct is not None:
+        ds.attrs["kd_par_1pct"] = kd_par_1pct
+    if kd_par_10pct is not None:
+        ds.attrs["kd_par_10pct"] = kd_par_10pct
+    if kd_par_pd is not None:
+        ds.attrs["kd_par_pd"] = kd_par_pd
     ds.to_netcdf(path, engine="netcdf4")
 
 
@@ -82,6 +94,42 @@ def test_aggregate_station_mean_sd_matches_manual_computation(tmp_path):
     np.testing.assert_allclose(result.rrs.sd[[i443, i555]], [np.std([1.0, 2.0], ddof=1), np.std([10.0, 20.0], ddof=1)])
     np.testing.assert_allclose(result.ed0_0p.mean[[i443, i555]], [105.0, 205.0])
     assert result.station_id == "ABC"
+
+
+def test_aggregate_station_computes_scalar_par_kd_par_mean_sd(tmp_path):
+    directory = tmp_path / "20200101_StationPAR" / "cops"
+    _make_station(
+        directory,
+        {
+            "CAST_001": dict(
+                rrs=[1.0, 10.0], ed0=[100.0, 200.0], par_0=500.0, kd_par_1pct=0.5, kd_par_10pct=0.6, kd_par_pd=0.55
+            ),
+            "CAST_002": dict(
+                rrs=[2.0, 20.0], ed0=[110.0, 210.0], par_0=520.0, kd_par_1pct=0.7, kd_par_10pct=0.8, kd_par_pd=0.75
+            ),
+        },
+    )
+
+    result = aggregate_station(directory)
+
+    assert result.par_0.mean == pytest.approx(510.0)
+    assert result.par_0.sd == pytest.approx(np.std([500.0, 520.0], ddof=1))
+    assert result.kd_par_1pct.mean == pytest.approx(0.6)
+    assert result.kd_par_10pct.mean == pytest.approx(0.7)
+    assert result.kd_par_pd.mean == pytest.approx(0.65)
+
+
+def test_aggregate_station_scalar_par_nan_when_no_cast_has_it(tmp_path):
+    directory = tmp_path / "20200101_StationNoPAR" / "cops"
+    _make_station(
+        directory,
+        {"CAST_001": dict(rrs=[1.0, 10.0], ed0=[100.0, 200.0])},
+    )
+
+    result = aggregate_station(directory)
+
+    assert np.isnan(result.par_0.mean)
+    assert np.isnan(result.par_0.sd)
 
 
 def test_aggregate_station_excludes_rejected_cast(tmp_path):

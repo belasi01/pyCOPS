@@ -20,14 +20,32 @@ _AV = 6.022140857e23
 _PAR_WAVES_NM = np.arange(400, 701, dtype=float)
 
 
-def _par_quanta(waves_nm: np.ndarray, values: np.ndarray) -> float:
-    """Photon-flux-weighted PAR for one spectrum (arbitrary units -- cancel out in a ratio)."""
+def par_quanta(waves_nm: np.ndarray, values: np.ndarray) -> float:
+    """Photon-flux-weighted PAR for one spectrum, in uEinstein.m-2.s-1 when ``values`` is in
+    COPS's native calibrated units (uW/cm^2/nm) -- matching ``compute.PAR.fitted.R``'s
+    Planck's-constant photon-flux conversion, including its ``* 1E-2`` uW/cm^2/nm -> W/m^2/nm
+    SI conversion (confirmed against ``shadow.correction.R``'s matching ``* 100`` in the other
+    direction) -- this cancels out in a ratio (e.g. :func:`percent_par_at_depth`, Kd(PAR)), which
+    is why its earlier omission here went undetected until an absolute PAR value was needed."""
     order = np.argsort(waves_nm)
     values = np.nan_to_num(values[order], nan=0.0)  # matches compute.PAR.fitted.R's EdZ[is.na(EdZ)] <- 0
     spline = CubicSpline(waves_nm[order], values, bc_type="natural")
     interpolated = np.clip(spline(_PAR_WAVES_NM), 0, None)  # negative spline artifacts -> 0, matching R's NA->0
+    interpolated = interpolated * 1e-2  # uW/cm^2/nm -> W/m^2/nm (SI), matching compute.PAR.fitted.R
     quanta = interpolated * _PAR_WAVES_NM * 1e-9 / (_H * _C)
     return float(np.sum(quanta)) * 1e6 / _AV  # uEinstein.m-2.s-1, matching compute.PAR.fitted.R
+
+
+def par_profile(waves_nm: np.ndarray, fitted_profile: np.ndarray) -> np.ndarray:
+    """PAR (uEinstein.m-2.s-1) at every depth-grid point of a fitted spectral profile.
+
+    ``fitted_profile`` is ``(n_depth, n_waves)`` (e.g. a cast's ``EdZ_fitted``). Full-profile
+    generalization of :func:`percent_par_at_depth`'s two-depth ratio -- port of the per-depth loop
+    in ``compute.PAR.fitted.R`` that produces ``PAR.d.fitted``/``PAR.u.fitted``.
+    """
+    waves_nm = np.asarray(waves_nm, dtype=float)
+    fitted_profile = np.asarray(fitted_profile, dtype=float)
+    return np.array([par_quanta(waves_nm, fitted_profile[i, :]) for i in range(fitted_profile.shape[0])])
 
 
 def percent_par_at_depth(
@@ -51,8 +69,8 @@ def percent_par_at_depth(
         [np.interp(target_depth, depth_grid, fitted_profile[:, i]) for i in range(fitted_profile.shape[1])]
     )
 
-    par_surface = _par_quanta(waves_nm, surface_values)
+    par_surface = par_quanta(waves_nm, surface_values)
     if par_surface <= 0:
         return None
-    par_target = _par_quanta(waves_nm, target_values)
+    par_target = par_quanta(waves_nm, target_values)
     return 100.0 * par_target / par_surface

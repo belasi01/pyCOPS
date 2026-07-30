@@ -20,13 +20,14 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from pycops.processing.attenuation import kd_at_light_fraction
+from pycops.processing.attenuation import compute_K, kd_at_light_fraction
 from pycops.processing.bioshade import BioShadeResult
 from pycops.processing.bottom import BottomReflectanceResult, compute_bottom_depth, compute_bottom_reflectance
 from pycops.processing.cast_fit import InstrumentFit, fit_cast, fit_ed0_for_cast
 from pycops.processing.ed0 import Ed0Fit
 from pycops.processing.ed0_0m import compute_ed0_subsurface
 from pycops.processing.gregg_carder import gregg_carder_diffuse_direct
+from pycops.processing.par import par_profile, par_quanta
 from pycops.processing.position import PositionOverride
 from pycops.processing.qfactor import compute_q_factor
 from pycops.processing.qwip import QWIPResult, compute_qwip
@@ -100,6 +101,14 @@ class CastResult:
     kd_1pct: np.ndarray | None  # mean Kd from surface to the 1% light level, EdZ only
     kd_10pct: np.ndarray | None  # mean Kd from surface to the 10% light level
     kd_pd: np.ndarray | None  # mean Kd from surface to the penetration depth (1/e light level)
+    par_0: float | None  # broadband PAR (uEin.m-2.s-1) of Ed0's smoothed surface reference
+    par_d_profile: np.ndarray | None  # PAR(z), one value per EdZ depth-grid point
+    par_u_profile: np.ndarray | None  # PAR(z) from EuZ (or LuZ*Q.sun.nadir), aligned onto EdZ's grid
+    kz_par: np.ndarray | None  # local Kd(PAR), aligned with EdZ's depth_grid[1:]
+    k0_par: np.ndarray | None  # depth-integrated Kd(PAR), same alignment as kz_par
+    kd_par_1pct: float | None  # mean Kd(PAR) from surface to the 1% light level
+    kd_par_10pct: float | None  # mean Kd(PAR) from surface to the 10% light level
+    kd_par_pd: float | None  # mean Kd(PAR) from surface to the penetration depth
     bottom_reflectance: dict[str, BottomReflectanceResult]  # by instrument ("LuZ"/"EuZ"), only for SHALLOW casts
     bottom_note: str | None  # why bottom_reflectance is empty despite a SHALLOW-flagged cast, if so
     resolved_longitude: float | None  # position actually used for shadow correction/Ed0.0m, if resolved
@@ -331,6 +340,19 @@ def process_cast(
     otherwise falls back to ``Ed0.0p`` (``ed0_fit.value_at_0``) rather than leaving these ``None``
     for every EuZ-less cast -- a documented deviation, since R always requires ``Ed0.0m``.
 
+    The same ``EdZ``-present gate also computes broadband PAR (port of
+    ``compute.PAR.fitted.R``, see :mod:`pycops.processing.par`): ``par_0`` (a single scalar, from
+    Ed0's smoothed surface-reference spectrum -- pycops fits Ed0 at one point, never a depth
+    profile, unlike R, so there's no ``PAR.0(z)`` curve here; the per-scan illumination-change
+    diagnostic that R plot doubles as is already covered by the analyze tab's separate "Ed0
+    stability" section), ``par_d_profile`` (PAR at every ``EdZ`` depth-grid point), ``par_u_profile``
+    (from EuZ, or ``LuZ * Q.sun.nadir`` when only LuZ is present, interpolated onto EdZ's own depth
+    grid the same way :func:`pycops.processing.bottom.compute_bottom_reflectance` already aligns
+    one instrument's fit onto another's), and ``kz_par``/``k0_par`` (local/depth-integrated Kd(PAR),
+    via :func:`pycops.processing.attenuation.compute_K` treating PAR as a single band) plus
+    ``kd_par_1pct``/``kd_par_10pct``/``kd_par_pd`` (the same three light-level fractions as the
+    spectral Kd above, via ``kd_at_light_fraction``).
+
     When ``ds`` is flagged ``SHALLOW`` (``select.cops.dat``'s 4th field,
     ``"1"`` -- see :attr:`~pycops.io.discovery.CastSelection.shallow`),
     ``CastResult.bottom_reflectance`` also gets one
@@ -463,6 +485,40 @@ def process_cast(
         kd_10pct = kd_at_light_fraction(edz_fit.aop_fitted, edz_fit.depth_grid, ed0_subsurface, 0.1)
         kd_pd = kd_at_light_fraction(edz_fit.aop_fitted, edz_fit.depth_grid, ed0_subsurface, 1 / np.e)
 
+    par_0 = par_d_profile = par_u_profile = kz_par = k0_par = None
+    kd_par_1pct = kd_par_10pct = kd_par_pd = None
+    if "EdZ" in instrument_fits:
+        edz_fit = instrument_fits["EdZ"]
+        par_0 = par_quanta(waves, ed0_fit.value_at_0)
+        par_d_profile = par_profile(waves, edz_fit.aop_fitted)
+
+        par_u_fitted = None
+        if "EuZ" in instrument_fits:
+            par_u_fitted = instrument_fits["EuZ"].aop_fitted
+            par_u_depth_grid = instrument_fits["EuZ"].depth_grid
+        elif "LuZ" in instrument_fits:
+            luz_fit = instrument_fits["LuZ"]
+            par_u_fitted = luz_fit.aop_fitted * compute_q_factor(ds.attrs.get("chl_flag"), len(waves))[None, :]
+            par_u_depth_grid = luz_fit.depth_grid
+        if par_u_fitted is not None:
+            # LuZ/EuZ have their own depth grid, separate from EdZ's -- align onto EdZ's grid the
+            # same way compute_bottom_reflectance() already does (bottom.py), rather than assuming
+            # a shared grid like R's own single-depth-axis convention does.
+            par_u_on_edz_grid = np.column_stack(
+                [np.interp(edz_fit.depth_grid, par_u_depth_grid, par_u_fitted[:, i]) for i in range(len(waves))]
+            )
+            par_u_profile = par_profile(waves, par_u_on_edz_grid)
+
+        kz_par_2d, k0_par_2d = compute_K(
+            edz_fit.depth_grid, edz_fit.idx_depth_0, np.array([par_0]), par_d_profile[:, None]
+        )
+        kz_par, k0_par = kz_par_2d[:, 0], k0_par_2d[:, 0]
+        kd_par_1pct = kd_at_light_fraction(par_d_profile[:, None], edz_fit.depth_grid, np.array([par_0]), 0.01)[0]
+        kd_par_10pct = kd_at_light_fraction(par_d_profile[:, None], edz_fit.depth_grid, np.array([par_0]), 0.1)[0]
+        kd_par_pd = kd_at_light_fraction(
+            par_d_profile[:, None], edz_fit.depth_grid, np.array([par_0]), 1 / np.e
+        )[0]
+
     bottom_reflectance: dict[str, BottomReflectanceResult] = {}
     bottom_note: str | None = None
     if ds.attrs.get("shallow"):
@@ -506,6 +562,14 @@ def process_cast(
         kd_1pct=kd_1pct,
         kd_10pct=kd_10pct,
         kd_pd=kd_pd,
+        par_0=par_0,
+        par_d_profile=par_d_profile,
+        par_u_profile=par_u_profile,
+        kz_par=kz_par,
+        k0_par=k0_par,
+        kd_par_1pct=kd_par_1pct,
+        kd_par_10pct=kd_par_10pct,
+        kd_par_pd=kd_par_pd,
         bottom_reflectance=bottom_reflectance,
         bottom_note=bottom_note,
         resolved_longitude=lon,
