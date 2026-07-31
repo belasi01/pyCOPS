@@ -208,11 +208,8 @@ def test_analyze_tab_full_cast_renders_every_section(tmp_path):
     assert "EuZ bottom reflectance" in expander_labels
     assert any("Benthic PAR" in m.label for m in at.metric)
 
-    # PAR & Kd(PAR) section: renders, and the interactive depth slider is exercisable.
+    # PAR & Kd(PAR) section: renders, including the Kd(PAR)-vs-depth plot (no exception).
     assert "PAR & Kd(PAR)" in expander_labels
-    at.slider(key=f"analyze_kdpar_depth_slider::{_CAST_STEM}").set_value(2.0).run(timeout=30)
-    assert not at.exception
-    assert any("Kd(PAR) at" in m.label for m in at.metric)
 
 
 def test_analyze_tab_minimal_cast_skips_optional_sections(tmp_path):

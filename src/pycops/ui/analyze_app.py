@@ -245,13 +245,21 @@ def _render_attenuation(nc: xr.Dataset, instrument: str) -> None:
     _show(fig)
 
 
+_PAR_LEVEL_FRACTIONS = (0.5, 0.1, 0.01, 0.001)  # 50% / 10% / 1% / 0.1% of PAR_0, per Simon's request
+# Kd(PAR) integrated from the surface is noisy/not meaningful in the first few cm (near-surface
+# scan sparsity, extrapolation sensitivity) -- Simon: "j'aurais tendance à commencer à partir de
+# 0.5 mètres" for the integrated Kd(PAR)-vs-depth plot specifically (not the PAR profile itself).
+_KD_PAR_MIN_DEPTH_M = 0.5
+
+
 def _render_par_and_kd_par(nc: xr.Dataset, selected: str) -> None:
     """Vertical PAR profile + Kd(PAR) -- port of ``compute.PAR.fitted.R``'s own plot, one of the
     richer diagnostics from Simon's R PDF report that pycops didn't have until now. ``PAR.0`` is a
     single scalar here (a vertical reference line), not a depth profile like R's: pycops fits Ed0
     at one point only (see ``par_0``'s own docstring in ``process_cast.py``), and the per-scan
     illumination-change diagnostic R's own ``PAR.0(z)`` plot doubles as is already covered by the
-    "Ed0 stability" section above.
+    "Ed0 stability" section above. ``PAR_u`` is computed (see ``.nc``'s ``par_u_profile``) but not
+    plotted here -- Simon: "pas vraiment pertinent sur le graph".
     """
     depth = nc["EdZ_depth"].values
     par_d = nc["par_d_profile"].values
@@ -259,9 +267,18 @@ def _render_par_and_kd_par(nc: xr.Dataset, selected: str) -> None:
 
     fig, ax = _new_fig((7, 5))
     ax.plot(par_d, depth, color="tab:blue", lw=2, label="PAR_d (downwelling)")
-    if "par_u_profile" in nc.data_vars:
-        ax.plot(nc["par_u_profile"].values, depth, color="tab:orange", lw=2, label="PAR_u (upwelling)")
     ax.axvline(par_0, color="gray", ls="--", lw=1.5, label="PAR_0 (surface reference)")
+    for fraction in _PAR_LEVEL_FRACTIONS:
+        ax.axvline(par_0 * fraction, color="gray", ls=":", lw=1)
+        ax.text(
+            par_0 * fraction,
+            depth.max(),
+            f"{fraction * 100:g}%",
+            color="gray",
+            fontsize="small",
+            ha="center",
+            va="bottom",
+        )
     ax.set_xscale("log")
     ax.invert_yaxis()
     ax.set_xlabel("PAR (µEin.m⁻².s⁻¹, log scale)")
@@ -288,16 +305,17 @@ def _render_par_and_kd_par(nc: xr.Dataset, selected: str) -> None:
 
     k0_depth = depth[1:]  # k0_par[0] is a leading-NaN pad, matching K0's own depth_grid[1:] alignment
     k0_values = nc["k0_par"].values[1:]
+    deep_enough = k0_depth >= _KD_PAR_MIN_DEPTH_M
+    k0_depth, k0_values = k0_depth[deep_enough], k0_values[deep_enough]
     if len(k0_depth) > 1:
-        chosen_depth = st.slider(
-            "Depth for Kd(PAR) integrated from the surface",
-            min_value=float(k0_depth.min()),
-            max_value=float(k0_depth.max()),
-            value=float(k0_depth.min()),
-            key=f"analyze_kdpar_depth_slider::{selected}",
-        )
-        kd_at_depth = np.interp(chosen_depth, k0_depth, k0_values)
-        st.metric(f"Kd(PAR) at {chosen_depth:.2f} m", f"{kd_at_depth:.4f} m⁻¹" if np.isfinite(kd_at_depth) else "NA")
+        fig, ax = _new_fig((7, 5))
+        ax.plot(k0_values, k0_depth, color="tab:blue", lw=2)
+        ax.invert_yaxis()
+        ax.set_xlabel("Kd(PAR) integrated from the surface to Z (m⁻¹)")
+        ax.set_ylabel("Depth Z (m)")
+        _show(fig)
+    else:
+        st.caption(f"Not enough fitted depths below {_KD_PAR_MIN_DEPTH_M:g} m to plot Kd(PAR) vs. depth.")
 
 
 def _render_extrapolation_comparison(
