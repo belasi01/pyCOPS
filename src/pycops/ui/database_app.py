@@ -12,12 +12,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import streamlit as st
 
 from pycops.io.database import write_mission_database_csv, write_mission_database_netcdf
+from pycops.io.database_report import KD_METRIC_LABELS, build_kd_comparison_figure, build_rrs_comparison_figure
 from pycops.io.discovery import FLAG_BIOSHADE, FLAG_NORMAL, FLAG_UNDER_ICE, find_deployment_folders, read_select_cops
 from pycops.io.seabass import SeaBASSHeaderFields, write_seabass_station_file
-from pycops.processing.database import aggregate_station, assemble_mission_database
+from pycops.processing.database import StationAggregate, aggregate_station, assemble_mission_database
 from pycops.ui._common import _directory_input
 
 _KEPT_FLAGS = (FLAG_NORMAL, FLAG_BIOSHADE, FLAG_UNDER_ICE)
@@ -33,11 +35,91 @@ def _kept_cast_count(directory: Path) -> int | None:
     return sum(1 for s in read_select_cops(select_path) if s.flag in _KEPT_FLAGS)
 
 
+def _show(fig) -> None:
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+def _aggregate_checked_stations(checked: list[Path]) -> tuple[list[StationAggregate], list[str]]:
+    stations: list[StationAggregate] = []
+    failures: list[str] = []
+    progress = st.progress(0.0)
+    for i, folder in enumerate(checked):
+        try:
+            stations.append(aggregate_station(folder))
+        except Exception as exc:  # noqa: BLE001 -- isolate one bad station from the rest
+            failures.append(f"{folder}: {type(exc).__name__}: {exc}")
+        progress.progress((i + 1) / len(checked))
+    return stations, failures
+
+
+def _render_station_comparison(checked: list[Path]) -> None:
+    """Overlay several stations' mean Rrs/Kd spectra (mean +/- 1 SD shaded band per station,
+    across each station's own kept casts) -- reuses the exact same aggregation
+    (:func:`~pycops.processing.database.aggregate_station`) the mission-database export computes,
+    just for plotting rather than writing files. One level up from tab 4's own "every cast in
+    this one station" comparison."""
+    st.caption(
+        "Mean Rrs/Kd across each station's kept casts, with +/- 1 SD as a shaded band -- pick a "
+        "handful of stations above to spot-check consistency or find outliers."
+    )
+    if not checked:
+        st.info("Check at least one station above to compare.")
+        return
+
+    kd_label = st.selectbox(
+        "Kd metric", list(KD_METRIC_LABELS.values()), key="database_compare_kd_metric"
+    )
+    kd_metric = next(k for k, label in KD_METRIC_LABELS.items() if label == kd_label)
+
+    if st.button(f"Compare {len(checked)} station(s)", key="database_compare_run"):
+        stations, failures = _aggregate_checked_stations(checked)
+        st.session_state["database_compare_stations"] = stations
+        st.session_state["database_compare_failures"] = failures
+
+    stations = st.session_state.get("database_compare_stations")
+    if stations is None:
+        return
+
+    for failure in st.session_state.get("database_compare_failures", []):
+        st.warning(f"Couldn't aggregate {failure}")
+    if not stations:
+        st.error("No station could be aggregated -- nothing to compare.")
+        return
+
+    st.dataframe(
+        {
+            "station": [s.station_id for s in stations],
+            "folder": [s.directory.name for s in stations],
+            "n_casts": [s.n_casts for s in stations],
+        },
+        width="stretch",
+        hide_index=True,
+    )
+
+    rrs_fig = build_rrs_comparison_figure(stations)
+    if rrs_fig is not None:
+        st.subheader("Rrs comparison")
+        _show(rrs_fig)
+    else:
+        st.info("No Rrs data available across the selected stations.")
+
+    kd_fig = build_kd_comparison_figure(stations, metric=kd_metric)
+    if kd_fig is not None:
+        st.subheader(f"{kd_label} comparison")
+        _show(kd_fig)
+    else:
+        st.info(f"No {kd_label.lower()} data available across the selected stations.")
+
+
 def render_database_tab() -> None:
+    tool = st.radio(
+        "Tool", ("Generate database", "Compare stations (Rrs & Kd)"), key="database_tool"
+    )
     parent_input = _directory_input(
         "Parent folder (searched recursively for init.cops.dat)", key="database_parent"
     )
-    mission = st.text_input("Mission name", key="database_mission")
+    mission = st.text_input("Mission name", key="database_mission") if tool == "Generate database" else None
     if not parent_input:
         st.info("Enter a parent folder to begin.")
         return
@@ -61,6 +143,10 @@ def render_database_tab() -> None:
         label += ")" if has_nc else ", not yet processed in tab 3)"
         if st.checkbox(label, value=True, key=f"database_station_{rel}"):
             checked.append(folder)
+
+    if tool == "Compare stations (Rrs & Kd)":
+        _render_station_comparison(checked)
+        return
 
     st.divider()
     st.subheader("SeaBASS metadata")

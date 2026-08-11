@@ -21,7 +21,7 @@ from pycops.processing.attenuation import compute_K
 from pycops.processing.depth import depth_grid as build_depth_grid
 from pycops.processing.depth import good_depth_mask, time_window_mask
 from pycops.processing.detection_limits import detection_limit_for_waves
-from pycops.processing.ed0 import Ed0Fit, fit_ed0
+from pycops.processing.ed0 import Ed0CorrectionMethod, Ed0Fit, fit_ed0
 from pycops.processing.profile_fit import fit_profile_loess
 from pycops.processing.surface_linear import SurfaceLinearFit, fit_surface_linear
 from pycops.processing.tilt import tilt_mask
@@ -30,7 +30,10 @@ _DEPTH_PROFILED_INSTRUMENTS = ("EdZ", "LuZ", "EuZ")
 
 
 def fit_ed0_for_cast(
-    ds: xr.Dataset, init: dict[str, object], time_window: tuple[float, float] | None = None
+    ds: xr.Dataset,
+    init: dict[str, object],
+    time_window: tuple[float, float] | None = None,
+    method: Ed0CorrectionMethod = "raw",
 ) -> Ed0Fit:
     """Fit the above-water reference (Ed0) for a cast, per ``process.Ed0.R``.
 
@@ -39,7 +42,21 @@ def fit_ed0_for_cast(
     ``time_window``, if given, further restricts kept scans to those falling
     within it (see :func:`pycops.processing.depth.time_window_mask`) --
     resolved by the caller (see :func:`pycops.processing.process_cast.process_cast`),
-    not read from ``ds.attrs`` here.
+    not read from ``ds.attrs`` here. ``method`` picks between the R-matching
+    ``"raw"`` correction and the pycops-only ``"smoothed"`` alternative (see
+    :func:`pycops.processing.ed0.fit_ed0`); both are always computed
+    (``Ed0Fit.correction_raw``/``.correction_smoothed``), only which one
+    becomes the plain ``.correction`` actually applied downstream changes.
+
+    Evaluates the LOESS fit across a real depth grid spanning the whole
+    cast (like :func:`fit_cast` already does for EdZ/LuZ/EuZ), not just the
+    single surface point -- ``fitted``/``value_at_0`` need this. Passes
+    elapsed time too (not just depth) for ``correction_smoothed``'s own,
+    separate time-domain fit -- depth alone isn't a safe stand-in for time
+    across a whole profile (a pre-descent bobbing phase or a down-up cast
+    puts two different real times at the same depth; see
+    :func:`pycops.processing.ed0.fit_ed0`'s docstring for the real-data bug
+    this fixes).
     """
     waves = ds["wavelength"].values
     depth_ref = ds[f"{init['depth.is.on']}_Depth"].values
@@ -50,14 +67,20 @@ def fit_ed0_for_cast(
     kept = depth_good & ed0_tilt_ok
 
     ed0_all = ds["Ed0"].values
+    time_all = (ds["time"].values - ds["time"].values.min()) / np.timedelta64(1, "s")
+    grid = build_depth_grid(init["depth.discretization"], max_depth=float(depth_ref.max()))
+    idx_depth_0 = int(np.argmin(np.abs(grid - 0.0)))
     return fit_ed0(
         waves,
         depth_ref[kept],
         ed0_all[kept],
         ed0_all,
         span=init["depth.interval.for.smoothing.optics"]["Ed0"],
-        depth_grid=np.array([0.0]),
-        idx_depth_0=0,
+        depth_grid=grid,
+        idx_depth_0=idx_depth_0,
+        time_kept=time_all[kept],
+        time_all=time_all,
+        method=method,
     )
 
 

@@ -30,7 +30,7 @@ from __future__ import annotations
 import html
 import sys
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -56,12 +56,14 @@ from pycops.io.discovery import (
     update_cast_selection,
 )
 from pycops.io.netcdf import write_deployment_result
+from pycops.io.pdf_report import write_station_pdf_reports
 from pycops.io.raw import parse_cast_filename, read_cast
 from pycops.io.scaffold import discover_l1_casts, scaffold_station, validate_station_id
 from pycops.processing.deployment import DeploymentProcessingResult, process_deployment
 from pycops.processing.position import find_gps_file, position_from_gps, read_gps_file
 from pycops.ui._common import (
     _directory_input,
+    _file_input,
     existing_info,
     existing_selection,
     parsed_override_fields,
@@ -87,12 +89,17 @@ _METHOD_LABELS = {
     "Rrs.0p": "LOESS (non-linear)",
     "Rrs.0p.linear": "Linear",
 }
+_ED0_CORRECTION_METHOD_OPTIONS = ("raw", "smoothed")
+_ED0_CORRECTION_METHOD_LABELS = {
+    "raw": "Raw (matches R)",
+    "smoothed": "Smoothed (pycops-only, less noisy)",
+}
 
 _TAB_SCAFFOLD = "1. Create a station (L1 -> L2)"
 _TAB_CLEAN = "2. Clean casts"
 _TAB_PROCESS = "3. Process casts"
 _TAB_ANALYZE = "4. Analyze results"
-_TAB_DATABASE = "5. Generate database"
+_TAB_DATABASE = "5. Station comparison and database generation tools"
 
 # info.cops.dat's "chl" field selects the absorption model shadow correction uses (see
 # pycops.processing.shadow.resolve_absorption): 999 = derived from this cast's own fitted Kd
@@ -277,7 +284,7 @@ def _render_init_cops_dat_editor(init: dict[str, object], *, key_prefix: str) ->
     )
 
     params = dict(init)
-    col_a, col_b, col_c = st.columns(3)
+    col_a, col_b, col_c, col_d = st.columns(4)
     with col_a:
         params["number.of.fields.before.date"] = st.number_input(
             "Segments before the date in the file name",
@@ -302,6 +309,18 @@ def _render_init_cops_dat_editor(init: dict[str, object], *, key_prefix: str) ->
             value=float(init["bandwidth"]),
             key=f"{key_prefix}_bandwidth",
             help=INIT_COPS_DAT_HELP["bandwidth"],
+        )
+    with col_d:
+        current_ed0_method = init.get("ed0.correction.method", "raw")
+        if current_ed0_method not in _ED0_CORRECTION_METHOD_OPTIONS:
+            current_ed0_method = "raw"
+        params["ed0.correction.method"] = st.selectbox(
+            "Ed0 correction method",
+            _ED0_CORRECTION_METHOD_OPTIONS,
+            index=_ED0_CORRECTION_METHOD_OPTIONS.index(current_ed0_method),
+            format_func=lambda k: _ED0_CORRECTION_METHOD_LABELS[k],
+            key=f"{key_prefix}_ed0_correction_method",
+            help=INIT_COPS_DAT_HELP["ed0.correction.method"],
         )
 
     _render_instrument_params_table(params, instruments, key_prefix=key_prefix)
@@ -360,8 +379,8 @@ def _render_scaffold_tab() -> None:
     init_template_input = ""
     init_params: dict[str, object] | None = None
     if init_mode == "Copy from an existing station":
-        init_template_input = st.text_input(
-            "Path to an existing init.cops.dat", key="scaffold_init_template"
+        init_template_input = _file_input(
+            "Path to an existing init.cops.dat", key="scaffold_init_template", filter_name="init.cops.dat"
         )
     elif init_mode == "Generate a new file":
         init_params = _render_init_cops_dat_generator_form()
@@ -725,9 +744,11 @@ class _ProcessSummary:
     n_written: int
     captured_warnings: list[str]
     error: str | None  # deployment-level failure (e.g. missing/malformed config), if any
+    pdf_written: int | None = None  # None when PDF generation wasn't requested for this run
+    pdf_failures: list[str] = field(default_factory=list)
 
 
-def _process_one_deployment(directory: Path) -> _ProcessSummary:
+def _process_one_deployment(directory: Path, generate_pdfs: bool = False) -> _ProcessSummary:
     """Read, process, and write NetCDF output for one deployment folder.
 
     A failure before/outside ``process_deployment``'s own per-cast isolation (e.g.
@@ -735,6 +756,12 @@ def _process_one_deployment(directory: Path) -> _ProcessSummary:
     and recorded as ``_ProcessSummary.error`` instead of propagating -- so one broken folder in a
     batch can't abort the rest, mirroring the per-cast failure isolation already built into
     ``process_deployment``/``read_deployment_casts`` one level down.
+
+    ``generate_pdfs=True`` also regenerates every kept cast's PDF report plus the station summary
+    (:func:`~pycops.io.pdf_report.write_station_pdf_reports`) right after the NetCDF write, so a
+    batch/single reprocess picks up PDF-format changes automatically without a separate manual
+    step in tab 4 -- Simon's own request, since re-running the full numeric pipeline just to see a
+    PDF layout tweak is wasteful when the underlying fit hasn't changed.
     """
     output_dir = directory / "nc"
     captured_warnings: list[str] = []
@@ -755,6 +782,12 @@ def _process_one_deployment(directory: Path) -> _ProcessSummary:
             captured_warnings=captured_warnings,
             error=f"{type(exc).__name__}: {exc}",
         )
+
+    pdf_written = None
+    pdf_failures: list[str] = []
+    if generate_pdfs:
+        pdf_written, pdf_failures = write_station_pdf_reports(directory)
+
     return _ProcessSummary(
         directory=directory,
         result=result,
@@ -762,6 +795,8 @@ def _process_one_deployment(directory: Path) -> _ProcessSummary:
         n_written=len(written),
         captured_warnings=captured_warnings,
         error=None,
+        pdf_written=pdf_written,
+        pdf_failures=pdf_failures,
     )
 
 
@@ -769,7 +804,10 @@ def _render_process_summary(label: str, summary: _ProcessSummary, *, expanded: b
     if summary.error is not None:
         icon = "❌"
     elif summary.result and (
-        summary.result.read_failures or summary.result.processing_failures or summary.captured_warnings
+        summary.result.read_failures
+        or summary.result.processing_failures
+        or summary.captured_warnings
+        or summary.pdf_failures
     ):
         icon = "⚠️"
     else:
@@ -792,6 +830,10 @@ def _render_process_summary(label: str, summary: _ProcessSummary, *, expanded: b
         if result.processing_failures:
             for failure in result.processing_failures:
                 st.warning(f"Couldn't process {failure.file}: {failure.error}")
+            st.caption(
+                f"Full details (including the exact step and traceback) for each failure above "
+                f"are in `{summary.output_dir / 'processing.log'}`."
+            )
         if result.cast_results:
             st.dataframe(
                 {
@@ -809,11 +851,59 @@ def _render_process_summary(label: str, summary: _ProcessSummary, *, expanded: b
                 for message in summary.captured_warnings:
                     st.caption(message)
 
+        if summary.pdf_written is not None:
+            st.write(
+                f"{summary.pdf_written} per-cast PDF report(s) + 1 station comparison PDF written -> "
+                f"`{summary.directory / 'pdf'}`"
+            )
+            for message in summary.pdf_failures:
+                st.warning(f"PDF report failed: {message}")
+
+
+@dataclass
+class _PdfOnlySummary:
+    """Outcome of :func:`~pycops.io.pdf_report.write_station_pdf_reports` run on its own, with no
+    reprocessing beforehand -- for the "Regenerate PDF reports only" action, when only the PDF
+    rendering code changed and the already-written ``.nc`` fits are still current."""
+
+    directory: Path
+    written: int
+    failures: list[str]
+
+
+def _render_pdf_only_summary(label: str, summary: _PdfOnlySummary, *, expanded: bool) -> None:
+    icon = "⚠️" if summary.failures else "✅"
+    with st.expander(f"{icon} {label}", expanded=expanded):
+        st.write(
+            f"{summary.written} per-cast PDF report(s) + 1 station comparison PDF written -> "
+            f"`{summary.directory / 'pdf'}`"
+        )
+        for message in summary.failures:
+            st.warning(message)
+
 
 def _render_process_tab() -> None:
     mode = st.radio(
         "Mode", ("Single deployment", "Batch (multiple deployments)"), key="process_mode"
     )
+    action = st.radio(
+        "Action",
+        ("Process casts", "Regenerate PDF reports only (skip processing)"),
+        key="process_action",
+        help=(
+            "\"Process casts\" reruns the full numeric pipeline (fitting, Rrs, etc.) and writes "
+            "fresh .nc files. \"Regenerate PDF reports only\" skips all of that and just rebuilds "
+            "the PDF reports from whatever .nc output is already on disk -- much faster when only "
+            "a PDF's own layout/content changed, not the underlying processing."
+        ),
+    )
+    generate_pdfs = True
+    if action == "Process casts":
+        generate_pdfs = st.checkbox(
+            "Also generate PDF reports (per-cast + station summary)",
+            value=True,
+            key="process_generate_pdfs",
+        )
 
     if mode == "Single deployment":
         directory_input = _directory_input(
@@ -834,10 +924,20 @@ def _render_process_tab() -> None:
             )
             return
 
-        if st.button("Process", key="process_single_run"):
-            with st.spinner(f"Processing {directory.name}..."):
-                summary = _process_one_deployment(directory)
-            _render_process_summary(directory.name, summary, expanded=True)
+        if action == "Process casts":
+            if st.button("Process", key="process_single_run"):
+                with st.spinner(f"Processing {directory.name}..."):
+                    summary = _process_one_deployment(directory, generate_pdfs=generate_pdfs)
+                _render_process_summary(directory.name, summary, expanded=True)
+        else:
+            if not (directory / "nc").is_dir():
+                st.error(f"No nc/ subfolder in {directory} -- process this station first.")
+            elif st.button("Regenerate PDF reports", key="process_single_pdf_only"):
+                with st.spinner(f"Regenerating PDF reports for {directory.name}..."):
+                    written, failures = write_station_pdf_reports(directory)
+                _render_pdf_only_summary(
+                    directory.name, _PdfOnlySummary(directory, written, failures), expanded=True
+                )
 
         st.divider()
         if st.button("Analyze this station's results ->", key="process_to_analyze"):
@@ -868,29 +968,51 @@ def _render_process_tab() -> None:
         if st.checkbox(str(rel), value=True, key=f"process_batch_{rel}"):
             checked.append(folder)
 
-    if st.button(f"Process checked deployments ({len(checked)})", key="process_batch_run"):
-        if not checked:
-            st.error("Select at least one deployment.")
-            return
-        progress = st.progress(0.0)
-        status = st.empty()
-        n_ok = n_warn = n_failed = 0
-        for i, folder in enumerate(checked):
-            rel = folder.relative_to(parent)
-            status.write(f"Processing {rel} ({i + 1}/{len(checked)})...")
-            summary = _process_one_deployment(folder)
-            _render_process_summary(str(rel), summary, expanded=False)
-            if summary.error is not None:
-                n_failed += 1
-            elif summary.result and (summary.result.read_failures or summary.result.processing_failures):
-                n_warn += 1
-            else:
-                n_ok += 1
-            progress.progress((i + 1) / len(checked))
-        status.write(
-            f"Done: {n_ok} ok, {n_warn} with warnings, {n_failed} failed "
-            f"(of {len(checked)} processed)."
-        )
+    if action == "Process casts":
+        if st.button(f"Process checked deployments ({len(checked)})", key="process_batch_run"):
+            if not checked:
+                st.error("Select at least one deployment.")
+                return
+            progress = st.progress(0.0)
+            status = st.empty()
+            n_ok = n_warn = n_failed = 0
+            for i, folder in enumerate(checked):
+                rel = folder.relative_to(parent)
+                status.write(f"Processing {rel} ({i + 1}/{len(checked)})...")
+                summary = _process_one_deployment(folder, generate_pdfs=generate_pdfs)
+                _render_process_summary(str(rel), summary, expanded=False)
+                if summary.error is not None:
+                    n_failed += 1
+                elif summary.result and (
+                    summary.result.read_failures or summary.result.processing_failures or summary.pdf_failures
+                ):
+                    n_warn += 1
+                else:
+                    n_ok += 1
+                progress.progress((i + 1) / len(checked))
+            status.write(
+                f"Done: {n_ok} ok, {n_warn} with warnings, {n_failed} failed "
+                f"(of {len(checked)} processed)."
+            )
+    else:
+        if st.button(f"Regenerate PDF reports for checked deployments ({len(checked)})", key="process_batch_pdf_only"):
+            if not checked:
+                st.error("Select at least one deployment.")
+                return
+            progress = st.progress(0.0)
+            status = st.empty()
+            n_ok = n_warn = 0
+            for i, folder in enumerate(checked):
+                rel = folder.relative_to(parent)
+                status.write(f"Regenerating PDF reports for {rel} ({i + 1}/{len(checked)})...")
+                written, failures = write_station_pdf_reports(folder)
+                _render_pdf_only_summary(str(rel), _PdfOnlySummary(folder, written, failures), expanded=False)
+                if failures:
+                    n_warn += 1
+                else:
+                    n_ok += 1
+                progress.progress((i + 1) / len(checked))
+            status.write(f"Done: {n_ok} ok, {n_warn} with warnings (of {len(checked)} processed).")
 
 
 def run_app() -> None:

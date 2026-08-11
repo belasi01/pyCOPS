@@ -444,6 +444,24 @@ def test_clean_tab_init_cops_dat_editor_prefills_and_saves(tmp_path):
     assert read_init_cops(tmp_path / "init.cops.dat")["windspeed_ms"] == 6.5
 
 
+def test_clean_tab_init_cops_dat_editor_ed0_correction_method_prefills_and_saves(tmp_path):
+    from pycops.io.config import read_init_cops
+
+    write_deployment(tmp_path)
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="clean_dir").set_value(str(tmp_path)).run(timeout=30)
+
+    # conftest's INIT_COPS_DAT fixture has no ed0.correction.method -- read_init_cops backfills "raw".
+    assert at.selectbox(key="clean_init_ed0_correction_method").value == "raw"
+    at.selectbox(key="clean_init_ed0_correction_method").set_value("smoothed").run(timeout=30)
+    at.button(key="clean_init_save").click().run(timeout=30)
+
+    assert not at.exception
+    assert read_init_cops(tmp_path / "init.cops.dat")["ed0.correction.method"] == "smoothed"
+
+
 def test_clean_tab_next_to_process_appears_only_once_all_casts_cleaned(tmp_path):
     """Fixture: select.cops.dat only covers casts 1/2, so cast 3 starts out not-yet-cleaned --
     the "Next -> Process casts" button shouldn't appear until it is."""
@@ -570,6 +588,35 @@ def test_directory_browsers_default_to_project_root_instead_of_home(tmp_path):
     assert len(matching) >= 2
 
 
+def test_scaffold_init_template_file_browser_filters_and_selects_init_cops_dat(tmp_path):
+    """Simon's request: picking 'Copy from an existing station' shouldn't require typing the full
+    path by hand -- a Browse popover filtered to init.cops.dat (the only file this field ever
+    wants) should let it be picked in a couple of clicks, same as every folder field already has."""
+    l1 = _write_l1_folder(tmp_path / "L1")
+    existing_station = tmp_path / "existing_station"
+    existing_station.mkdir()
+    (existing_station / "init.cops.dat").write_text("dummy init content\n")
+    (existing_station / "other_file.txt").write_text("not an init file\n")
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="project_root_dir").set_value(str(tmp_path)).run(timeout=30)
+    at.text_input(key="scaffold_l1").set_value(str(l1)).run(timeout=30)
+    at.radio(key="scaffold_init_mode").set_value("Copy from an existing station").run(timeout=30)
+
+    at.button(key="scaffold_init_template_sub_existing_station").click().run(timeout=30)
+    assert not at.exception
+    # Only init.cops.dat is offered as a pick target -- other_file.txt is filtered out.
+    file_buttons = [b for b in at.button if b.key and b.key.startswith("scaffold_init_template_file_")]
+    assert len(file_buttons) == 1
+    assert file_buttons[0].key == "scaffold_init_template_file_init.cops.dat"
+
+    at.button(key="scaffold_init_template_file_init.cops.dat").click().run(timeout=30)
+
+    assert not at.exception
+    assert at.text_input(key="scaffold_init_template").value == str(existing_station / "init.cops.dat")
+
+
 def test_process_tab_single_deployment_writes_nc_files(tmp_path, monkeypatch):
     _patch_successful_processing(monkeypatch)
     (tmp_path / "init.cops.dat").write_text("")
@@ -582,6 +629,110 @@ def test_process_tab_single_deployment_writes_nc_files(tmp_path, monkeypatch):
     assert not at.exception
     assert (tmp_path / "nc" / f"{Path(CAST_1).stem}.nc").exists()
     assert any("1 cast(s) processed" in m.value for m in at.markdown)
+
+
+def test_process_tab_single_deployment_generates_pdf_reports_by_default(tmp_path, monkeypatch):
+    """Simon's request: PDF reports should be regenerated automatically when reprocessing, not
+    require a separate manual step in tab 4 -- the checkbox defaults to checked."""
+    _patch_successful_processing(monkeypatch)
+    (tmp_path / "init.cops.dat").write_text("")
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    assert at.checkbox(key="process_generate_pdfs").value is True
+    at.text_input(key="process_dir").set_value(str(tmp_path)).run(timeout=30)
+    at.button(key="process_single_run").click().run(timeout=30)
+
+    assert not at.exception
+    assert (tmp_path / "pdf" / f"{Path(CAST_1).stem}.pdf").exists()
+    assert (tmp_path / "pdf" / f"{tmp_path.name}_station_summary.pdf").exists()
+    # the confirmation message explicitly names the station comparison PDF, not just a bare
+    # per-cast count -- Simon flagged that the earlier wording made it look like the comparison
+    # PDF hadn't been produced even though it had.
+    assert any("station comparison PDF" in m.value for m in at.markdown)
+
+
+def test_process_tab_single_deployment_pdf_checkbox_unchecked_skips_pdfs(tmp_path, monkeypatch):
+    _patch_successful_processing(monkeypatch)
+    (tmp_path / "init.cops.dat").write_text("")
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.checkbox(key="process_generate_pdfs").set_value(False).run(timeout=30)
+    at.text_input(key="process_dir").set_value(str(tmp_path)).run(timeout=30)
+    at.button(key="process_single_run").click().run(timeout=30)
+
+    assert not at.exception
+    assert (tmp_path / "nc" / f"{Path(CAST_1).stem}.nc").exists()
+    assert not (tmp_path / "pdf").exists()
+
+
+def test_process_tab_pdf_only_action_regenerates_without_reprocessing(tmp_path, monkeypatch):
+    """The "Regenerate PDF reports only" action must not call process_deployment at all -- Simon's
+    request, so a PDF-only rendering change doesn't require rerunning the whole numeric pipeline."""
+    _patch_successful_processing(monkeypatch)
+    (tmp_path / "init.cops.dat").write_text("")
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.checkbox(key="process_generate_pdfs").set_value(False).run(timeout=30)
+    at.text_input(key="process_dir").set_value(str(tmp_path)).run(timeout=30)
+    at.button(key="process_single_run").click().run(timeout=30)
+    assert (tmp_path / "nc" / f"{Path(CAST_1).stem}.nc").exists()
+    assert not (tmp_path / "pdf").exists()
+
+    def _fail_if_called(directory):
+        raise AssertionError("process_deployment should not be called in PDF-only mode")
+
+    monkeypatch.setattr(deployment_module, "process_deployment", _fail_if_called)
+
+    at.radio(key="process_action").set_value("Regenerate PDF reports only (skip processing)").run(timeout=30)
+    at.button(key="process_single_pdf_only").click().run(timeout=30)
+
+    assert not at.exception
+    assert (tmp_path / "pdf" / f"{Path(CAST_1).stem}.pdf").exists()
+    assert (tmp_path / "pdf" / f"{tmp_path.name}_station_summary.pdf").exists()
+    assert any("station comparison PDF" in m.value for m in at.markdown)
+
+
+def test_process_tab_pdf_only_action_requires_existing_nc(tmp_path):
+    (tmp_path / "init.cops.dat").write_text("")
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="process_dir").set_value(str(tmp_path)).run(timeout=30)
+    at.radio(key="process_action").set_value("Regenerate PDF reports only (skip processing)").run(timeout=30)
+
+    assert not at.exception
+    assert any("process this station first" in e.value for e in at.error)
+
+
+def test_process_tab_batch_pdf_only_action_regenerates_for_checked_stations(tmp_path, monkeypatch):
+    _patch_successful_processing(monkeypatch)
+    parent = tmp_path / "L2"
+    (parent / "StationA" / "cops").mkdir(parents=True)
+    (parent / "StationA" / "cops" / "init.cops.dat").write_text("")
+    (parent / "StationB" / "cops").mkdir(parents=True)
+    (parent / "StationB" / "cops" / "init.cops.dat").write_text("")
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.checkbox(key="process_generate_pdfs").set_value(False).run(timeout=30)
+    at.radio(key="process_mode").set_value("Batch (multiple deployments)").run(timeout=30)
+    at.text_input(key="process_parent").set_value(str(parent)).run(timeout=30)
+    at.button(key="process_batch_run").click().run(timeout=30)
+    assert (parent / "StationA" / "cops" / "nc" / f"{Path(CAST_1).stem}.nc").exists()
+
+    def _fail_if_called(directory):
+        raise AssertionError("process_deployment should not be called in PDF-only mode")
+
+    monkeypatch.setattr(deployment_module, "process_deployment", _fail_if_called)
+
+    at.radio(key="process_action").set_value("Regenerate PDF reports only (skip processing)").run(timeout=30)
+    at.button(key="process_batch_pdf_only").click().run(timeout=30)
+
+    assert not at.exception
+    assert (parent / "StationA" / "cops" / "pdf" / f"{Path(CAST_1).stem}.pdf").exists()
 
 
 def test_process_tab_analyze_button_jumps_to_analyze_tab_with_folder_prefilled(tmp_path, monkeypatch):
@@ -800,3 +951,119 @@ def test_database_tab_isolates_a_station_missing_nc_folder(tmp_path):
     df = pd.read_csv(parent / "TestMission.csv")
     assert list(df["station_id"]) == ["Good"]
     assert any("Skipped 1 station" in e.label for e in at.expander)
+
+
+def _write_fake_station_with_kd(directory, cast_specs, select_rows=None):
+    """Like ``_write_fake_station``, but also writes ``kd_1pct``/``kd_10pct``/``kd_pd`` so the
+    Kd comparison figure (tab 5's new "Compare stations" tool) has real data to plot, not just
+    Rrs."""
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "init.cops.dat").write_text("")
+    nc_dir = directory / "nc"
+    nc_dir.mkdir()
+    waves = np.array([443.0, 555.0])
+    for stem, (rrs, kd_pd) in cast_specs.items():
+        ds = xr.Dataset(
+            {
+                "rrs_0p_recommended": ("wavelength", np.asarray(rrs, dtype=float)),
+                "ed0_value_at_0": ("wavelength", np.asarray(rrs, dtype=float) * 100),
+                "kd_1pct": ("wavelength", np.asarray(kd_pd, dtype=float) * 2),
+                "kd_10pct": ("wavelength", np.asarray(kd_pd, dtype=float) * 1.5),
+                "kd_pd": ("wavelength", np.asarray(kd_pd, dtype=float)),
+            },
+            coords={"wavelength": waves, "time": pd.date_range("2019-08-17T12:00:00", periods=2, freq="s")},
+        )
+        ds.attrs["rrs_method"] = "Rrs.0p"
+        ds.attrs["sun_zenith_deg"] = 45.0
+        ds.attrs["longitude"] = -68.1
+        ds.attrs["latitude"] = 49.1
+        ds.attrs["chl_flag"] = float("nan")
+        ds.to_netcdf(nc_dir / f"{stem}.nc", engine="netcdf4")
+    if select_rows is not None:
+        (directory / "select.cops.dat").write_text(select_rows)
+
+
+def test_database_tab_default_tool_is_generate_database(tmp_path):
+    """Backward compatibility: the pre-existing "Generate database" flow must stay the default so
+    existing users/workflows aren't surprised by the new "Compare stations" addition."""
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+
+    assert at.radio(key="database_tool").value == "Generate database"
+
+
+def test_database_tab_compare_stations_shows_rrs_and_kd_figures(tmp_path):
+    parent = tmp_path / "L2"
+    _write_fake_station_with_kd(
+        parent / "20200101_StationA" / "cops", {"CAST_001": ([1.0, 2.0], [0.5, 0.6])}
+    )
+    _write_fake_station_with_kd(
+        parent / "20200101_StationB" / "cops", {"CAST_001": ([3.0, 4.0], [0.7, 0.8])}
+    )
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.radio(key="database_tool").set_value("Compare stations (Rrs & Kd)").run(timeout=30)
+    at.text_input(key="database_parent").set_value(str(parent)).run(timeout=30)
+    at.button(key="database_compare_run").click().run(timeout=30)
+
+    assert not at.exception
+    assert any("Rrs comparison" in s.value for s in at.subheader)
+    assert any("Kd at penetration depth" in s.value for s in at.subheader)
+    assert len(at.dataframe) >= 1
+
+
+def test_database_tab_compare_stations_kd_metric_selectbox_switches_metric(tmp_path):
+    parent = tmp_path / "L2"
+    _write_fake_station_with_kd(
+        parent / "20200101_StationA" / "cops", {"CAST_001": ([1.0, 2.0], [0.5, 0.6])}
+    )
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.radio(key="database_tool").set_value("Compare stations (Rrs & Kd)").run(timeout=30)
+    at.text_input(key="database_parent").set_value(str(parent)).run(timeout=30)
+    at.button(key="database_compare_run").click().run(timeout=30)
+    assert any("Kd at penetration depth" in s.value for s in at.subheader)
+
+    at.selectbox(key="database_compare_kd_metric").set_value("Kd at 1% light level").run(timeout=30)
+
+    assert not at.exception
+    assert any("Kd at 1% light level" in s.value for s in at.subheader)
+
+
+def test_database_tab_compare_stations_requires_at_least_one_checked(tmp_path):
+    parent = tmp_path / "L2"
+    _write_fake_station_with_kd(
+        parent / "20200101_StationA" / "cops", {"CAST_001": ([1.0, 2.0], [0.5, 0.6])}
+    )
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.radio(key="database_tool").set_value("Compare stations (Rrs & Kd)").run(timeout=30)
+    at.text_input(key="database_parent").set_value(str(parent)).run(timeout=30)
+    rel = Path("20200101_StationA") / "cops"
+    at.checkbox(key=f"database_station_{rel}").set_value(False).run(timeout=30)
+
+    assert not at.exception
+    assert any("Check at least one station" in i.value for i in at.info)
+
+
+def test_database_tab_compare_stations_isolates_a_bad_station(tmp_path):
+    parent = tmp_path / "L2"
+    _write_fake_station_with_kd(
+        parent / "20200101_StationGood" / "cops", {"CAST_001": ([1.0, 2.0], [0.5, 0.6])}
+    )
+    bad = parent / "20200101_StationBad" / "cops"
+    bad.mkdir(parents=True)
+    (bad / "init.cops.dat").write_text("")  # discovered, but no nc/ -> aggregate_station() raises
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.radio(key="database_tool").set_value("Compare stations (Rrs & Kd)").run(timeout=30)
+    at.text_input(key="database_parent").set_value(str(parent)).run(timeout=30)
+    at.button(key="database_compare_run").click().run(timeout=30)
+
+    assert not at.exception
+    assert any("Couldn't aggregate" in w.value for w in at.warning)
+    assert any("Rrs comparison" in s.value for s in at.subheader)  # the good station still renders

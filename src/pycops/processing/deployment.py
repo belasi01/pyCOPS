@@ -19,6 +19,7 @@ cast whose own GPS failed in the field, a real recurring situation.
 
 from __future__ import annotations
 
+import logging
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,10 +36,55 @@ from pycops.io.discovery import (
     read_deployment_casts,
     read_one_cast,
 )
+from pycops.io.ed0_correction import read_ed0_correction_methods
 from pycops.io.exclusions import read_wavelength_exclusions
 from pycops.processing.bioshade import BioShadeResult, process_bioshade
+from pycops.processing.log_utils import station_log_handler
 from pycops.processing.position import PositionOverride, find_gps_file, position_from_gps, read_gps_file
 from pycops.processing.process_cast import CastResult, process_cast
+
+logger = logging.getLogger(__name__)
+
+
+def _log_cast_summary(file: str, result: CastResult) -> None:
+    """One INFO line per major outcome of processing ``file`` -- see
+    :func:`pycops.processing.log_utils.station_log_handler`'s docstring for the intended detail
+    level (major steps, not every intermediate filter count)."""
+    if result.instrument_fits:
+        instruments = ", ".join(
+            f"{instr} ({int(fit.kept.sum())}/{len(fit.kept)} scans kept)"
+            for instr, fit in result.instrument_fits.items()
+        )
+        logger.info("%s: fitted instruments: %s", file, instruments)
+    else:
+        logger.info("%s: no depth-profiled instrument fit (none present in this cast)", file)
+
+    if result.shadow_correction_note:
+        logger.info("%s: shadow correction skipped -- %s", file, result.shadow_correction_note)
+    elif result.shadow_corrections:
+        logger.info("%s: shadow correction applied to %s", file, ", ".join(result.shadow_corrections))
+
+    logger.info(
+        "%s: Rrs source=%s, select.cops.dat method=%s, recommended Rrs available=%s",
+        file,
+        result.rrs_source or "none",
+        result.rrs_method or "none",
+        result.recommended_rrs is not None,
+    )
+
+    for label, qwip in (("loess", result.qwip_loess), ("linear", result.qwip_linear)):
+        if qwip is None:
+            logger.info("%s: QWIP (%s) not available", file, label)
+        else:
+            logger.info(
+                "%s: QWIP (%s) score=%.3f passed=%s water_class=%s",
+                file, label, qwip.score, qwip.passed, qwip.water_class,
+            )
+
+    if result.bottom_note:
+        logger.info("%s: bottom reflectance -- %s", file, result.bottom_note)
+    elif result.bottom_reflectance:
+        logger.info("%s: bottom reflectance computed for %s", file, ", ".join(result.bottom_reflectance))
 
 
 @dataclass(frozen=True)
@@ -80,6 +126,10 @@ def _load_wavelength_exclusions(directory: Path) -> dict[str, list[float]]:
     return read_wavelength_exclusions(directory / "rrs_wavelength_exclusions.cops.dat")
 
 
+def _load_ed0_correction_methods(directory: Path) -> dict[str, str]:
+    return read_ed0_correction_methods(directory / "ed0_correction_method.cops.dat")
+
+
 def _load_gps_table(directory: Path) -> pd.DataFrame | None:
     gps_path = find_gps_file(directory)
     if gps_path is None:
@@ -118,6 +168,7 @@ def _process_kept_cast(
     bioshade_used: BioShadeResult | None,
     position_overrides: dict[str, PositionOverride] | None,
     excluded_wavelengths: list[float] | None = None,
+    ed0_correction_method: str | None = None,
 ) -> CastResult:
     """The per-cast body shared by :func:`process_deployment`'s loop and
     :func:`reprocess_single_cast`, so both always process one cast exactly the same way."""
@@ -138,6 +189,7 @@ def _process_kept_cast(
         bioshade=bioshade_used,
         position_override=position_override,
         excluded_wavelengths=excluded_wavelengths,
+        ed0_correction_method=ed0_correction_method,
     )
 
 
@@ -190,28 +242,37 @@ def reprocess_single_cast(
     coordinate, ``chl_flag``/``qc_flag``/``shallow``/position attrs), not a bare ``read_cast()``.
     """
     directory = Path(directory)
-    deployment = discover_deployment(directory)
-    record = next((r for r in deployment.casts if r.info.file == file), None)
-    if record is None:
-        raise ValueError(f"{file!r} not found in {directory}'s info.cops.dat")
+    with station_log_handler(directory / "nc", mode="a"):
+        logger.info("Reprocessing cast %s", file)
+        deployment = discover_deployment(directory)
+        record = next((r for r in deployment.casts if r.info.file == file), None)
+        if record is None:
+            raise ValueError(f"{file!r} not found in {directory}'s info.cops.dat")
 
-    absorption_table = _load_absorption_table(directory)
-    gps_table = _load_gps_table(directory)
-    bioshade_used = _find_bioshade_result(directory, deployment)
-    excluded_wavelengths = _load_wavelength_exclusions(directory).get(file)
+        absorption_table = _load_absorption_table(directory)
+        gps_table = _load_gps_table(directory)
+        bioshade_used = _find_bioshade_result(directory, deployment)
+        excluded_wavelengths = _load_wavelength_exclusions(directory).get(file)
+        ed0_correction_method = _load_ed0_correction_methods(directory).get(file)
 
-    ds = read_one_cast(record, deployment.init)
-    result = _process_kept_cast(
-        ds,
-        deployment.init,
-        file,
-        record.info.chl_flag,
-        absorption_table,
-        gps_table,
-        bioshade_used,
-        position_overrides,
-        excluded_wavelengths,
-    )
+        ds = read_one_cast(record, deployment.init)
+        try:
+            result = _process_kept_cast(
+                ds,
+                deployment.init,
+                file,
+                record.info.chl_flag,
+                absorption_table,
+                gps_table,
+                bioshade_used,
+                position_overrides,
+                excluded_wavelengths,
+                ed0_correction_method,
+            )
+        except Exception:
+            logger.exception("%s: reprocessing failed", file)
+            raise
+        _log_cast_summary(file, result)
     return ReprocessedCast(result=result, ds=ds)
 
 
@@ -235,7 +296,10 @@ def process_deployment(
     ``CastResult.shadow_correction_note``) rather than this function raising.
     A cast with a row in ``rrs_wavelength_exclusions.cops.dat`` (see
     :mod:`pycops.io.exclusions`) gets those wavelengths NaN'd out of its final
-    Rrs -- a pycops-only, post-fit QC override with no R equivalent.
+    Rrs -- a pycops-only, post-fit QC override with no R equivalent. Likewise, a
+    cast with a row in ``ed0_correction_method.cops.dat`` (see
+    :mod:`pycops.io.ed0_correction`) overrides ``init.cops.dat``'s station-wide
+    ``ed0.correction.method`` default for that one cast.
 
     A cast that fails to read is recorded in ``read_failures`` (see
     :func:`~pycops.io.discovery.read_deployment_casts`); one that reads but
@@ -255,52 +319,82 @@ def process_deployment(
     its GPS fix, is known to be wrong).
     """
     directory = Path(directory)
-    deployment: Deployment = discover_deployment(directory)
-    read_result = read_deployment_casts(deployment)
-    absorption_table = _load_absorption_table(directory)
-    gps_table = _load_gps_table(directory)
-    wavelength_exclusions = _load_wavelength_exclusions(directory)
-    chl_flag_by_file = {record.info.file: record.info.chl_flag for record in deployment.kept_casts()}
+    with station_log_handler(directory / "nc", mode="w"):
+        logger.info("Processing deployment %s", directory)
+        deployment: Deployment = discover_deployment(directory)
+        read_result = read_deployment_casts(deployment)
+        absorption_table = _load_absorption_table(directory)
+        gps_table = _load_gps_table(directory)
+        wavelength_exclusions = _load_wavelength_exclusions(directory)
+        ed0_correction_methods = _load_ed0_correction_methods(directory)
+        chl_flag_by_file = {record.info.file: record.info.chl_flag for record in deployment.kept_casts()}
 
-    bioshade_files = [
-        record.info.file for record in deployment.kept_casts() if record.selection.flag == FLAG_BIOSHADE
-    ]
+        bioshade_files = [
+            record.info.file for record in deployment.kept_casts() if record.selection.flag == FLAG_BIOSHADE
+        ]
+        logger.info(
+            "Discovered %d kept cast(s) (%d BioShade), %d read failure(s)",
+            len(read_result.datasets),
+            len(bioshade_files),
+            len(read_result.failures),
+        )
+        for failure in read_result.failures:
+            logger.warning("%s: failed to read (%s)", failure.file, failure.error)
 
-    processing_failures: list[CastProcessingFailure] = []
-    bioshade_results: dict[str, BioShadeResult] = {}
-    for file in bioshade_files:
-        ds = read_result.datasets.get(file)
-        if ds is None:
-            continue  # already recorded in read_result.failures
-        try:
-            bioshade_results[file] = process_bioshade(ds, deployment.init)
-        except Exception as exc:  # noqa: BLE001 -- isolate one bad BioShade cast from the rest
-            error = f"{type(exc).__name__}: {exc}"
-            warnings.warn(f"{directory.name}: failed to process BioShade cast {file!r} ({error})", stacklevel=2)
-            processing_failures.append(CastProcessingFailure(file=file, error=error))
+        processing_failures: list[CastProcessingFailure] = []
+        bioshade_results: dict[str, BioShadeResult] = {}
+        for file in bioshade_files:
+            ds = read_result.datasets.get(file)
+            if ds is None:
+                continue  # already recorded in read_result.failures
+            logger.info("Processing BioShade cast %s", file)
+            try:
+                bioshade_results[file] = process_bioshade(ds, deployment.init)
+            except Exception as exc:  # noqa: BLE001 -- isolate one bad BioShade cast from the rest
+                error = f"{type(exc).__name__}: {exc}"
+                logger.exception("%s: BioShade processing failed", file)
+                warnings.warn(f"{directory.name}: failed to process BioShade cast {file!r} ({error})", stacklevel=2)
+                processing_failures.append(CastProcessingFailure(file=file, error=error))
 
-    bioshade_used = next(iter(bioshade_results.values()), None)
+        bioshade_used = next(iter(bioshade_results.values()), None)
+        logger.info(
+            "BioShade cast used for shadow correction: %s",
+            next((f for f, r in bioshade_results.items() if r is bioshade_used), "none"),
+        )
 
-    cast_results: dict[str, CastResult] = {}
-    for file, ds in read_result.datasets.items():
-        if file in bioshade_files:
-            continue
-        try:
-            cast_results[file] = _process_kept_cast(
-                ds,
-                deployment.init,
-                file,
-                chl_flag_by_file.get(file),
-                absorption_table,
-                gps_table,
-                bioshade_used,
-                position_overrides,
-                wavelength_exclusions.get(file),
-            )
-        except Exception as exc:  # noqa: BLE001 -- isolate one bad cast from the rest
-            error = f"{type(exc).__name__}: {exc}"
-            warnings.warn(f"{directory.name}: failed to process cast {file!r} ({error})", stacklevel=2)
-            processing_failures.append(CastProcessingFailure(file=file, error=error))
+        cast_results: dict[str, CastResult] = {}
+        for file, ds in read_result.datasets.items():
+            if file in bioshade_files:
+                continue
+            logger.info("Processing cast %s", file)
+            try:
+                result = _process_kept_cast(
+                    ds,
+                    deployment.init,
+                    file,
+                    chl_flag_by_file.get(file),
+                    absorption_table,
+                    gps_table,
+                    bioshade_used,
+                    position_overrides,
+                    wavelength_exclusions.get(file),
+                    ed0_correction_methods.get(file),
+                )
+            except Exception as exc:  # noqa: BLE001 -- isolate one bad cast from the rest
+                error = f"{type(exc).__name__}: {exc}"
+                logger.exception("%s: processing failed", file)
+                warnings.warn(f"{directory.name}: failed to process cast {file!r} ({error})", stacklevel=2)
+                processing_failures.append(CastProcessingFailure(file=file, error=error))
+            else:
+                cast_results[file] = result
+                _log_cast_summary(file, result)
+
+        logger.info(
+            "Deployment done: %d cast(s) processed, %d processing failure(s), %d read failure(s)",
+            len(cast_results),
+            len(processing_failures),
+            len(read_result.failures),
+        )
 
     return DeploymentProcessingResult(
         cast_results=cast_results,

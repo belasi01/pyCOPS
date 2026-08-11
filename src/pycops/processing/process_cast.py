@@ -98,6 +98,8 @@ class CastResult:
     ed0_0m: np.ndarray | None  # Ed0(0-), diffuse/direct-decomposed -- diagnostic only, Rrs doesn't need it
     r0m_loess: np.ndarray | None  # EuZ.0m(LOESS) / Ed0.0m -- subsurface irradiance reflectance
     r0m_linear: np.ndarray | None  # EuZ.0m(linear) / Ed0.0m
+    q_factor_loess: np.ndarray | None  # empirical Q-factor, EuZ.0m(LOESS) / LuZ.0m(LOESS) -- only when both present
+    q_factor_linear: np.ndarray | None  # empirical Q-factor, EuZ.0m(linear) / LuZ.0m(linear)
     kd_1pct: np.ndarray | None  # mean Kd from surface to the 1% light level, EdZ only
     kd_10pct: np.ndarray | None  # mean Kd from surface to the 10% light level
     kd_pd: np.ndarray | None  # mean Kd from surface to the penetration depth (1/e light level)
@@ -115,6 +117,7 @@ class CastResult:
     resolved_latitude: float | None  # (may differ from ds.attrs -- e.g. a position_override or GPS file)
     resolved_sun_zenith_deg: float | None  # sun zenith angle (degrees) at the cast's mean time/position
     excluded_wavelengths: tuple[float, ...] = ()  # final-Rrs bands manually NaN'd out (see io.exclusions)
+    ed0_correction_method: str = "raw"  # "raw" (matches R) or "smoothed" (pycops-only) -- see ed0.py
 
 
 def _mask_rrs_wavelengths(rrs: RrsResult, mask: np.ndarray) -> RrsResult:
@@ -165,6 +168,43 @@ def _resolve_sun_geometry(
         return lon, lat, julian_day, sun_zenith_deg, "sun below the horizon for this cast"
 
     return lon, lat, julian_day, sun_zenith_deg, None
+
+
+def _empirical_q_factor(
+    instrument_fits: dict[str, InstrumentFit],
+    shadow_corrections: dict[str, ShadowCorrectionResult],
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Empirical Q-factor (``EuZ.0m / LuZ.0m``), one value per wavelength -- a real *measured*
+    ratio, only computable when a cast carries both EuZ and LuZ sensors (most casts have only one,
+    which is exactly why :func:`pycops.processing.qfactor.compute_q_factor`'s theoretical
+    ``Q.sun.nadir`` constant exists, to fill in for the other one). Simon: this measured ratio is
+    "rarement rapporte dans la litterature" -- a diagnostic pycops can now surface simply because
+    both fits are already computed, not something the R package itself reports.
+
+    Both the LOESS (``value_at_0``) and linear (``surface_linear.value_at_surface``)
+    surface-extrapolated values are shadow-corrected first when a correction is available, matching
+    the same "divide by shadow.correction" convention already used to derive ``LuZ.0m``/``EuZ.0m``
+    for Rrs itself (see ``process_cast()``'s own ``rrs_loess``/``rrs_linear`` block).
+    """
+    if "LuZ" not in instrument_fits or "EuZ" not in instrument_fits:
+        return None, None
+    luz_fit = instrument_fits["LuZ"]
+    euz_fit = instrument_fits["EuZ"]
+    luz_shadow = shadow_corrections.get("LuZ")
+    euz_shadow = shadow_corrections.get("EuZ")
+
+    luz_0m_loess = luz_fit.value_at_0
+    euz_0m_loess = euz_fit.value_at_0
+    luz_0m_linear = luz_fit.surface_linear.value_at_surface
+    euz_0m_linear = euz_fit.surface_linear.value_at_surface
+    if luz_shadow is not None:
+        luz_0m_loess = luz_0m_loess / luz_shadow.correction
+        luz_0m_linear = luz_0m_linear / luz_shadow.correction
+    if euz_shadow is not None:
+        euz_0m_loess = euz_0m_loess / euz_shadow.correction
+        euz_0m_linear = euz_0m_linear / euz_shadow.correction
+
+    return euz_0m_loess / luz_0m_loess, euz_0m_linear / luz_0m_linear
 
 
 def _shadow_correct_instruments(
@@ -234,6 +274,7 @@ def process_cast(
     bioshade: BioShadeResult | None = None,
     position_override: PositionOverride | None = None,
     excluded_wavelengths: Sequence[float] | None = None,
+    ed0_correction_method: str | None = None,
 ) -> CastResult:
     """Fit Ed0 plus every depth-profiled instrument present in ``ds``, shadow-correct, and Rrs/Lw.
 
@@ -315,6 +356,19 @@ def process_cast(
     ends up picking, matching within ``waves`` to 1e-6 nm. Recorded verbatim
     on ``CastResult.excluded_wavelengths`` for display/export.
 
+    ``ed0_correction_method``, if given, overrides ``init["ed0.correction.method"]``
+    (``init.cops.dat``'s station-wide default, itself defaulting to ``"raw"`` for
+    older files that predate this field -- see :func:`pycops.io.config.read_init_cops`)
+    for this one cast -- the per-cast sidecar override (see
+    :mod:`pycops.io.ed0_correction`), resolved by the caller the same way
+    ``excluded_wavelengths`` already is, not read from ``ds.attrs``. Picks
+    between the R-matching ``"raw"`` Ed0 illumination correction (divides by
+    each raw scan) and the pycops-only ``"smoothed"`` alternative (divides by
+    the LOESS-smoothed Ed0 at each scan's own time instead -- see
+    :func:`pycops.processing.ed0.fit_ed0`), for a researcher who finds the raw
+    correction injects too much of Ed0's own sensor noise into EdZ/LuZ/EuZ.
+    The resolved value is recorded on ``CastResult.ed0_correction_method``.
+
     Each available ``RrsResult`` also gets its normalized water-leaving
     radiance (``nlw_0p``, from ``init.cops.dat``'s ``bandwidth``) and, on
     ``CastResult``, its Forel-Ule/QWIP quality-control diagnostics
@@ -368,7 +422,8 @@ def process_cast(
     time_window = ds.attrs.get("time_window") or (
         tuple(init["time.window"]) if "time.window" in init else None
     )
-    ed0_fit = fit_ed0_for_cast(ds, init, time_window=time_window)
+    resolved_ed0_correction_method = ed0_correction_method or init.get("ed0.correction.method", "raw")
+    ed0_fit = fit_ed0_for_cast(ds, init, time_window=time_window, method=resolved_ed0_correction_method)
 
     instrument_fits = {
         instr: fit_cast(ds, init, instr, ed0_fit, time_window=time_window)
@@ -393,6 +448,8 @@ def process_cast(
         sun_zenith_deg,
         geometry_note,
     )
+
+    q_factor_loess, q_factor_linear = _empirical_q_factor(instrument_fits, shadow_corrections)
 
     rrs_loess = rrs_linear = rrs_source = None
     if "LuZ" in instrument_fits:
@@ -559,6 +616,8 @@ def process_cast(
         ed0_0m=ed0_0m,
         r0m_loess=r0m_loess,
         r0m_linear=r0m_linear,
+        q_factor_loess=q_factor_loess,
+        q_factor_linear=q_factor_linear,
         kd_1pct=kd_1pct,
         kd_10pct=kd_10pct,
         kd_pd=kd_pd,
@@ -576,4 +635,5 @@ def process_cast(
         resolved_latitude=lat,
         resolved_sun_zenith_deg=sun_zenith_deg,
         excluded_wavelengths=tuple(excluded_wavelengths) if excluded_wavelengths else (),
+        ed0_correction_method=resolved_ed0_correction_method,
     )

@@ -38,3 +38,17 @@ def test_compute_qwip_ignores_nan_wavelengths():
     result = compute_qwip(WAVES, rrs_with_nan)
     assert np.isfinite(result.avw)
     assert np.isfinite(result.score)
+
+
+def test_compute_qwip_returns_none_with_fewer_than_two_finite_wavelengths():
+    """Regression test: a cast whose linear fit only has one usable wavelength (e.g. every other
+    band failed the R2/KS gate) used to crash CubicSpline construction instead of gracefully
+    skipping QWIP for that cast -- found on a real CASCADE cast (Amundsen 2026, station CS1-9,
+    CAST_002) whose linear Rrs had exactly one finite value, at 875 nm."""
+    rrs_one_finite = np.full_like(RRS1, np.nan)
+    rrs_one_finite[-1] = RRS1[-1]
+
+    assert compute_qwip(WAVES, rrs_one_finite) is None
+
+    rrs_zero_finite = np.full_like(RRS1, np.nan)
+    assert compute_qwip(WAVES, rrs_zero_finite) is None

@@ -24,7 +24,9 @@ written as global attrs, along with
 the QWIP/Forel-Ule scalar diagnostics (``qwip_loess_*``/``qwip_linear_*``)
 when available; nLw (``nlw_0p_loess``/``nlw_0p_linear``/``nlw_0p_recommended``),
 ``ed0_0m``/``r0m_loess``/``r0m_linear`` (see
-:mod:`pycops.processing.ed0_0m`), ``kd_1pct``/``kd_10pct``/``kd_pd`` (see
+:mod:`pycops.processing.ed0_0m`), ``q_factor_loess``/``q_factor_linear`` (empirical Q-factor,
+``EuZ.0m / LuZ.0m``, only when a cast has both instruments -- see
+:func:`pycops.processing.process_cast._empirical_q_factor`), ``kd_1pct``/``kd_10pct``/``kd_pd`` (see
 :mod:`pycops.processing.attenuation`), ``par_d_profile``/``par_u_profile``/``kz_par``/``k0_par``
 (``EdZ_depth``-dimensioned; ``kz_par``/``k0_par`` leading-NaN-padded like ``KZ``/``K0``) plus the
 scalar attrs ``par_0``/``kd_par_1pct``/``kd_par_10pct``/``kd_par_pd`` (see
@@ -88,6 +90,8 @@ def cast_result_to_dataset(cast_result: CastResult, ds: xr.Dataset | None = None
 
     data_vars["ed0_value_at_0"] = ("wavelength", cast_result.ed0_fit.value_at_0)
     data_vars["ed0_correction"] = ((time_dim, "wavelength"), cast_result.ed0_fit.correction)
+    data_vars["ed0_correction_raw"] = ((time_dim, "wavelength"), cast_result.ed0_fit.correction_raw)
+    data_vars["ed0_correction_smoothed"] = ((time_dim, "wavelength"), cast_result.ed0_fit.correction_smoothed)
 
     for instrument, fit in cast_result.instrument_fits.items():
         depth_dim = f"{instrument}_depth"
@@ -143,6 +147,10 @@ def cast_result_to_dataset(cast_result: CastResult, ds: xr.Dataset | None = None
         data_vars["r0m_loess"] = ("wavelength", cast_result.r0m_loess)
     if cast_result.r0m_linear is not None:
         data_vars["r0m_linear"] = ("wavelength", cast_result.r0m_linear)
+    if cast_result.q_factor_loess is not None:
+        data_vars["q_factor_loess"] = ("wavelength", cast_result.q_factor_loess)
+    if cast_result.q_factor_linear is not None:
+        data_vars["q_factor_linear"] = ("wavelength", cast_result.q_factor_linear)
 
     if cast_result.kd_1pct is not None:
         data_vars["kd_1pct"] = ("wavelength", cast_result.kd_1pct)
@@ -188,6 +196,7 @@ def cast_result_to_dataset(cast_result: CastResult, ds: xr.Dataset | None = None
     attrs["shadow_correction_note"] = cast_result.shadow_correction_note or ""
     attrs["bottom_note"] = cast_result.bottom_note or ""
     attrs["excluded_wavelengths"] = ",".join(f"{w:.10g}" for w in cast_result.excluded_wavelengths)
+    attrs["ed0_correction_method"] = cast_result.ed0_correction_method
 
     if ds is not None:
         for key, missing in (("chl_flag", float("nan")), ("qc_flag", -1)):

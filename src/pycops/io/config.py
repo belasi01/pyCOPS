@@ -60,6 +60,7 @@ _PER_INSTRUMENT_DEFAULTS = {
 _SCALAR_DEFAULTS = {
     "bandwidth": 10.0,
     "windspeed_ms": 4.0,
+    "ed0.correction.method": "raw",
 }
 
 # init.cops.dat parameters that are effectively constant across every real deployment cached in
@@ -78,6 +79,7 @@ _INIT_COPS_DAT_CONSTANTS: dict[str, object] = {
         50.0, 1.0, 100.0, 2.0, 200.0, 5.0, 500.0,
     ],
     "bandwidth": _SCALAR_DEFAULTS["bandwidth"],
+    "ed0.correction.method": _SCALAR_DEFAULTS["ed0.correction.method"],
 }
 
 def _to_float(value: str) -> float:
@@ -204,6 +206,11 @@ INIT_COPS_DAT_HELP: dict[str, str] = {
     "linear.fit.max.delta.depth.optics": "Maximum depth extent (m) of the linear surface fit window "
     "(NA for Ed0).",
     "bandwidth": "Bandwidth (nm) used when computing extraterrestrial irradiance.",
+    "ed0.correction.method": "How the Ed0 illumination correction is computed: 'raw' divides by "
+    "each raw scan (matches the R package exactly, but inherits Ed0's own scan-to-scan sensor "
+    "noise); 'smoothed' divides by the LOESS-smoothed Ed0 value at each scan's own time instead "
+    "(pycops-only, no R equivalent -- reduces noise in EdZ/LuZ/EuZ profiles at the cost of no "
+    "longer tracking every raw fluctuation).",
 }
 
 # Verbatim header comment block from a real init.cops.dat (local_data/AlgaeWISE/
@@ -259,6 +266,11 @@ _INIT_COPS_DAT_LAYOUT = [
     ("depth.discretization", "numeric", "for smoothing purpose"),
     ("bandwidth", "numeric", "bandwidth : the size of the window (nanometers) around each wavelength"),
     ("windspeed_ms", "numeric", "Environmental conditions"),
+    (
+        "ed0.correction.method",
+        "character",
+        "Ed0 illumination correction: 'raw' (matches the R package) or 'smoothed' (pycops-only)",
+    ),
 ]
 
 

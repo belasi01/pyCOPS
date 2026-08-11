@@ -193,6 +193,29 @@ def test_cast_result_to_dataset_no_excluded_wavelengths_is_empty_string():
     assert out.attrs["excluded_wavelengths"] == ""
 
 
+def test_cast_result_to_dataset_writes_ed0_correction_raw_and_smoothed_and_method():
+    ds = _make_dataset()
+    result = process_cast(ds, _make_init(), ed0_correction_method="smoothed")
+
+    out = cast_result_to_dataset(result, ds=ds)
+
+    assert out.attrs["ed0_correction_method"] == "smoothed"
+    np.testing.assert_allclose(out["ed0_correction_raw"].values, result.ed0_fit.correction_raw)
+    np.testing.assert_allclose(out["ed0_correction_smoothed"].values, result.ed0_fit.correction_smoothed)
+    # "ed0_correction" always means the *active* one, unchanged meaning from before this feature.
+    np.testing.assert_allclose(out["ed0_correction"].values, result.ed0_fit.correction_smoothed)
+
+
+def test_cast_result_to_dataset_ed0_correction_defaults_to_raw_method():
+    ds = _make_dataset()
+    result = process_cast(ds, _make_init())
+
+    out = cast_result_to_dataset(result, ds=ds)
+
+    assert out.attrs["ed0_correction_method"] == "raw"
+    np.testing.assert_allclose(out["ed0_correction"].values, out["ed0_correction_raw"].values)
+
+
 def test_cast_result_to_dataset_no_luz_still_builds(tmp_path):
     ds = _make_dataset(include_edz=True)
     ds = ds.drop_vars("LuZ")
@@ -307,6 +330,28 @@ def test_cast_result_to_dataset_omits_ed0_0m_without_euz():
     assert result.ed0_0m is None
     assert "ed0_0m" not in out.data_vars
     assert "r0m_loess" not in out.data_vars
+
+
+def test_cast_result_to_dataset_writes_q_factor_when_luz_and_euz_present():
+    ds = _make_dataset(include_euz=True)  # LuZ (default) + EuZ -- both present
+    result = process_cast(ds, _make_init())
+
+    out = cast_result_to_dataset(result, ds=ds)
+
+    assert result.q_factor_loess is not None
+    assert "q_factor_loess" in out.data_vars
+    assert "q_factor_linear" in out.data_vars
+    np.testing.assert_allclose(out["q_factor_loess"].values, result.q_factor_loess, equal_nan=True)
+    np.testing.assert_allclose(out["q_factor_linear"].values, result.q_factor_linear, equal_nan=True)
+
+
+def test_cast_result_to_dataset_omits_q_factor_without_euz():
+    ds, result = _cast_result_with_shadow()  # LuZ only, no EuZ
+    out = cast_result_to_dataset(result, ds=ds)
+
+    assert result.q_factor_loess is None
+    assert "q_factor_loess" not in out.data_vars
+    assert "q_factor_linear" not in out.data_vars
 
 
 def test_cast_result_to_dataset_writes_bottom_reflectance_when_shallow():

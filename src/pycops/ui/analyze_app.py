@@ -1,11 +1,19 @@
 """Interactive results-analysis tab (section 4).
 
-Replaces Simon's R workflow's per-cast, multi-page PDF diagnostic report (``process.cops.R``'s
-``pdf(...)``/``dev.off()`` block driving ``process.LuZ.R``/``process.EdZ.R``/``process.EuZ.R``/
-``compute.aops.R``'s ``plot()``/``matplot()`` calls) with an interactive equivalent, browsing the
-results tab 3 already wrote to ``.nc`` files (:func:`pycops.io.netcdf.write_deployment_result`)
-one cast at a time. This is a read-only viewer over already-computed data -- no new processing
-happens here.
+Originally built to replace Simon's R workflow's per-cast, multi-page PDF diagnostic report
+(``process.cops.R``'s ``pdf(...)``/``dev.off()`` block driving ``process.LuZ.R``/
+``process.EdZ.R``/``process.EuZ.R``/``compute.aops.R``'s ``plot()``/``matplot()`` calls) with an
+interactive equivalent, browsing the results tab 3 already wrote to ``.nc`` files
+(:func:`pycops.io.netcdf.write_deployment_result`) one cast at a time. This is a read-only viewer
+over already-computed data -- no new processing happens here (except reprocessing one cast on
+demand, see ``_render_qc_actions``).
+
+Every figure here is built by :mod:`pycops.io.pdf_report` (no Streamlit dependency there) and
+just displayed with :func:`_show`; this module also now offers a static PDF export of the same
+diagnostics (per cast, and a whole-station batch/summary) via that module's
+``write_cast_pdf_report``/``write_station_summary_pdf`` -- a portable artifact for records/
+collaborators who don't run the app, matching R's own per-cast PDF convention more directly than
+this interactive tab alone did.
 
 Depth-profile/attenuation plots also reopen the original raw cast file (still sitting next to
 ``nc/`` in the same deployment folder, per tabs 2/3's convention) to overlay raw per-scan points
@@ -25,15 +33,40 @@ import xarray as xr
 
 from pycops.io.config import CastInfo, read_init_cops, update_cast_info
 from pycops.io.discovery import FLAG_NORMAL, FLAG_REJECTED, kept_nc_files, update_cast_selection
+from pycops.io.ed0_correction import read_ed0_correction_methods, update_ed0_correction_method
 from pycops.io.exclusions import read_wavelength_exclusions, update_wavelength_exclusions
 from pycops.io.netcdf import write_cast_result
+from pycops.io.pdf_report import (
+    _KD_PAR_MIN_DEPTH_M,
+    _effective_time_window,
+    _instruments_present,
+    _kept_mask,
+    _raw_scan_values,
+    build_attenuation_figure,
+    build_bottom_figure,
+    build_depth_profile_figure,
+    build_depth_vs_time_figure,
+    build_ed0_stability_figure,
+    build_par_kd_par_figures,
+    build_qfactor_figure,
+    build_qwip_figure,
+    build_rrs_figure,
+    build_shadow_correction_figure,
+    build_spectral_kd_figure,
+    build_station_kd_penetration_depth_figure,
+    build_station_par_depth_table,
+    build_station_par_profile_figure,
+    build_station_comparison_figures,
+    build_station_qfactor_figure,
+    build_tilt_figure,
+    find_raw_cast_for_stem,
+    write_cast_pdf_report,
+    write_station_pdf_reports,
+    write_station_summary_pdf,
+)
 from pycops.io.raw import read_cast
-from pycops.io.scaffold import discover_l1_casts
 from pycops.processing.deployment import reprocess_single_cast
-from pycops.processing.depth import time_window_mask
 from pycops.processing.par import percent_par_at_depth
-from pycops.processing.qwip import _qwip_polynomial
-from pycops.processing.tilt import add_tilt
 from pycops.ui._common import (
     OVERRIDE_FIELDS,
     _directory_input,
@@ -45,38 +78,15 @@ from pycops.ui._common import (
     render_time_window_editor,
 )
 
-_DEPTH_INSTRUMENTS = ("EdZ", "LuZ", "EuZ")
 _SHADOW_INSTRUMENTS = ("LuZ", "EuZ")
-_VISIBLE_MAX_NM = 700.0  # visible-band cutoff, matching QWIP's own 400-700 nm convention
-_RB_NEGLIGIBLE_EDZ_FRACTION = 0.01  # Simon's own starting suggestion ("e.g. inferieur a 1%?")
 # Matches discovery.py's own _DEFAULT_METHOD (private there, so not imported directly) --
 # clean_app.py already duplicates this same constant for the same reason.
 _DEFAULT_METHOD = "Rrs.0p.linear"
 _METHOD_OPTIONS = ("Rrs.0p", "Rrs.0p.linear")
 _METHOD_LABELS = {"Rrs.0p": "LOESS", "Rrs.0p.linear": "Linear"}
-
-
-def _instruments_present(nc: xr.Dataset) -> tuple[str, ...]:
-    return tuple(instr for instr in _DEPTH_INSTRUMENTS if f"{instr}_fitted" in nc.data_vars)
-
-
-def _find_raw_cast(directory: Path, nc_stem: str) -> Path | None:
-    for path in discover_l1_casts(directory):
-        if path.stem == nc_stem:
-            return path
-    return None
-
-
-def _wavelength_dim(ds: xr.Dataset, instrument: str) -> str:
-    return "wavelength" if "wavelength" in ds[instrument].dims else f"wavelength_{instrument}"
-
-
-def _wavelength_colors(waves: np.ndarray) -> np.ndarray:
-    return plt.cm.viridis(np.linspace(0, 1, len(waves)))
-
-
-def _new_fig(figsize: tuple[float, float] = (9, 4.5)):
-    return plt.subplots(figsize=figsize)
+_DEFAULT_ED0_CORRECTION_METHOD = "raw"
+_ED0_CORRECTION_METHOD_OPTIONS = ("raw", "smoothed")
+_ED0_CORRECTION_METHOD_LABELS = {"raw": "Raw (matches R)", "smoothed": "Smoothed (pycops-only)"}
 
 
 def _show(fig) -> None:
@@ -112,68 +122,31 @@ def _render_overview(nc: xr.Dataset) -> None:
         )
 
 
-def _render_ed0_stability(nc: xr.Dataset) -> None:
+def _render_ed0_stability(nc: xr.Dataset, time_window: tuple[float, float] | None = None) -> None:
     if "ed0_correction" not in nc.data_vars:
         return
     st.subheader("Ed0 stability")
+    active_method = nc.attrs.get("ed0_correction_method") or _DEFAULT_ED0_CORRECTION_METHOD
     st.caption(
-        "Ratio of the smoothed surface reference to each raw scan -- flags illumination changes "
-        "(e.g. clouds) during the cast. Red lines mark the +/-5% acceptable range."
+        "Ratio of the smoothed surface reference to each scan -- flags illumination changes (e.g. "
+        "clouds) during the cast. **Raw** (matches the R package) divides by each raw scan; "
+        "**smoothed** (pycops-only) divides by the LOESS-smoothed Ed0 at that scan's own time "
+        f"instead, for less noise. Currently active for this cast: **"
+        f"{_ED0_CORRECTION_METHOD_LABELS.get(active_method, active_method)}** (see 'Adjust & "
+        "reprocess' below to change it). Red lines mark the +/-5% acceptable range. Gray shading "
+        "(if any) marks time excluded by this cast's time.window."
     )
-    correction = nc["ed0_correction"].mean(dim="wavelength").values
+    _show(build_ed0_stability_figure(nc, time_window))
 
-    fig, ax = _new_fig((9, 3))
-    ax.plot(nc["time"].values, correction, color="tab:orange")
-    ax.axhline(1.05, color="red", ls="--", lw=1)
-    ax.axhline(0.95, color="red", ls="--", lw=1)
-    # +/-10% by default, widened to fit the data if it's more variable than that.
-    ax.set_ylim(min(0.9, float(np.nanmin(correction))), max(1.1, float(np.nanmax(correction))))
-    ax.set_xlabel("Time")
-    ax.set_ylabel("Ed0 correction (mean over wavelengths)")
-    fig.autofmt_xdate()
-    _show(fig)
-
-    outside = int(np.sum((correction < 0.95) | (correction > 1.05)))
+    active_var = f"ed0_correction_{active_method}"
+    active_correction = nc[active_var] if active_var in nc.data_vars else nc["ed0_correction"]
+    active_values = active_correction.mean(dim="wavelength").values
+    outside = int(np.sum((active_values < 0.95) | (active_values > 1.05)))
     if outside:
         st.warning(
             f"Ed0 correction is outside the +/-5% acceptable range for {outside} scan(s) -- "
             "possible illumination instability (e.g. passing clouds) during this cast."
         )
-
-
-def _raw_scan_values(
-    raw_ds: xr.Dataset | None,
-    depth_is_on: str | None,
-    delta_capteur: float | None,
-    instrument: str,
-    w: float,
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """Raw per-scan (value, depth) for ``instrument`` at the wavelength nearest ``w``.
-
-    Depth comes from ``depth_is_on``'s own column (``init.cops.dat``'s single reference
-    depth/pressure sensor) -- *not* ``f"{instrument}_Depth"``, which only exists for whichever
-    instrument physically carries that sensor (typically LuZ or EuZ). EdZ has no depth column of
-    its own and shares the reference sensor's, exactly like the real fitting pipeline does.
-
-    ``delta_capteur`` (``init.cops.dat``'s ``delta.capteur.optics`` for *this* instrument) is
-    then added, matching ``cast_fit.py``'s own ``depth = depth_ref + delta_capteur_optics``:
-    without it, the raw points are still in the reference sensor's own depth frame, offset from
-    the fitted curve (which *is* in this instrument's corrected frame) by that sensor-to-sensor
-    distance -- confirmed by Simon on a real cast (EdZ's fit sat above its raw points, LuZ's
-    below, consistent with EdZ/LuZ's opposite-signed real-world offsets, e.g. -0.05 m / +0.238 m).
-    """
-    if raw_ds is None or depth_is_on is None:
-        return None
-    if instrument not in raw_ds or f"{depth_is_on}_Depth" not in raw_ds:
-        return None
-    wdim = _wavelength_dim(raw_ds, instrument)
-    raw_waves = raw_ds[wdim].values
-    nearest_raw_wave = raw_waves[int(np.argmin(np.abs(raw_waves - w)))]
-    values = raw_ds[instrument].sel({wdim: nearest_raw_wave}).values
-    depth = raw_ds[f"{depth_is_on}_Depth"].values
-    if delta_capteur is not None and np.isfinite(delta_capteur):
-        depth = depth + delta_capteur
-    return values, depth
 
 
 def _render_depth_profile(
@@ -183,73 +156,29 @@ def _render_depth_profile(
     delta_capteur: float | None,
     instrument: str,
 ) -> None:
-    depth_dim = f"{instrument}_depth"
     waves = nc["wavelength"].values
-    fitted = nc[f"{instrument}_fitted"]
-    depth = nc[depth_dim].values
-
     wave_options = ["All"] + [f"{w:g}" for w in waves]
     wavelength_choice = st.selectbox(
         "Wavelength", wave_options, key=f"analyze_{instrument}_depth_wave"
     )
-
-    fig, ax = _new_fig()
-    if wavelength_choice == "All":
-        colors = _wavelength_colors(waves)
-        for i, w in enumerate(waves):
-            ax.plot(fitted.isel(wavelength=i).values, depth, color=colors[i], lw=1.5)
-        sm = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(waves.min(), waves.max()))
-        fig.colorbar(sm, ax=ax, label="Wavelength (nm)")
-    else:
-        w = float(wavelength_choice)
-        wi = int(np.argmin(np.abs(waves - w)))
-        raw = _raw_scan_values(raw_ds, depth_is_on, delta_capteur, instrument, w)
-        if raw is not None:
-            raw_values, raw_depth = raw
-            kept_var = f"{instrument}_kept"
-            if kept_var in nc.data_vars and nc.sizes["time"] == raw_ds.sizes["time"]:
-                kept = nc[kept_var].values.astype(bool)
-            else:
-                kept = np.ones(raw_depth.shape, dtype=bool)
-            ax.plot(raw_values[kept], raw_depth[kept], ".", markersize=3, color="tab:blue", label="kept scans")
-            ax.plot(raw_values[~kept], raw_depth[~kept], ".", markersize=3, color="lightgray", label="excluded scans")
-        ax.plot(fitted.isel(wavelength=wi).values, depth, color="tab:red", lw=2, label="fitted")
-        detection_limit = nc[f"{instrument}_detection_limit"].values[wi]
-        if np.isfinite(detection_limit):
-            ax.axvline(detection_limit, color="black", ls="--", lw=1, label="detection limit")
-        ax.legend(loc="best", fontsize="small")
-
-    ax.set_xscale("log")
-    ax.invert_yaxis()
-    ax.set_xlabel(f"{instrument} (log scale)")
-    ax.set_ylabel("Depth (m)")
-    _show(fig)
+    _show(build_depth_profile_figure(nc, raw_ds, depth_is_on, delta_capteur, instrument, wavelength_choice))
 
 
 def _render_attenuation(nc: xr.Dataset, instrument: str) -> None:
-    depth_dim = f"{instrument}_depth"
-    waves = nc["wavelength"].values
-    depth = nc[depth_dim].values
-    colors = _wavelength_colors(waves)
+    _show(build_attenuation_figure(nc, instrument))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
-    for i, w in enumerate(waves):
-        ax1.plot(nc[f"{instrument}_KZ"].isel(wavelength=i).values, depth, color=colors[i], lw=1.5)
-        ax2.plot(nc[f"{instrument}_K0"].isel(wavelength=i).values, depth, color=colors[i], lw=1.5)
-    for ax, title in ((ax1, "KZ (local)"), (ax2, "K0 (depth-integrated)")):
-        ax.invert_yaxis()
-        ax.set_xlabel(f"{title} (m⁻¹)")
-        ax.set_ylabel("Depth (m)")
-    sm = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(waves.min(), waves.max()))
-    fig.colorbar(sm, ax=(ax1, ax2), label="Wavelength (nm)")
+
+def _render_spectral_kd(nc: xr.Dataset) -> None:
+    fig = build_spectral_kd_figure(nc)
+    if fig is None:
+        return
+    st.subheader("Spectral Kd")
+    st.caption(
+        "Mean diffuse attenuation from the surface down to the 1%, 10%, and penetration-depth "
+        "(1/e) light levels, one line per level vs. wavelength -- distinct from the K attenuation "
+        "panels above, which plot Kd vs. depth for one instrument at a time."
+    )
     _show(fig)
-
-
-_PAR_LEVEL_FRACTIONS = (0.5, 0.1, 0.01, 0.001)  # 50% / 10% / 1% / 0.1% of PAR_0, per Simon's request
-# Kd(PAR) integrated from the surface is noisy/not meaningful in the first few cm (near-surface
-# scan sparsity, extrapolation sensitivity) -- Simon: "j'aurais tendance à commencer à partir de
-# 0.5 mètres" for the integrated Kd(PAR)-vs-depth plot specifically (not the PAR profile itself).
-_KD_PAR_MIN_DEPTH_M = 0.5
 
 
 def _render_par_and_kd_par(nc: xr.Dataset, selected: str) -> None:
@@ -261,30 +190,8 @@ def _render_par_and_kd_par(nc: xr.Dataset, selected: str) -> None:
     "Ed0 stability" section above. ``PAR_u`` is computed (see ``.nc``'s ``par_u_profile``) but not
     plotted here -- Simon: "pas vraiment pertinent sur le graph".
     """
-    depth = nc["EdZ_depth"].values
-    par_d = nc["par_d_profile"].values
-    par_0 = float(nc.attrs["par_0"])
-
-    fig, ax = _new_fig((7, 5))
-    ax.plot(par_d, depth, color="tab:blue", lw=2, label="PAR_d (downwelling)")
-    ax.axvline(par_0, color="gray", ls="--", lw=1.5, label="PAR_0 (surface reference)")
-    for fraction in _PAR_LEVEL_FRACTIONS:
-        ax.axvline(par_0 * fraction, color="gray", ls=":", lw=1)
-        ax.text(
-            par_0 * fraction,
-            depth.max(),
-            f"{fraction * 100:g}%",
-            color="gray",
-            fontsize="small",
-            ha="center",
-            va="bottom",
-        )
-    ax.set_xscale("log")
-    ax.invert_yaxis()
-    ax.set_xlabel("PAR (µEin.m⁻².s⁻¹, log scale)")
-    ax.set_ylabel("Depth (m)")
-    ax.legend(loc="best", fontsize="small")
-    _show(fig)
+    figures = build_par_kd_par_figures(nc)
+    _show(figures[0])
 
     st.caption("Kd(PAR): mean diffuse attenuation of broadband PAR from the surface to a given depth.")
     fraction_table = {
@@ -303,17 +210,8 @@ def _render_par_and_kd_par(nc: xr.Dataset, selected: str) -> None:
         }
         st.dataframe(spectral_table, hide_index=True)
 
-    k0_depth = depth[1:]  # k0_par[0] is a leading-NaN pad, matching K0's own depth_grid[1:] alignment
-    k0_values = nc["k0_par"].values[1:]
-    deep_enough = k0_depth >= _KD_PAR_MIN_DEPTH_M
-    k0_depth, k0_values = k0_depth[deep_enough], k0_values[deep_enough]
-    if len(k0_depth) > 1:
-        fig, ax = _new_fig((7, 5))
-        ax.plot(k0_values, k0_depth, color="tab:blue", lw=2)
-        ax.invert_yaxis()
-        ax.set_xlabel("Kd(PAR) integrated from the surface to Z (m⁻¹)")
-        ax.set_ylabel("Depth Z (m)")
-        _show(fig)
+    if len(figures) > 1:
+        _show(figures[1])
     else:
         st.caption(f"Not enough fitted depths below {_KD_PAR_MIN_DEPTH_M:g} m to plot Kd(PAR) vs. depth.")
 
@@ -331,6 +229,11 @@ def _render_extrapolation_comparison(
     The linear curve is reconstructed from already-stored fit parameters, not refit here:
     ``surface_linear.py``'s log-linear regression is anchored at the true surface (``z=0``), so
     ``value(z) = value_at_surface * exp(-k_surf * z)`` over ``z`` in ``[0, z_interval]``.
+
+    This is the interactive, single-wavelength drill-down; the PDF report
+    (:mod:`pycops.io.pdf_report`) has a separate small-multiples grid version of this same
+    diagnostic (:func:`~pycops.io.pdf_report.build_extrapolation_grid_figure`, all wavelengths on
+    one page) since per-band detail matters more in a static document than a one-at-a-time picker.
     """
     waves = nc["wavelength"].values
     depth = nc[f"{instrument}_depth"].values
@@ -346,12 +249,16 @@ def _render_extrapolation_comparison(
     w = float(wavelength_choice)
     wi = int(np.argmin(np.abs(waves - w)))
 
-    fig, ax = _new_fig((9, 4.5))
-    raw = _raw_scan_values(raw_ds, depth_is_on, delta_capteur, instrument, w)
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    raw = _raw_scan_values(raw_ds, nc, depth_is_on, delta_capteur, instrument, w)
     if raw is not None:
-        raw_values, raw_depth = raw
+        raw_values, corrected_values, raw_depth = raw
+        kept = _kept_mask(nc, raw_ds, instrument, raw_depth)
         near_surface = raw_depth <= max(z_interval[wi] * 1.5, 1.0) if np.isfinite(z_interval[wi]) else np.ones_like(raw_depth, dtype=bool)
-        ax.plot(raw_values[near_surface], raw_depth[near_surface], ".", markersize=4, color="tab:blue", label="raw scans")
+        show = kept & near_surface
+        plot_values = corrected_values if corrected_values is not None else raw_values
+        label = "kept scans (Ed0-corrected)" if corrected_values is not None else "kept scans"
+        ax.plot(plot_values[show], raw_depth[show], ".", markersize=4, color="tab:blue", label=label)
     ax.plot(fitted.isel(wavelength=wi).values, depth, color="tab:red", lw=2, label="LOESS fit")
     if np.isfinite(value_at_surface[wi]) and np.isfinite(z_interval[wi]):
         z_line = np.linspace(0, z_interval[wi], 50)
@@ -391,30 +298,24 @@ def _render_rrs_spectra(nc: xr.Dataset) -> None:
             f"select.cops.dat's method column -- not QWIP-based; QWIP below is an independent "
             f"quality check, not the criterion used to pick loess vs. linear)."
         )
-    waves = nc["wavelength"].values
-    fig, ax = _new_fig((7, 4.5))
-    for method, style in (("loess", "-o"), ("linear", "--s"), ("recommended", ":^")):
-        var = f"rrs_0p_{method}"
-        if var in nc.data_vars:
-            ax.plot(waves, nc[var].values, style, label=method, markersize=4)
-    ax.set_yscale("log")
-    ax.set_xlabel("Wavelength (nm)")
-    ax.set_ylabel("Rrs(0+)")
-    ax.legend(fontsize="small")
-    _show(fig)
+    _show(build_rrs_figure(nc))
+
+
+def _render_qfactor(nc: xr.Dataset) -> None:
+    if "q_factor_loess" not in nc.data_vars and "q_factor_linear" not in nc.data_vars:
+        return
+    st.subheader("Empirical Q-factor (Eu(0-) / Lu(0-))")
+    st.caption(
+        "Measured ratio of EuZ to LuZ surface-extrapolated values (shadow-corrected when "
+        "available) -- only available for casts carrying both instruments. A rarely-reported "
+        "diagnostic, distinct from the theoretical Q.sun.nadir constant used elsewhere to convert "
+        "between the two when only one is present."
+    )
+    _show(build_qfactor_figure(nc))
 
 
 def _render_shadow_correction(nc: xr.Dataset, instrument: str) -> None:
-    waves = nc["wavelength"].values
-    fig, ax = _new_fig((9, 3.5))
-    ax.plot(waves, nc[f"{instrument}_shadow_correction"].values, "-o", color="tab:purple")
-    ax.set_ylim(0.2, 1.05)
-    ax.set_xlabel("Wavelength (nm)")
-    ax.set_ylabel(f"Shadow correction ({instrument})")
-    source = nc.attrs.get(f"{instrument}_absorption_source")
-    if source:
-        ax.set_title(f"Absorption source: {source}")
-    _show(fig)
+    _show(build_shadow_correction_figure(nc, instrument))
 
 
 def _render_qwip(nc: xr.Dataset) -> None:
@@ -439,99 +340,18 @@ def _render_qwip(nc: xr.Dataset) -> None:
                 st.write("✅ Passed" if passed else "⚠️ Failed")
             st.write(f"Water class: {nc.attrs[f'qwip_{label}_water_class']} (FU {nc.attrs[f'qwip_{label}_fu']})")
 
-    avw_range = np.linspace(400, 600, 200)
-    predicted = _qwip_polynomial(avw_range)
-    fig, ax = _new_fig((7, 4))
-    ax.plot(avw_range, predicted, color="black", label="QWIP reference")
-    ax.fill_between(avw_range, predicted - 0.1, predicted + 0.1, color="gray", alpha=0.2)
-    for label, marker in zip(labels, ("o", "s")):
-        ax.plot(nc.attrs[f"qwip_{label}_avw"], nc.attrs[f"qwip_{label}_ndi"], marker, markersize=10, label=label)
-    ax.set_xlabel("AVW (nm)")
-    ax.set_ylabel("NDI")
-    ax.legend()
-    _show(fig)
-
-
-def _mask_negligible_rb(
-    rb: np.ndarray,
-    rb_extrapolated: np.ndarray,
-    edz_at_bottom: np.ndarray,
-    edz_at_surface: np.ndarray,
-    threshold: float = _RB_NEGLIGIBLE_EDZ_FRACTION,
-) -> tuple[np.ndarray, np.ndarray]:
-    """NaN out wavelengths where EdZ at the bottom is negligible relative to the surface.
-
-    Rb's denominator there is dominated by noise/near-zero division, not a real reflectance
-    signal (a known numerical fragility of ``compute.bottom.R``'s own ratio, see CLAUDE.md).
-    ``threshold`` (default 1% of surface EdZ) is Simon's own starting suggestion, not yet tuned
-    against real data. A NaN ``edz_at_bottom`` (e.g. the fitted profile has no valid points that
-    deep at a fast-attenuating wavelength) also counts as negligible.
-    """
-    rb = rb.copy()
-    rb_extrapolated = rb_extrapolated.copy()
-    with np.errstate(invalid="ignore"):
-        negligible = ~(edz_at_bottom > threshold * edz_at_surface)
-    rb[negligible] = np.nan
-    rb_extrapolated[negligible] = np.nan
-    return rb, rb_extrapolated
-
-
-def _visible_band_ylim(rb: np.ndarray, rb_extrapolated: np.ndarray, waves: np.ndarray) -> float | None:
-    """Y-axis max from visible-band (<=700 nm) values only.
-
-    Near-infrared fluorescence can push Rb over 100% there (Simon), which would otherwise blow
-    out the scale for the whole plot even though the visible bands (what Rb is actually meant to
-    characterize) look normal. Returns ``None`` if there's nothing finite to scale from.
-    """
-    visible = waves <= _VISIBLE_MAX_NM
-    values = np.concatenate([rb[visible], rb_extrapolated[visible]])
-    values = values[np.isfinite(values)]
-    return float(np.max(values)) * 1.15 if len(values) else None
+    _show(build_qwip_figure(nc))
 
 
 def _render_bottom(nc: xr.Dataset, instrument: str) -> None:
-    waves = nc["wavelength"].values
-    rb = nc[f"{instrument}_rb"].values
-    rb_extrapolated = nc[f"{instrument}_rb_extrapolated"].values
+    _show(build_bottom_figure(nc, instrument))
+
     bottom_depth = nc.attrs.get(f"{instrument}_bottom_depth")
-
     if bottom_depth is not None and "EdZ_fitted" in nc.data_vars:
-        edz_at_bottom = np.array(
-            [np.interp(bottom_depth, nc["EdZ_depth"].values, nc["EdZ_fitted"].isel(wavelength=i).values) for i in range(len(waves))]
-        )
-        rb, rb_extrapolated = _mask_negligible_rb(rb, rb_extrapolated, edz_at_bottom, nc["EdZ_value_at_0"].values)
-
-    fig, ax = _new_fig((9, 3.5))
-    ax.plot(waves, rb, "-o", label="Rb (~0.3 m above bottom)")
-    ax.plot(waves, rb_extrapolated, "--s", label="Rb (extrapolated to bottom)")
-    ax.set_xlabel("Wavelength (nm)")
-    ax.set_ylabel(f"Bottom reflectance ({instrument})")
-    ax.legend(fontsize="small")
-    if bottom_depth is not None:
-        ax.set_title(f"Bottom depth: {bottom_depth:.2f} m")
-
-    ylim = _visible_band_ylim(rb, rb_extrapolated, waves)
-    if ylim is not None:
-        ax.set_ylim(0, ylim)
-    _show(fig)
-
-    if bottom_depth is not None and "EdZ_fitted" in nc.data_vars:
+        waves = nc["wavelength"].values
         pct_par = percent_par_at_depth(waves, nc["EdZ_fitted"].values, nc["EdZ_depth"].values, bottom_depth)
         if pct_par is not None:
             st.metric("Benthic PAR available (% of surface)", f"{pct_par:.2f}%")
-
-
-def _effective_time_window(
-    init: dict[str, object], info: CastInfo | None
-) -> tuple[float, float] | None:
-    """The ``time.window`` actually used by processing: this cast's ``info.cops.dat`` override if
-    present, else ``init.cops.dat``'s deployment-wide default -- mirrors
-    ``process_cast.py``'s own resolution (``ds.attrs.get("time_window") or init["time.window"]``),
-    for display purposes only."""
-    if info is not None and info.time_window is not None:
-        return info.time_window
-    time_window = init.get("time.window")
-    return tuple(time_window) if time_window is not None else None
 
 
 def _render_depth_vs_time(
@@ -543,33 +363,7 @@ def _render_depth_vs_time(
     cast's currently-saved ``time.window`` -- the diagnostic Simon looks at to spot where tilt/
     depth goes bad near the end of a cast, kept visible without opening "Adjust & reprocess"."""
     st.subheader(f"{depth_is_on} depth vs time")
-    elapsed = (raw_ds["time"].values - raw_ds["time"].values.min()) / np.timedelta64(1, "s")
-    depth = raw_ds[f"{depth_is_on}_Depth"].values
-
-    fig, ax = _new_fig((9, 3.2))
-    ax.plot(elapsed, depth, ".", markersize=2, color="tab:blue")
-    if time_window is not None:
-        start, end = time_window
-        ax.axvspan(0, start, color="gray", alpha=0.3)
-        ax.axvspan(end, float(elapsed.max()), color="gray", alpha=0.3)
-    ax.invert_yaxis()
-    ax.set_xlabel("Elapsed time (s)")
-    ax.set_ylabel(f"{depth_is_on} depth (m)")
-    _show(fig)
-
-
-def _effective_tiltmax(init: dict[str, object], info: CastInfo | None, instrument: str) -> float:
-    """``tiltmax.optics`` for ``instrument``, the deployment default unless ``info.cops.dat``'s
-    per-cast ``tiltmax`` override (a value per ``instruments.optics`` entry, same shape ``init``
-    itself uses) has one -- mirrors ``process_cast.py``'s own ``_apply_info_overrides()`` merge,
-    for display purposes only (this doesn't itself change what gets processed)."""
-    if info is not None and info.tiltmax is not None:
-        instruments_list = list(init["instruments.optics"])
-        if instrument in instruments_list:
-            idx = instruments_list.index(instrument)
-            if idx < len(info.tiltmax):
-                return info.tiltmax[idx]
-    return init["tiltmax.optics"][instrument]
+    _show(build_depth_vs_time_figure(raw_ds, depth_is_on, time_window))
 
 
 def _render_tilt(
@@ -594,35 +388,10 @@ def _render_tilt(
     keeping the ``.nc`` schema free of raw scans avoids bloating file size or needing to
     reprocess already-processed stations for a schema change.
     """
-    try:
-        tilt = add_tilt(raw_ds, instrument)[f"{instrument}_Tilt"].values
-    except KeyError as exc:
-        st.warning(f"No Roll/Pitch available for {instrument}: {exc}")
+    fig = build_tilt_figure(raw_ds, depth_is_on, delta_capteur, init, info, instrument, time_window)
+    if fig is None:
+        st.warning(f"No Roll/Pitch available for {instrument}.")
         return
-
-    depth = raw_ds[f"{depth_is_on}_Depth"].values
-    if delta_capteur is not None and np.isfinite(delta_capteur):
-        depth = depth + delta_capteur
-    tiltmax = _effective_tiltmax(init, info, instrument)
-
-    if time_window is not None:
-        in_window = time_window_mask(raw_ds["time"].values, time_window)
-    else:
-        in_window = np.ones(tilt.shape, dtype=bool)
-    within = in_window & (tilt < tiltmax)
-    exceeds = in_window & ~(tilt < tiltmax)
-    excluded = ~in_window
-
-    fig, ax = _new_fig((9, 4))
-    ax.plot(tilt[excluded], depth[excluded], ".", markersize=3, color="gray", label="excluded by time.window")
-    ax.plot(tilt[within], depth[within], ".", markersize=3, color="tab:blue", label="within limit")
-    ax.plot(tilt[exceeds], depth[exceeds], ".", markersize=4, color="red", label="exceeds limit")
-    if np.isfinite(tiltmax):
-        ax.axvline(tiltmax, color="red", ls="--", lw=1)
-    ax.invert_yaxis()
-    ax.set_xlabel(f"{instrument} tilt (degrees)")
-    ax.set_ylabel("Depth (m)")
-    ax.legend(fontsize="small")
     _show(fig)
 
 
@@ -669,6 +438,7 @@ def _render_qc_actions(
     instruments: tuple[str, ...],
     labels: list[str],
     selected: str,
+    init: dict[str, object] | None,
 ) -> None:
     """Adjust this cast's processing parameters and reprocess it in place, discard it, or
     validate it and move to the next -- the QC loop Simon wants after spotting a problem in the
@@ -687,6 +457,7 @@ def _render_qc_actions(
     info_path = directory / "info.cops.dat"
     select_path = directory / "select.cops.dat"
     exclusions_path = directory / "rrs_wavelength_exclusions.cops.dat"
+    ed0_method_path = directory / "ed0_correction_method.cops.dat"
     cast_file = raw_path.name
 
     current_selection = existing_selection(select_path, cast_file)
@@ -697,6 +468,14 @@ def _render_qc_actions(
     )
     shallow = current_selection.shallow if current_selection else False
     flag = current_selection.flag if current_selection else FLAG_NORMAL
+
+    station_ed0_method = (init or {}).get("ed0.correction.method", _DEFAULT_ED0_CORRECTION_METHOD)
+    if station_ed0_method not in _ED0_CORRECTION_METHOD_OPTIONS:
+        station_ed0_method = _DEFAULT_ED0_CORRECTION_METHOD
+    existing_ed0_override = read_ed0_correction_methods(ed0_method_path).get(cast_file)
+    default_ed0_method = (
+        existing_ed0_override if existing_ed0_override in _ED0_CORRECTION_METHOD_OPTIONS else station_ed0_method
+    )
 
     with st.expander("Adjust processing parameters"):
         elapsed = (raw_ds["time"].values - raw_ds["time"].values.min()) / np.timedelta64(1, "s")
@@ -720,6 +499,14 @@ def _render_qc_actions(
             index=_METHOD_OPTIONS.index(default_method),
             format_func=lambda k: _METHOD_LABELS[k],
             key=f"analyze_method::{selected}",
+        )
+        ed0_method = st.selectbox(
+            "Ed0 illumination correction method (this cast -- 'x' below to use the station "
+            f"default, currently {_ED0_CORRECTION_METHOD_LABELS[station_ed0_method]})",
+            _ED0_CORRECTION_METHOD_OPTIONS,
+            index=_ED0_CORRECTION_METHOD_OPTIONS.index(default_ed0_method),
+            format_func=lambda k: _ED0_CORRECTION_METHOD_LABELS[k],
+            key=f"analyze_ed0_method::{selected}",
         )
         st.caption("Final Rrs wavelength exclusions -- checked bands are set to NaN regardless of method.")
         existing_exclusions = read_wavelength_exclusions(exclusions_path).get(cast_file, [])
@@ -751,6 +538,7 @@ def _render_qc_actions(
     }
     has_unsaved_changes = (
         method != default_method
+        or ed0_method != default_ed0_method
         or sorted(excluded_waves) != sorted(existing_exclusions)
         or (round(start, 6), round(end, 6)) != (round(saved_start, 6), round(saved_end, 6))
         or override_texts != saved_overrides
@@ -778,6 +566,7 @@ def _render_qc_actions(
                 return
             update_cast_selection(select_path, cast_file, flag, method, shallow=shallow)
             update_wavelength_exclusions(exclusions_path, cast_file, excluded_waves)
+            update_ed0_correction_method(ed0_method_path, cast_file, ed0_method)
             try:
                 reprocessed = reprocess_single_cast(directory, cast_file)
             except Exception as exc:  # noqa: BLE001 -- surface any processing failure in the UI
@@ -785,9 +574,10 @@ def _render_qc_actions(
                 return
             write_cast_result(reprocessed.result, nc_dir / f"{selected}.nc", ds=reprocessed.ds)
             st.session_state["analyze_action_message"] = (
-                f"Reprocessed {cast_file} -- select.cops.dat, info.cops.dat, and the .nc file "
-                "have all been saved with your new parameters (the diagnostics below already "
-                "reflect them). Click 'Validate and next' whenever you're satisfied with this cast."
+                f"Reprocessed {cast_file} -- select.cops.dat, info.cops.dat, "
+                "ed0_correction_method.cops.dat, and the .nc file have all been saved with your "
+                "new parameters (the diagnostics below already reflect them). Click 'Validate and "
+                "next' whenever you're satisfied with this cast."
             )
             # st.data_editor keeps its own cached grid state across reruns under the same key --
             # without this, the wavelength-exclusion table's Rrs (loess)/Rrs (linear) preview
@@ -820,18 +610,22 @@ def _render_qc_actions(
             st.rerun()
 
 
-def _k0_at_adaptive_depth(k0: np.ndarray, depth_grid: np.ndarray, z_interval: np.ndarray) -> np.ndarray:
-    """K0(EdZ) sampled at each wavelength's own near-surface linear-fit ``z_interval`` depth, or
-    at the depth nearest 2 m for *every* wavelength if any wavelength's ``z_interval`` is NaN --
-    port of ``plot.Rrs.Kd.for.station.R``'s exact adaptive-depth/all-or-nothing-fallback logic."""
-    if np.any(np.isnan(z_interval)):
-        ix = int(np.argmin(np.abs(depth_grid - 2.0)))
-        return k0[ix, :]
-    values = np.empty(len(z_interval))
-    for w in range(len(z_interval)):
-        ix = int(np.argmin(np.abs(depth_grid - z_interval[w])))
-        values[w] = k0[ix, w]
-    return values
+def _generate_batch_pdf_reports(directory: Path, kept_files: list[Path]) -> None:
+    """Write one PDF report per currently-kept cast -- thin Streamlit wrapper (progress bar +
+    success/warning banner) over the pure :func:`~pycops.io.pdf_report.write_station_pdf_reports`,
+    which also backs tab 3's own "regenerate PDF reports" action so there's exactly one
+    implementation of this loop."""
+    progress = st.progress(0.0)
+    written, failures = write_station_pdf_reports(
+        directory,
+        include_station_summary=False,  # this button is per-cast only; the summary has its own button
+        progress_callback=lambda i, total: progress.progress(i / total),
+    )
+
+    if failures:
+        st.warning(f"{written}/{len(kept_files)} PDF report(s) written; failed: " + "; ".join(failures))
+    else:
+        st.success(f"{written} PDF report(s) written to {directory / 'pdf'}")
 
 
 def _render_station_comparison(directory: Path) -> None:
@@ -850,51 +644,50 @@ def _render_station_comparison(directory: Path) -> None:
         st.warning(f"No kept casts with .nc output found in {nc_dir}.")
         return
 
-    colors = plt.cm.tab20(np.linspace(0, 1, len(kept_files)))
-
-    fig_rrs, ax_rrs = _new_fig((9, 4.5))
-    fig_kd, ax_kd = _new_fig((9, 4.5))
-    any_rrs = any_kd = False
-
-    for color, nc_path in zip(colors, kept_files):
-        with xr.open_dataset(nc_path) as opened:
-            nc = opened.load()
-        waves = nc["wavelength"].values
-        label = nc_path.stem
-
-        if "rrs_0p_loess" in nc.data_vars or "rrs_0p_linear" in nc.data_vars:
-            any_rrs = True
-            if "rrs_0p_loess" in nc.data_vars:
-                ax_rrs.plot(waves, nc["rrs_0p_loess"].values, "-", color=color, label=label)
-            if "rrs_0p_linear" in nc.data_vars:
-                ax_rrs.plot(waves, nc["rrs_0p_linear"].values, "--", color=color)
-
-        if "EdZ_K0" in nc.data_vars and "EdZ_surface_z_interval" in nc.data_vars:
-            any_kd = True
-            k0_adaptive = _k0_at_adaptive_depth(
-                nc["EdZ_K0"].values, nc["EdZ_depth"].values, nc["EdZ_surface_z_interval"].values
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("📄 Generate station summary PDF", key="analyze_station_summary_pdf"):
+            pdf_path = directory / "pdf" / f"{directory.name}_station_summary.pdf"
+            write_station_summary_pdf(directory, pdf_path)
+            st.success(f"Station summary PDF written to {pdf_path}")
+            st.download_button(
+                "Download station summary PDF",
+                data=pdf_path.read_bytes(),
+                file_name=pdf_path.name,
+                mime="application/pdf",
+                key="analyze_station_pdf_download",
             )
-            ax_kd.plot(waves, k0_adaptive, "-", color=color, label=label)
-            ax_kd.plot(waves, nc["EdZ_surface_k_surf"].values, "--", color=color)
+    with col2:
+        if st.button("📄 Generate PDF reports for every kept cast", key="analyze_batch_pdf"):
+            _generate_batch_pdf_reports(directory, kept_files)
 
-    if any_rrs:
+    rrs_figure, k0_figure = build_station_comparison_figures(directory)
+    if rrs_figure is not None:
         st.subheader("Rrs (solid: LOESS, dashed: linear)")
-        ax_rrs.set_yscale("log")
-        ax_rrs.set_xlabel("Wavelength (nm)")
-        ax_rrs.set_ylabel("Rrs(0+)")
-        ax_rrs.legend(fontsize="small")
-        _show(fig_rrs)
-    else:
-        plt.close(fig_rrs)
-
-    if any_kd:
+        _show(rrs_figure)
+    if k0_figure is not None:
         st.subheader("K0(EdZ) (solid: adaptive depth, dashed: near-surface linear)")
-        ax_kd.set_xlabel("Wavelength (nm)")
-        ax_kd.set_ylabel("K0 (m⁻¹)")
-        ax_kd.legend(fontsize="small")
-        _show(fig_kd)
-    else:
-        plt.close(fig_kd)
+        _show(k0_figure)
+
+    par_table = build_station_par_depth_table(directory)
+    if not par_table.empty:
+        st.subheader("PAR penetration depth (m) by light level, per cast")
+        st.dataframe(par_table, hide_index=True)
+
+    par_profile_figure = build_station_par_profile_figure(directory)
+    if par_profile_figure is not None:
+        st.subheader("PAR profile comparison")
+        _show(par_profile_figure)
+
+    kd_penetration_depth_figure = build_station_kd_penetration_depth_figure(directory)
+    if kd_penetration_depth_figure is not None:
+        st.subheader("Spectral Kd at penetration depth, by cast")
+        _show(kd_penetration_depth_figure)
+
+    qfactor_figure = build_station_qfactor_figure(directory)
+    if qfactor_figure is not None:
+        st.subheader("Empirical Q-factor, by cast (Eu(0-) / Lu(0-))")
+        _show(qfactor_figure)
 
 
 def render_analyze_tab() -> None:
@@ -963,7 +756,7 @@ def _render_single_cast(directory: Path) -> None:
             depth_is_on = None
 
     instruments = _instruments_present(nc)
-    raw_path = _find_raw_cast(directory, selected)
+    raw_path = find_raw_cast_for_stem(directory, selected)
     raw_ds = None
     if raw_path is None:
         st.caption("⚠️ Original raw cast file not found -- showing fitted curves only, no raw scan overlay.")
@@ -978,8 +771,29 @@ def _render_single_cast(directory: Path) -> None:
     info = existing_info(directory / "info.cops.dat", raw_path.name) if raw_path is not None else None
     time_window = _effective_time_window(init, info) if init is not None else None
 
+    cast_file = raw_path.name if raw_path is not None else selected
+    if st.button("📄 Generate PDF report for this cast", key="analyze_pdf_report"):
+        pdf_path = directory / "pdf" / f"{selected}.pdf"
+        write_cast_pdf_report(
+            nc, raw_ds, init, info, cast_file, instruments, depth_is_on, delta_capteur_optics, time_window, pdf_path
+        )
+        st.session_state["analyze_pdf_report_message"] = f"PDF report written to {pdf_path}"
+        st.rerun()
+    pdf_report_message = st.session_state.pop("analyze_pdf_report_message", None)
+    if pdf_report_message:
+        st.success(pdf_report_message)
+        pdf_report_path = directory / "pdf" / f"{selected}.pdf"
+        if pdf_report_path.exists():
+            st.download_button(
+                "Download PDF report",
+                data=pdf_report_path.read_bytes(),
+                file_name=pdf_report_path.name,
+                mime="application/pdf",
+                key="analyze_pdf_report_download",
+            )
+
     _render_overview(nc)
-    _render_ed0_stability(nc)
+    _render_ed0_stability(nc, time_window)
 
     if raw_ds is not None and depth_is_on is not None:
         _render_depth_vs_time(raw_ds, depth_is_on, time_window)
@@ -997,6 +811,8 @@ def _render_single_cast(directory: Path) -> None:
         with st.expander(f"{instrument} attenuation (K)"):
             _render_attenuation(nc, instrument)
 
+    _render_spectral_kd(nc)
+
     if "par_d_profile" in nc.data_vars:
         with st.expander("PAR & Kd(PAR)"):
             _render_par_and_kd_par(nc, selected)
@@ -1009,6 +825,7 @@ def _render_single_cast(directory: Path) -> None:
                 )
 
     _render_rrs_spectra(nc)
+    _render_qfactor(nc)
 
     for instrument in _SHADOW_INSTRUMENTS:
         if f"{instrument}_shadow_correction" in nc.data_vars:
@@ -1023,4 +840,6 @@ def _render_single_cast(directory: Path) -> None:
                 with st.expander(f"{instrument} bottom reflectance"):
                     _render_bottom(nc, instrument)
 
-    _render_qc_actions(directory, nc_dir, nc, raw_path, raw_ds, depth_is_on, info, instruments, labels, selected)
+    _render_qc_actions(
+        directory, nc_dir, nc, raw_path, raw_ds, depth_is_on, info, instruments, labels, selected, init
+    )

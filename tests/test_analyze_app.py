@@ -11,17 +11,9 @@ pytest.importorskip("streamlit")
 from streamlit.testing.v1 import AppTest  # noqa: E402
 
 from conftest import _write_cast_file  # noqa: E402
-from pycops.io.config import CastInfo, write_init_cops  # noqa: E402
+from pycops.io.config import write_init_cops  # noqa: E402
 from pycops.io.netcdf import write_cast_result  # noqa: E402
 from pycops.processing.process_cast import process_cast  # noqa: E402
-from pycops.ui.analyze_app import (  # noqa: E402
-    _effective_tiltmax,
-    _effective_time_window,
-    _k0_at_adaptive_depth,
-    _mask_negligible_rb,
-    _raw_scan_values,
-    _visible_band_ylim,
-)
 
 _APP_PATH = str(Path(__file__).resolve().parents[1] / "src" / "pycops" / "ui" / "clean_app.py")
 
@@ -185,6 +177,8 @@ def test_analyze_tab_full_cast_renders_every_section(tmp_path):
         assert f"{instrument} depth profile" in expander_labels
         assert f"{instrument} attenuation (K)" in expander_labels
 
+    assert any("Spectral Kd" in s.value for s in at.subheader)  # EdZ present in this fixture
+
     # Exercise the wavelength drill-down (raw-scan overlay code path) on LuZ -- also confirms the
     # EdZ raw-scan overlay fix (both LuZ and EdZ use depth_is_on's own depth column, not
     # "{instrument}_Depth", which doesn't exist for EdZ).
@@ -201,6 +195,7 @@ def test_analyze_tab_full_cast_renders_every_section(tmp_path):
 
     assert any("Rrs" in s.value for s in at.subheader)
     assert any("Recommended" in c.value for c in at.caption)
+    assert any("Q-factor" in s.value for s in at.subheader)  # both LuZ+EuZ present in this fixture
     assert "LuZ shadow correction" in expander_labels
     assert "EuZ shadow correction" in expander_labels
     assert any("QWIP" in s.value for s in at.subheader)
@@ -240,58 +235,6 @@ def test_analyze_tab_missing_raw_file_still_renders_nc_content(tmp_path):
     assert not at.exception
     assert any("raw cast file not found" in c.value for c in at.caption)
     assert any("Overview" in s.value for s in at.subheader)
-
-
-def test_raw_scan_values_applies_delta_capteur_offset():
-    """Regression test: the raw depth column is the reference sensor's own depth (depth_is_on),
-    not this instrument's true depth -- delta_capteur_optics (the sensor-to-sensor offset already
-    applied by cast_fit.py before fitting) must be added, or the raw scatter and the fitted curve
-    end up systematically offset from each other (Simon: EdZ's fit sat above its raw points, LuZ's
-    below -- exactly what a missing, oppositely-signed offset per instrument would cause)."""
-    raw_ds = xr.Dataset(
-        {"LuZ": (("time", "wavelength"), np.array([[1.0], [2.0]])), "LuZ_Depth": ("time", np.array([1.0, 2.0]))},
-        coords={"wavelength": [340.0]},
-    )
-    values, depth = _raw_scan_values(raw_ds, "LuZ", 0.238, "LuZ", 340.0)
-    np.testing.assert_allclose(depth, [1.238, 2.238])
-
-    values, depth = _raw_scan_values(raw_ds, "LuZ", None, "LuZ", 340.0)
-    np.testing.assert_allclose(depth, [1.0, 2.0])
-
-
-def test_mask_negligible_rb_flags_near_zero_denominator_and_nan():
-    rb = np.array([1.0, 2.0, 3.0, 4.0])
-    rb_extrapolated = np.array([1.1, 2.1, 3.1, 4.1])
-    edz_surface = np.array([100.0, 100.0, 100.0, 100.0])
-    # wave 0: NaN at bottom (fast-attenuating channel with no valid fitted point that deep);
-    # wave 1: 0.5% of surface (below the 1% threshold); wave 2/3: comfortably above it.
-    edz_bottom = np.array([np.nan, 0.5, 9.0, 45.0])
-
-    masked_rb, masked_rb_extrap = _mask_negligible_rb(rb, rb_extrapolated, edz_bottom, edz_surface)
-
-    assert np.isnan(masked_rb[0]) and np.isnan(masked_rb_extrap[0])
-    assert np.isnan(masked_rb[1]) and np.isnan(masked_rb_extrap[1])
-    assert masked_rb[2] == 3.0 and masked_rb[3] == 4.0
-    assert masked_rb_extrap[2] == 3.1 and masked_rb_extrap[3] == 4.1
-    # the inputs aren't mutated in place
-    assert not np.isnan(rb[0])
-
-
-def test_visible_band_ylim_ignores_nir_fluorescence_spike():
-    waves = np.array([443.0, 555.0, 683.0, 780.0])
-    rb = np.array([0.05, 0.08, 0.06, 1.4])  # 780 nm: >100%, a fluorescence artifact
-    rb_extrapolated = np.array([0.06, 0.09, 0.07, 1.5])
-
-    ylim = _visible_band_ylim(rb, rb_extrapolated, waves)
-
-    assert ylim is not None
-    assert ylim < 1.0  # scaled from the <=700 nm bands only, not the 780 nm spike
-
-
-def test_visible_band_ylim_none_when_nothing_finite():
-    waves = np.array([443.0, 555.0])
-    nan_array = np.full(2, np.nan)
-    assert _visible_band_ylim(nan_array, nan_array, waves) is None
 
 
 def test_analyze_tab_discard_button_sets_flag_rejected(tmp_path):
@@ -484,6 +427,66 @@ def test_analyze_tab_reprocess_button_saves_method_to_select_cops_dat(tmp_path, 
     assert f"{_CAST_FILE};1;Rrs.0p;NA" in select_text  # method changed, flag/shallow preserved
 
 
+def test_analyze_tab_ed0_correction_method_selectbox_defaults_to_raw_when_unset(tmp_path):
+    """No station-wide init.cops.dat default and no per-cast sidecar override -- must fall back
+    to "raw" (matching the R package), the same default process_cast()/fit_ed0_for_cast() use."""
+    _write_nc(tmp_path, _make_minimal_dataset(), _make_minimal_init())
+    _write_cast_file(tmp_path, _CAST_FILE)
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="analyze_dir").set_value(str(tmp_path)).run(timeout=30)
+
+    assert not at.exception
+    assert at.selectbox(key=f"analyze_ed0_method::{_CAST_STEM}").value == "raw"
+
+
+def test_analyze_tab_ed0_correction_method_selectbox_defaults_to_existing_sidecar_override(tmp_path):
+    _write_nc(tmp_path, _make_minimal_dataset(), _make_minimal_init())
+    _write_cast_file(tmp_path, _CAST_FILE)
+    (tmp_path / "ed0_correction_method.cops.dat").write_text(f"{_CAST_FILE};smoothed\n")
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="analyze_dir").set_value(str(tmp_path)).run(timeout=30)
+
+    assert not at.exception
+    assert at.selectbox(key=f"analyze_ed0_method::{_CAST_STEM}").value == "smoothed"
+
+
+def test_analyze_tab_reprocess_button_saves_ed0_correction_method_to_sidecar(tmp_path, monkeypatch):
+    """Simon's request: a per-cast choice between the raw (R-matching) and smoothed (pycops-only)
+    Ed0 illumination correction, editable inside Adjust & reprocess and persisted to the
+    ed0_correction_method.cops.dat sidecar (not info.cops.dat/init.cops.dat -- see io/ed0_correction.py)."""
+    import pycops.ui.analyze_app as analyze_app_module
+    from pycops.processing.deployment import ReprocessedCast
+
+    _write_nc(tmp_path, _make_minimal_dataset(), _make_minimal_init())
+    _write_cast_file(tmp_path, _CAST_FILE)
+
+    fake_result = process_cast(_make_minimal_dataset(), _make_minimal_init(), ed0_correction_method="smoothed")
+    monkeypatch.setattr(
+        analyze_app_module,
+        "reprocess_single_cast",
+        lambda directory, file, position_overrides=None: ReprocessedCast(
+            result=fake_result, ds=_make_minimal_dataset()
+        ),
+    )
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="analyze_dir").set_value(str(tmp_path)).run(timeout=30)
+    at.selectbox(key=f"analyze_ed0_method::{_CAST_STEM}").set_value("smoothed").run(timeout=30)
+    at.button(key="analyze_reprocess").click().run(timeout=30)
+
+    assert not at.exception
+    sidecar_text = (tmp_path / "ed0_correction_method.cops.dat").read_text()
+    assert f"{_CAST_FILE};smoothed" in sidecar_text
+    nc = xr.open_dataset(tmp_path / "nc" / f"{_CAST_STEM}.nc")
+    assert nc.attrs["ed0_correction_method"] == "smoothed"
+    nc.close()
+
+
 def test_wavelength_exclusion_table_prechecks_existing_exclusions():
     from pycops.ui.analyze_app import _wavelength_exclusion_table
 
@@ -556,30 +559,6 @@ def test_analyze_tab_qwip_shallow_water_shows_note_instead_of_failed(tmp_path):
     assert not any("Failed" in m.value for m in at.markdown)
 
 
-def test_k0_at_adaptive_depth_uses_per_wavelength_z_interval():
-    depth_grid = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
-    k0 = np.array([[1, 10], [2, 20], [3, 30], [4, 40], [5, 50]], dtype=float)
-    z_interval = np.array([1.0, 3.0])
-
-    result = _k0_at_adaptive_depth(k0, depth_grid, z_interval)
-
-    np.testing.assert_allclose(result, [2.0, 40.0])
-
-
-def test_k0_at_adaptive_depth_falls_back_to_2m_when_any_z_interval_nan():
-    """Port of plot.Rrs.Kd.for.station.R's all-or-nothing fallback: one invalid linear fit
-    forces every wavelength (not just that one) onto the fixed ~2 m depth."""
-    depth_grid = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
-    k0 = np.array([[1, 10], [2, 20], [3, 30], [4, 40], [5, 50]], dtype=float)
-    z_interval = np.array([1.0, np.nan])
-
-    result = _k0_at_adaptive_depth(k0, depth_grid, z_interval)
-
-    np.testing.assert_allclose(result, [3.0, 30.0])  # depth nearest 2 m -> index 2, both bands
-
-
-
-
 def test_analyze_tab_station_comparison_overlays_kept_casts(tmp_path):
     second_stem = "WISE_CAST_002_190817_221224_URC"
     _write_nc(tmp_path, _make_minimal_dataset(), _make_minimal_init(), stem=_CAST_STEM)
@@ -595,6 +574,44 @@ def test_analyze_tab_station_comparison_overlays_kept_casts(tmp_path):
     assert any("K0" in s.value for s in at.subheader)
 
 
+def test_analyze_tab_station_comparison_shows_par_table_and_figures(tmp_path):
+    """Simon's request: station-wide PAR penetration-depth table (50/10/5/1/0.1%), PAR profile
+    overlay, and Kd(PAR)-at-penetration-depth comparison, alongside the existing Rrs/K0 overlays
+    -- both minimal fixtures have EdZ, so PAR is computed unconditionally (see process_cast.py)."""
+    second_stem = "WISE_CAST_002_190817_221224_URC"
+    _write_nc(tmp_path, _make_minimal_dataset(), _make_minimal_init(), stem=_CAST_STEM)
+    _write_nc(tmp_path, _make_minimal_dataset(), _make_minimal_init(), stem=second_stem)
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="analyze_dir").set_value(str(tmp_path)).run(timeout=30)
+    at.radio(key="analyze_mode").set_value("Station comparison (Rrs & Kd)").run(timeout=30)
+
+    assert not at.exception
+    assert any("PAR penetration depth" in s.value for s in at.subheader)
+    assert any("PAR profile comparison" in s.value for s in at.subheader)
+    assert len(at.dataframe) >= 1
+    # Kd(PAR)-at-penetration-depth itself isn't asserted here: this fixture's shallow 5 m depth
+    # range doesn't necessarily reach the 1/e penetration depth (a legitimate "fraction never
+    # reached" NaN, same as documented elsewhere in this port) -- build_station_kd_penetration_depth_figure's
+    # own rendering is already covered deterministically in test_pdf_report.py with a fixture
+    # deep enough to guarantee a crossing.
+
+
+def test_analyze_tab_station_comparison_shows_qfactor_when_luz_and_euz_present(tmp_path):
+    second_stem = "WISE_CAST_002_190817_221224_URC"
+    _write_nc(tmp_path, _make_full_dataset(), _make_full_init(), stem=_CAST_STEM)
+    _write_nc(tmp_path, _make_full_dataset(), _make_full_init(), stem=second_stem)
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="analyze_dir").set_value(str(tmp_path)).run(timeout=30)
+    at.radio(key="analyze_mode").set_value("Station comparison (Rrs & Kd)").run(timeout=30)
+
+    assert not at.exception
+    assert any("Q-factor" in s.value for s in at.subheader)
+
+
 def test_analyze_tab_station_comparison_warns_when_all_discarded(tmp_path):
     _write_nc(tmp_path, _make_minimal_dataset(), _make_minimal_init())
     (tmp_path / "select.cops.dat").write_text(f"{_CAST_FILE};0;Rrs.0p;NA\n")
@@ -606,62 +623,6 @@ def test_analyze_tab_station_comparison_warns_when_all_discarded(tmp_path):
 
     assert not at.exception
     assert any("No kept casts" in w.value for w in at.warning)
-
-
-def test_effective_tiltmax_uses_override_when_present():
-    init = {
-        "instruments.optics": ("Ed0", "EdZ", "LuZ"),
-        "tiltmax.optics": {"Ed0": 10.0, "EdZ": 5.0, "LuZ": 5.0},
-    }
-    info = CastInfo(
-        file="x",
-        longitude=None,
-        latitude=None,
-        chl_flag=None,
-        time_window=None,
-        sub_surface_removed_layer=None,
-        tiltmax=[10.0, 2.0, 3.0],
-        depth_interval_for_smoothing=None,
-        dark_files=[],
-    )
-
-    assert _effective_tiltmax(init, info, "EdZ") == 2.0
-
-
-def test_effective_tiltmax_falls_back_to_init_default_when_no_override():
-    init = {
-        "instruments.optics": ("Ed0", "EdZ", "LuZ"),
-        "tiltmax.optics": {"Ed0": 10.0, "EdZ": 5.0, "LuZ": 5.0},
-    }
-
-    assert _effective_tiltmax(init, None, "EdZ") == 5.0
-
-
-def test_effective_time_window_uses_info_override_when_present():
-    init = {"time.window": [0.0, 100.0]}
-    info = CastInfo(
-        file="x",
-        longitude=None,
-        latitude=None,
-        chl_flag=None,
-        time_window=(3.5, 22.5),
-        sub_surface_removed_layer=None,
-        tiltmax=None,
-        depth_interval_for_smoothing=None,
-        dark_files=[],
-    )
-
-    assert _effective_time_window(init, info) == (3.5, 22.5)
-
-
-def test_effective_time_window_falls_back_to_init_default_when_no_override():
-    init = {"time.window": [0.0, 100.0]}
-
-    assert _effective_time_window(init, None) == (0.0, 100.0)
-
-
-def test_effective_time_window_none_when_neither_set():
-    assert _effective_time_window({}, None) is None
 
 
 def test_analyze_tab_depth_vs_time_section_always_visible(tmp_path):
@@ -744,3 +705,55 @@ def test_analyze_tab_ed0_stability_warns_when_outside_5_percent(tmp_path):
 
     assert not at.exception
     assert any("outside the" in w.value and "+/-5%" in w.value for w in at.warning)
+
+
+def test_analyze_tab_generate_pdf_report_button_writes_file_and_offers_download(tmp_path):
+    """Simon's request: a portable PDF export of the same diagnostics this tab already shows,
+    matching R's own per-cast PDF convention -- written to a new pdf/ subfolder alongside nc/."""
+    _write_nc(tmp_path, _make_minimal_dataset(), _make_minimal_init())
+    _write_cast_file(tmp_path, _CAST_FILE)
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="analyze_dir").set_value(str(tmp_path)).run(timeout=30)
+    at.button(key="analyze_pdf_report").click().run(timeout=60)
+
+    assert not at.exception
+    pdf_path = tmp_path / "pdf" / f"{_CAST_STEM}.pdf"
+    assert pdf_path.exists()
+    assert pdf_path.read_bytes().startswith(b"%PDF")
+    assert any("PDF report written" in s.value for s in at.success)
+    assert len(at.download_button) == 1
+
+
+def test_analyze_tab_station_comparison_generate_summary_pdf_button(tmp_path):
+    _write_nc(tmp_path, _make_minimal_dataset(), _make_minimal_init())
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="analyze_dir").set_value(str(tmp_path)).run(timeout=30)
+    at.radio(key="analyze_mode").set_value("Station comparison (Rrs & Kd)").run(timeout=30)
+    at.button(key="analyze_station_summary_pdf").click().run(timeout=60)
+
+    assert not at.exception
+    pdf_path = tmp_path / "pdf" / f"{tmp_path.name}_station_summary.pdf"
+    assert pdf_path.exists()
+    assert pdf_path.read_bytes().startswith(b"%PDF")
+    assert any("Station summary PDF written" in s.value for s in at.success)
+
+
+def test_analyze_tab_station_comparison_generate_batch_pdf_reports_button(tmp_path):
+    second_stem = "WISE_CAST_002_190817_221224_URC"
+    _write_nc(tmp_path, _make_minimal_dataset(), _make_minimal_init(), stem=_CAST_STEM)
+    _write_nc(tmp_path, _make_minimal_dataset(), _make_minimal_init(), stem=second_stem)
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="analyze_dir").set_value(str(tmp_path)).run(timeout=30)
+    at.radio(key="analyze_mode").set_value("Station comparison (Rrs & Kd)").run(timeout=30)
+    at.button(key="analyze_batch_pdf").click().run(timeout=60)
+
+    assert not at.exception
+    assert (tmp_path / "pdf" / f"{_CAST_STEM}.pdf").exists()
+    assert (tmp_path / "pdf" / f"{second_stem}.pdf").exists()
+    assert any("2 PDF report(s) written" in s.value for s in at.success)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 import xarray as xr
 
@@ -42,7 +43,9 @@ def _make_dataset(n=300, ed0_level=100.0, cloud_dip_at=None):
             "LuZ_Depth": ("time", sensor_depth),
             "LuZ_Temp": ("time", np.full(n, 10.0)),
         },
-        coords={"time": np.arange(n), "wavelength": waves},
+        # Real datetime64 time, not a bare scan index -- fit_ed0_for_cast() needs real elapsed
+        # time for correction_smoothed's own time-domain LOESS fit.
+        coords={"time": pd.date_range("2020-01-01T00:00:00", periods=n, freq="s"), "wavelength": waves},
     )
 
 
@@ -60,15 +63,8 @@ def _make_init():
     }
 
 
-def _make_dataset_with_time(**kwargs):
-    ds = _make_dataset(**kwargs)
-    n = ds.sizes["time"]
-    time = np.datetime64("2020-01-01T00:00:00") + np.arange(n) * np.timedelta64(1, "s")
-    return ds.assign_coords(time=("time", time))
-
-
 def test_fit_cast_time_window_excludes_scans_outside_window():
-    ds = _make_dataset_with_time()
+    ds = _make_dataset()
     init = _make_init()
     ed0_fit = fit_ed0_for_cast(ds, init, time_window=(50.0, 250.0))
     result = fit_cast(ds, init, "LuZ", ed0_fit, time_window=(50.0, 250.0))
@@ -82,7 +78,7 @@ def test_fit_cast_time_window_excludes_scans_outside_window():
 
 
 def test_fit_cast_no_time_window_keeps_full_range():
-    ds = _make_dataset_with_time()
+    ds = _make_dataset()
     init = _make_init()
     ed0_fit = fit_ed0_for_cast(ds, init)
     result = fit_cast(ds, init, "LuZ", ed0_fit)

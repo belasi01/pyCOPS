@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 import xarray as xr
 
@@ -46,7 +47,9 @@ def _make_dataset(n=300, ed0_level=100.0):
             "LuZ_Depth": ("time", sensor_depth),
             "LuZ_Temp": ("time", np.full(n, 10.0)),
         },
-        coords={"time": np.arange(n), "wavelength": waves},
+        # Real datetime64 time, not a bare scan index -- process_cast()'s Ed0 fit needs real
+        # elapsed time for correction_smoothed's own time-domain LOESS fit.
+        coords={"time": pd.date_range("2020-01-01T00:00:00", periods=n, freq="s"), "wavelength": waves},
     )
 
 

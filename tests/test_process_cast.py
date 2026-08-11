@@ -45,7 +45,11 @@ def _make_dataset(n=300, ed0_level=100.0, include_edz=True):
             np.array(EDZ_X0_TRUE)[None, :] * np.exp(-K[None, :] * edz_true_depth[:, None]),
         )
 
-    return xr.Dataset(data_vars, coords={"time": np.arange(n), "wavelength": waves})
+    # Real datetime64 time, not a bare scan index -- fit_ed0_for_cast() needs real elapsed time
+    # for correction_smoothed's own time-domain LOESS fit (see ed0.py's docstring for why depth
+    # alone isn't a safe stand-in for time across a whole profile).
+    times = pd.date_range("2020-01-01T00:00:00", periods=n, freq="s")
+    return xr.Dataset(data_vars, coords={"time": times, "wavelength": waves})
 
 
 def _make_init():
@@ -65,15 +69,8 @@ def _make_init():
     }
 
 
-def _make_dataset_with_time(**kwargs):
-    ds = _make_dataset(**kwargs)
-    n = ds.sizes["time"]
-    time = np.datetime64("2020-01-01T00:00:00") + np.arange(n) * np.timedelta64(1, "s")
-    return ds.assign_coords(time=("time", time))
-
-
 def test_process_cast_resolves_time_window_from_ds_attrs():
-    ds = _make_dataset_with_time()
+    ds = _make_dataset()
     ds.attrs["time_window"] = (50.0, 250.0)
     result = process_cast(ds, _make_init())
 
@@ -83,7 +80,7 @@ def test_process_cast_resolves_time_window_from_ds_attrs():
 
 
 def test_process_cast_falls_back_to_init_time_window_when_ds_attrs_unset():
-    ds = _make_dataset_with_time()
+    ds = _make_dataset()
     init = _make_init()
     init["time.window"] = [50.0, 250.0]
     result = process_cast(ds, init)
@@ -94,7 +91,7 @@ def test_process_cast_falls_back_to_init_time_window_when_ds_attrs_unset():
 
 
 def test_process_cast_ds_attrs_time_window_overrides_init_default():
-    ds = _make_dataset_with_time()
+    ds = _make_dataset()
     ds.attrs["time_window"] = (0.0, 299.0)  # per-cast override: keep (almost) everything
     init = _make_init()
     init["time.window"] = [50.0, 250.0]  # deployment default would exclude the edges
@@ -110,9 +107,9 @@ def test_process_cast_applies_info_cops_dat_sub_surface_removed_layer_override()
     init = _make_init()
     init["instruments.optics"] = ("Ed0", "LuZ")
 
-    baseline = process_cast(_make_dataset_with_time(include_edz=False), init)
+    baseline = process_cast(_make_dataset(include_edz=False), init)
 
-    overridden_ds = _make_dataset_with_time(include_edz=False)
+    overridden_ds = _make_dataset(include_edz=False)
     overridden_ds.attrs["sub_surface_removed_layer"] = [0.0, 4.0]  # Ed0, LuZ -- default LuZ is 0.0
     overridden = process_cast(overridden_ds, init)
 
@@ -203,7 +200,7 @@ def test_process_cast_par_u_profile_none_without_luz_or_euz():
             "EdZ_Pitch": ("time", np.zeros(300)),
             "LuZ_Depth": ("time", np.linspace(0.05, 6.0, 300)),
         },
-        coords={"time": np.arange(300), "wavelength": np.array(WAVES)},
+        coords={"time": pd.date_range("2020-01-01T00:00:00", periods=300, freq="s"), "wavelength": np.array(WAVES)},
     )
 
     result = process_cast(ds, _make_init())
@@ -261,6 +258,51 @@ def test_process_cast_no_excluded_wavelengths_by_default():
     assert np.all(np.isfinite(result.rrs_loess.rrs_0p[2:]))
 
 
+def test_process_cast_ed0_correction_method_defaults_to_raw():
+    ds = _make_dataset()
+    result = process_cast(ds, _make_init())
+
+    assert result.ed0_correction_method == "raw"
+    assert result.ed0_fit.method == "raw"
+
+
+def test_process_cast_ed0_correction_method_param_overrides_init_default():
+    ds = _make_dataset()
+    result = process_cast(ds, _make_init(), ed0_correction_method="smoothed")
+
+    assert result.ed0_correction_method == "smoothed"
+    assert result.ed0_fit.method == "smoothed"
+
+
+def test_process_cast_ed0_correction_method_falls_back_to_init_default():
+    ds = _make_dataset()
+    init = _make_init()
+    init["ed0.correction.method"] = "smoothed"
+    result = process_cast(ds, init)
+
+    assert result.ed0_correction_method == "smoothed"
+
+
+def test_process_cast_ed0_correction_method_param_wins_over_init_default():
+    ds = _make_dataset()
+    init = _make_init()
+    init["ed0.correction.method"] = "smoothed"
+    result = process_cast(ds, init, ed0_correction_method="raw")
+
+    assert result.ed0_correction_method == "raw"
+
+
+def test_process_cast_ed0_correction_method_does_not_change_ed0_value_at_0():
+    """The surface reference (Ed0.0p) -- and therefore Rrs -- only ever depends on the LOESS
+    fit's value at the surface, never on which correction denominator is used; only the
+    per-scan correction applied to EdZ/LuZ/EuZ should differ between the two methods."""
+    ds = _make_dataset()
+    raw_result = process_cast(ds, _make_init(), ed0_correction_method="raw")
+    smoothed_result = process_cast(ds, _make_init(), ed0_correction_method="smoothed")
+
+    np.testing.assert_allclose(raw_result.ed0_fit.value_at_0, smoothed_result.ed0_fit.value_at_0)
+
+
 def test_process_cast_rrs_none_without_luz():
     ds = xr.Dataset(
         {
@@ -272,7 +314,7 @@ def test_process_cast_rrs_none_without_luz():
             "EdZ_Pitch": ("time", np.zeros(300)),
             "LuZ_Depth": ("time", np.linspace(0.05, 6.0, 300)),
         },
-        coords={"time": np.arange(300), "wavelength": np.array(WAVES)},
+        coords={"time": pd.date_range("2020-01-01T00:00:00", periods=300, freq="s"), "wavelength": np.array(WAVES)},
     )
 
     result = process_cast(ds, _make_init())
@@ -610,6 +652,35 @@ def test_process_cast_euz_only_shadow_corrected_before_q_division():
     np.testing.assert_allclose(result.rrs_linear.rrs_0p, expected.rrs_0p, equal_nan=True)
 
 
+def test_process_cast_empirical_q_factor_computed_when_both_luz_and_euz_present():
+    ds = _make_euz_dataset()
+    ds["LuZ"] = ds["EuZ"]  # both present -- same pattern as test_process_cast_rrs_source_is_luz_when_both_present
+    result = process_cast(ds, _make_init_euz_only())
+
+    assert result.q_factor_loess is not None
+    assert result.q_factor_linear is not None
+    luz_fit = result.instrument_fits["LuZ"]
+    euz_fit = result.instrument_fits["EuZ"]
+    # no chl_flag/position on this fixture -- shadow correction is skipped, so the empirical
+    # Q-factor should reduce to a bare ratio of the two fits' own surface-extrapolated values.
+    np.testing.assert_allclose(
+        result.q_factor_loess, euz_fit.value_at_0 / luz_fit.value_at_0, equal_nan=True
+    )
+    np.testing.assert_allclose(
+        result.q_factor_linear,
+        euz_fit.surface_linear.value_at_surface / luz_fit.surface_linear.value_at_surface,
+        equal_nan=True,
+    )
+
+
+def test_process_cast_empirical_q_factor_none_when_only_one_instrument_present():
+    ds = _make_euz_dataset()  # EuZ + EdZ, no LuZ
+    result = process_cast(ds, _make_init_euz_only())
+
+    assert result.q_factor_loess is None
+    assert result.q_factor_linear is None
+
+
 def test_process_cast_euz_only_positive_chl_leaves_rrs_none():
     ds = _make_euz_dataset()
     ds.attrs["chl_flag"] = 2.5  # real chlorophyll concentration -- Q factor not ported
@@ -663,7 +734,7 @@ def test_process_cast_qwip_none_without_rrs():
             "EdZ_Pitch": ("time", np.zeros(300)),
             "LuZ_Depth": ("time", np.linspace(0.05, 6.0, 300)),
         },
-        coords={"time": np.arange(300), "wavelength": np.array(WAVES)},
+        coords={"time": pd.date_range("2020-01-01T00:00:00", periods=300, freq="s"), "wavelength": np.array(WAVES)},
     )
 
     result = process_cast(ds, _make_init())

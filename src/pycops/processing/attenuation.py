@@ -38,23 +38,25 @@ def compute_K(
     return KZ, K0
 
 
-def kd_at_light_fraction(
+def depth_at_light_fraction(
     fitted_profile: np.ndarray,
     depth_grid: np.ndarray,
     ed0_subsurface: np.ndarray,
     fraction: float,
 ) -> np.ndarray:
-    """Mean diffuse attenuation from the surface down to the depth where light has attenuated
-    to ``fraction`` of its subsurface value (e.g. 0.01/0.1 for the 1%/10% light levels, or
-    ``1/e`` for the penetration depth), one value per wavelength.
+    """The depth where light has attenuated to ``fraction`` of its subsurface value (e.g.
+    0.01/0.1 for the 1%/10% light levels, or ``1/e`` for the penetration depth), one value per
+    wavelength -- the crossing depth ``z`` that :func:`kd_at_light_fraction` derives ``Kd`` from,
+    exposed directly for display purposes (e.g. annotating a PAR-vs-depth plot with the actual
+    depth of each light level, not just its attenuation coefficient).
 
     Port of ``generate.cops.DB.R``'s inline spline-based depth search (``z1``/``z10``/``zpd``):
     for each wavelength, the fraction of subsurface light remaining at each grid depth
     (``fitted_profile / ed0_subsurface``, NaN treated as 0 -- matches R's
     ``percentEdZ[is.na(percentEdZ)] <- 0``) is inverted to find the depth ``z`` where it equals
-    ``fraction``, then ``Kd = -ln(fraction) / z``. Uses ``np.interp`` rather than R's ``spline()``
-    since only a single crossing depth is needed, not a smooth curve -- matching this module's own
-    depth-axis convention (:func:`compute_K` also works directly off ``depth_grid``, no spline).
+    ``fraction``. Uses ``np.interp`` rather than R's ``spline()`` since only a single crossing
+    depth is needed, not a smooth curve -- matching this module's own depth-axis convention
+    (:func:`compute_K` also works directly off ``depth_grid``, no spline).
 
     Unlike R's ``spline()``, ``np.interp`` never extrapolates -- it clips to the nearest measured
     depth instead of continuing past it. So when ``fraction`` falls outside the profile's own
@@ -84,4 +86,21 @@ def kd_at_light_fraction(
         z[i] = np.interp(fraction, xp, depth_grid[::-1])
     z[(z < 0) | (z > depth_grid.max())] = np.nan
 
+    return z
+
+
+def kd_at_light_fraction(
+    fitted_profile: np.ndarray,
+    depth_grid: np.ndarray,
+    ed0_subsurface: np.ndarray,
+    fraction: float,
+) -> np.ndarray:
+    """Mean diffuse attenuation from the surface down to the depth where light has attenuated
+    to ``fraction`` of its subsurface value (e.g. 0.01/0.1 for the 1%/10% light levels, or
+    ``1/e`` for the penetration depth), one value per wavelength -- ``Kd = -ln(fraction) / z``,
+    where ``z`` is :func:`depth_at_light_fraction`'s own crossing depth. Port of
+    ``generate.cops.DB.R``'s inline spline-based depth search (``z1``/``z10``/``zpd``); see
+    :func:`depth_at_light_fraction`'s docstring for the crossing-depth search itself.
+    """
+    z = depth_at_light_fraction(fitted_profile, depth_grid, ed0_subsurface, fraction)
     return -np.log(fraction) / z

@@ -6,11 +6,14 @@ import pytest
 from conftest import INFO_COPS_DAT, INIT_COPS_DAT
 from pycops.io.config import (
     absorption_for_cast,
+    default_init_cops_params,
+    format_init_cops_dat,
     read_absorption_cops,
     read_info_cops,
     read_init_cops,
     update_cast_info,
     update_time_window,
+    write_init_cops,
 )
 
 
@@ -92,6 +95,47 @@ def test_read_init_cops_does_not_override_present_windspeed(tmp_path):
     params = read_init_cops(path)
 
     assert params["windspeed_ms"] == 9.8
+
+
+def test_read_init_cops_parses_ed0_correction_method(tmp_path):
+    content = INIT_COPS_DAT + "ed0.correction.method;character;smoothed\n"
+    path = tmp_path / "init.cops.dat"
+    path.write_text(content)
+
+    params = read_init_cops(path)
+
+    assert params["ed0.correction.method"] == "smoothed"
+
+
+def test_read_init_cops_defaults_missing_ed0_correction_method(tmp_path):
+    # Real init.cops.dat files predate this pycops-only field entirely.
+    path = tmp_path / "init.cops.dat"
+    path.write_text(INIT_COPS_DAT)
+
+    with pytest.warns(UserWarning, match="ed0.correction.method"):
+        params = read_init_cops(path)
+
+    assert params["ed0.correction.method"] == "raw"
+
+
+def test_default_init_cops_params_round_trips_ed0_correction_method(tmp_path):
+    params = default_init_cops_params(["Ed0", "EdZ", "LuZ", "EuZ"])
+    assert params["ed0.correction.method"] == "raw"
+
+    path = tmp_path / "init.cops.dat"
+    write_init_cops(path, params)
+    reread = read_init_cops(path)
+
+    assert reread["ed0.correction.method"] == "raw"
+
+
+def test_format_init_cops_dat_writes_ed0_correction_method_line(tmp_path):
+    params = default_init_cops_params(["Ed0", "EdZ", "LuZ", "EuZ"])
+    params["ed0.correction.method"] = "smoothed"
+
+    text = format_init_cops_dat(params)
+
+    assert "ed0.correction.method;character;smoothed" in text
 
 
 def test_read_info_cops(tmp_path):

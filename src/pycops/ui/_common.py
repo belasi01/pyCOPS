@@ -197,3 +197,74 @@ def _directory_input(label: str, key: str, default: str = "") -> str:
         with st.popover("📁 Browse"):
             _directory_browser(key, chosen_key)
     return value
+
+
+def _list_files(directory: Path, filter_name: str | None = None) -> list[str]:
+    try:
+        names = sorted(p.name for p in directory.iterdir() if p.is_file() and not p.name.startswith("."))
+    except (PermissionError, OSError):
+        return []
+    return [n for n in names if n == filter_name] if filter_name else names
+
+
+def _file_browser(key: str, chosen_key: str, filter_name: str | None = None) -> None:
+    """An in-app file browser (see :func:`_directory_browser`, same design) -- folders to navigate
+    into, plus files in the current folder as pick targets. ``filter_name``, if given (e.g.
+    ``"init.cops.dat"``), only lists files with that exact name, since these config files always
+    use one fixed, well-known name rather than an arbitrary one a glob pattern would be needed for.
+    """
+    browse_key = f"{key}_browse_path"
+    # Falls back to the paired text input's own value (its parent folder, if it already points at
+    # a file) before the project-wide root and finally the home directory -- same "start from
+    # what's already there" precedent as _directory_browser.
+    existing_value = st.session_state.get(key)
+    existing_parent = str(Path(existing_value).parent) if existing_value and Path(existing_value).is_file() else None
+    current = (
+        st.session_state.get(browse_key)
+        or existing_parent
+        or st.session_state.get("project_root_dir")
+        or str(Path.home())
+    )
+    current_path = Path(current) if current else Path.home()
+    if not current_path.is_dir():
+        current_path = Path.home()
+
+    st.caption(f"📂 {current_path}")
+
+    if st.button("⬆️ Parent folder", key=f"{key}_up", disabled=current_path.parent == current_path):
+        st.session_state[browse_key] = str(current_path.parent)
+        st.rerun()
+
+    subdirs = _list_subdirs(current_path)
+    if not subdirs:
+        st.caption("(no subfolders)")
+    for sub in subdirs:
+        if st.button(f"📁 {sub}", key=f"{key}_sub_{sub}", use_container_width=True):
+            st.session_state[browse_key] = str(current_path / sub)
+            st.rerun()
+
+    st.divider()
+    files = _list_files(current_path, filter_name)
+    if not files:
+        st.caption(f"(no {filter_name!r} file here)" if filter_name else "(no files here)")
+    for f in files:
+        if st.button(f"📄 {f}", key=f"{key}_file_{f}", use_container_width=True, type="primary"):
+            st.session_state[chosen_key] = str(current_path / f)
+            st.session_state.pop(browse_key, None)
+            st.rerun()
+
+
+def _file_input(label: str, key: str, *, filter_name: str | None = None, default: str = "") -> str:
+    """A text input paired with a popover-based in-app file browser (see :func:`_file_browser`)."""
+    chosen_key = f"{key}_chosen"
+    if chosen_key in st.session_state:
+        st.session_state[key] = st.session_state.pop(chosen_key)
+
+    col_text, col_button = st.columns([5, 1])
+    with col_text:
+        value = st.text_input(label, value=default, key=key)
+    with col_button:
+        st.write("")  # vertical spacer, roughly aligns the popover button with the text field
+        with st.popover("📁 Browse"):
+            _file_browser(key, chosen_key, filter_name=filter_name)
+    return value

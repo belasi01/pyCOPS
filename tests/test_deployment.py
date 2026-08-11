@@ -246,6 +246,39 @@ def test_reprocess_single_cast_applies_saved_wavelength_exclusions(tmp_path, mon
     assert np.isnan(reprocessed.result.rrs_linear.rrs_0p[1])
 
 
+def test_process_deployment_applies_saved_ed0_correction_method(tmp_path, monkeypatch):
+    from pycops.io.ed0_correction import update_ed0_correction_method
+
+    deployment = _make_deployment(tmp_path)
+    datasets = {
+        PROFILE_CAST: _with_position_attrs(_with_real_time(_make_profile_dataset()), 999.0),
+        BIOSHADE_CAST: _make_bioshade_dataset(),
+    }
+    _patch_discovery(monkeypatch, deployment, datasets)
+    update_ed0_correction_method(tmp_path / "ed0_correction_method.cops.dat", PROFILE_CAST, "smoothed")
+
+    result = process_deployment(tmp_path)
+
+    assert result.cast_results[PROFILE_CAST].ed0_correction_method == "smoothed"
+
+
+def test_reprocess_single_cast_applies_saved_ed0_correction_method(tmp_path, monkeypatch):
+    from pycops.io.ed0_correction import update_ed0_correction_method
+
+    deployment = _make_deployment(tmp_path)
+    datasets = {
+        PROFILE_CAST: _with_position_attrs(_with_real_time(_make_profile_dataset()), 999.0),
+        BIOSHADE_CAST: _make_bioshade_dataset(),
+    }
+    monkeypatch.setattr(deployment_module, "discover_deployment", lambda directory: deployment)
+    monkeypatch.setattr(deployment_module, "read_one_cast", lambda record, init: datasets[record.info.file])
+    update_ed0_correction_method(tmp_path / "ed0_correction_method.cops.dat", PROFILE_CAST, "smoothed")
+
+    reprocessed = reprocess_single_cast(tmp_path, PROFILE_CAST)
+
+    assert reprocessed.result.ed0_correction_method == "smoothed"
+
+
 def test_reprocess_single_cast_unknown_file_raises(tmp_path, monkeypatch):
     deployment = _make_deployment(tmp_path)
     monkeypatch.setattr(deployment_module, "discover_deployment", lambda directory: deployment)
@@ -326,6 +359,75 @@ def test_process_deployment_isolates_one_bad_cast(tmp_path, monkeypatch):
     assert any(f.file == PROFILE_CAST for f in result.processing_failures)
     # the BioShade cast itself still processed fine
     assert BIOSHADE_CAST in result.bioshade_results
+
+    # the log carries a full traceback for the failure -- not just the short summary that
+    # reaches the UI/CastProcessingFailure.error (see log_utils.py: motivated by a real cast
+    # whose only surfaced error, "ValueError: `x` must contain at least 2 elements.", gave no
+    # clue what actually failed).
+    log_text = (tmp_path / "nc" / "processing.log").read_text()
+    assert f"{PROFILE_CAST}: processing failed" in log_text
+    assert "Traceback (most recent call last)" in log_text
+
+
+def test_process_deployment_writes_processing_log_with_cast_summary(tmp_path, monkeypatch):
+    deployment = _make_deployment(tmp_path)
+    datasets = {
+        PROFILE_CAST: _with_position_attrs(_with_real_time(_make_profile_dataset()), 999.0),
+        BIOSHADE_CAST: _make_bioshade_dataset(),
+    }
+    _patch_discovery(monkeypatch, deployment, datasets)
+
+    process_deployment(tmp_path)
+
+    log_path = tmp_path / "nc" / "processing.log"
+    assert log_path.exists()
+    log_text = log_path.read_text()
+    assert "Processing deployment" in log_text
+    assert f"Processing BioShade cast {BIOSHADE_CAST}" in log_text
+    assert f"Processing cast {PROFILE_CAST}" in log_text
+    assert f"{PROFILE_CAST}: fitted instruments" in log_text
+    assert f"{PROFILE_CAST}: Rrs source=" in log_text
+    assert "Deployment done" in log_text
+
+
+def test_process_deployment_truncates_log_on_each_full_run(tmp_path, monkeypatch):
+    deployment = _make_deployment(tmp_path)
+    datasets = {
+        PROFILE_CAST: _with_position_attrs(_with_real_time(_make_profile_dataset()), 999.0),
+        BIOSHADE_CAST: _make_bioshade_dataset(),
+    }
+    _patch_discovery(monkeypatch, deployment, datasets)
+
+    process_deployment(tmp_path)
+    process_deployment(tmp_path)
+    log_text = (tmp_path / "nc" / "processing.log").read_text()
+
+    # a fresh full-deployment run starts a clean log, not an ever-growing one -- two runs still
+    # leave exactly one run's worth of content, not two concatenated.
+    assert log_text.count("Processing deployment") == 1
+    assert log_text.count("Deployment done") == 1
+
+
+def test_reprocess_single_cast_appends_to_existing_processing_log(tmp_path, monkeypatch):
+    deployment = _make_deployment(tmp_path)
+    datasets = {
+        PROFILE_CAST: _with_position_attrs(_with_real_time(_make_profile_dataset()), 999.0),
+        BIOSHADE_CAST: _make_bioshade_dataset(),
+    }
+    _patch_discovery(monkeypatch, deployment, datasets)
+    monkeypatch.setattr(deployment_module, "read_one_cast", lambda record, init: datasets[record.info.file])
+
+    process_deployment(tmp_path)  # first, a full run -- establishes the station's log history
+    reprocess_single_cast(tmp_path, PROFILE_CAST)
+
+    log_text = (tmp_path / "nc" / "processing.log").read_text()
+    # both the original full-deployment run's own log AND the single-cast reprocess's log are
+    # present -- a single-cast reprocess must not wipe out the rest of the station's history.
+    assert "Processing deployment" in log_text
+    assert f"Reprocessing cast {PROFILE_CAST}" in log_text
+    assert log_text.count(f"Processing cast {PROFILE_CAST}") + log_text.count(
+        f"Reprocessing cast {PROFILE_CAST}"
+    ) == 2
 
 
 def test_process_deployment_propagates_read_failures(tmp_path, monkeypatch):

@@ -46,12 +46,21 @@ class QWIPResult:
     fu: int  # Forel-Ule class, 1-21 (see pycops.processing.color.forel_ule_class)
 
 
-def compute_qwip(waves: np.ndarray, rrs: np.ndarray) -> QWIPResult:
-    """QWIP quality-control score for an ``Rrs`` spectrum, port of ``QWIP.R``'s scoring logic."""
+def compute_qwip(waves: np.ndarray, rrs: np.ndarray) -> QWIPResult | None:
+    """QWIP quality-control score for an ``Rrs`` spectrum, port of ``QWIP.R``'s scoring logic.
+
+    Returns ``None`` when fewer than 2 wavelengths have a finite ``Rrs`` value -- a real case on
+    real data (e.g. a cast whose linear surface fit only passed its R2/KS gate at one wavelength),
+    not just a synthetic edge case: ``CubicSpline`` needs at least 2 points and previously crashed
+    the whole cast's processing here, even though the caller (``process_cast()``) only ever
+    checked for *at least one* finite value before calling this.
+    """
     waves = np.asarray(waves, dtype=float)
     rrs = np.asarray(rrs, dtype=float)
     finite = np.isfinite(rrs)
     waves, rrs = waves[finite], rrs[finite]
+    if len(waves) < 2:
+        return None
 
     order = np.argsort(waves)
     spline = CubicSpline(waves[order], rrs[order], bc_type="natural")
