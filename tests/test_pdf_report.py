@@ -20,6 +20,8 @@ from pycops.io.pdf_report import (
     build_ed0_stability_figure,
     build_extrapolation_grid_figure,
     build_par_kd_par_figures,
+    build_penetration_depth_comparison_figure,
+    build_penetration_depth_figure,
     build_qfactor_figure,
     build_rrs_figure,
     build_spectral_kd_figure,
@@ -570,6 +572,73 @@ def test_build_spectral_kd_figure_has_side_by_side_linear_and_log_axes_with_thre
     assert scales == {"linear", "log"}
     for ax in fig.axes:
         assert len(ax.lines) == 3  # kd_1pct, kd_10pct, kd_pd
+    plt.close(fig)
+
+
+def test_build_penetration_depth_figure_none_without_pd_depth_var():
+    nc = xr.Dataset(coords={"wavelength": np.array([400.0, 500.0])})
+
+    assert build_penetration_depth_figure(nc) is None
+
+
+def test_build_penetration_depth_figure_none_when_all_nan():
+    nc = xr.Dataset(
+        {"pd_depth": ("wavelength", np.array([np.nan, np.nan]))},
+        coords={"wavelength": np.array([400.0, 500.0])},
+    )
+
+    assert build_penetration_depth_figure(nc) is None
+
+
+def test_build_penetration_depth_figure_inverted_axis_with_true_color_markers():
+    ds = _make_minimal_dataset()  # LuZ+EdZ -- pd_depth only needs EdZ
+    nc = _make_nc(ds, _make_minimal_init())
+
+    fig = build_penetration_depth_figure(nc)
+
+    assert fig is not None
+    ax = fig.axes[0]
+    ylim = ax.get_ylim()
+    assert ylim[0] > ylim[1]  # inverted -- depth 0 at the top
+    scatter_collections = [c for c in ax.collections if hasattr(c, "get_facecolors")]
+    assert len(scatter_collections) == 1
+    face_colors = scatter_collections[0].get_facecolors()
+    assert face_colors.shape[0] == len(nc["wavelength"].values)
+    plt.close(fig)
+
+
+def _write_penetration_depth_station_nc(nc_dir, stem, waves, depths):
+    nc_dir.mkdir(parents=True, exist_ok=True)
+    xr.Dataset(
+        {"pd_depth": ("wavelength", np.asarray(depths, dtype=float))},
+        coords={"wavelength": np.asarray(waves, dtype=float)},
+    ).to_netcdf(nc_dir / f"{stem}.nc")
+
+
+def test_build_penetration_depth_comparison_figure_none_without_nc_dir(tmp_path):
+    assert build_penetration_depth_comparison_figure(tmp_path) is None
+
+
+def test_build_penetration_depth_comparison_figure_none_without_kept_data(tmp_path):
+    (tmp_path / "nc").mkdir()
+    assert build_penetration_depth_comparison_figure(tmp_path) is None
+
+
+def test_build_penetration_depth_comparison_figure_one_line_style_per_cast(tmp_path):
+    waves = [443.0, 555.0, 665.0]
+    _write_penetration_depth_station_nc(tmp_path / "nc", "CAST_001", waves, [4.0, 6.0, 2.0])
+    _write_penetration_depth_station_nc(tmp_path / "nc", "CAST_002", waves, [5.0, 7.0, 2.5])
+
+    fig = build_penetration_depth_comparison_figure(tmp_path)
+
+    assert fig is not None
+    ax = fig.axes[0]
+    ylim = ax.get_ylim()
+    assert ylim[0] > ylim[1]  # inverted -- depth 0 at the top
+    assert len(ax.lines) == 2  # one line (style) per cast
+    assert ax.lines[0].get_linestyle() != ax.lines[1].get_linestyle()
+    scatter_collections = [c for c in ax.collections if hasattr(c, "get_facecolors")]
+    assert len(scatter_collections) == 2  # one true-color scatter per cast
     plt.close(fig)
 
 

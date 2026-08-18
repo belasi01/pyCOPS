@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from pycops.processing.color import forel_ule_class
+from pycops.processing.color import forel_ule_class, wavelength_to_rgb
 
 WAVES = np.array([340, 380, 412, 443, 490, 510, 555, 620, 665, 683, 780], dtype=float)
 
@@ -31,3 +31,30 @@ def test_forel_ule_class_ignores_nan_wavelengths():
 
     result = forel_ule_class(WAVES, rrs_with_nan)
     assert result.fu == CASES[0][3]
+
+
+def test_wavelength_to_rgb_matches_expected_hue_at_recognizable_bands():
+    rgb = wavelength_to_rgb(np.array([465.0, 532.0, 665.0]))
+
+    blue, green, red = rgb
+    assert blue[2] > blue[0] and blue[2] > blue[1]  # 465 nm: blue channel dominates
+    assert green[1] > green[0] and green[1] > green[2]  # 532 nm: green channel dominates
+    assert red[0] > red[1] and red[0] > red[2]  # 665 nm: red channel dominates
+    assert np.all((rgb >= 0.0) & (rgb <= 1.0))
+
+
+def test_wavelength_to_rgb_gray_outside_visible_range():
+    rgb = wavelength_to_rgb(np.array([305.0, 875.0]))
+
+    for swatch in rgb:
+        assert swatch[0] == swatch[1] == swatch[2]  # a neutral gray, not a fabricated hue
+
+
+def test_wavelength_to_rgb_stays_in_unit_range_across_the_full_cops_band_set():
+    waves = np.array([305, 313, 320, 330, 340, 380, 395, 412, 443, 465, 490, 510, 532, 555, 589, 625, 665, 683, 780, 875], dtype=float)
+
+    rgb = wavelength_to_rgb(waves)
+
+    assert rgb.shape == (len(waves), 3)
+    assert np.all(np.isfinite(rgb))
+    assert np.all((rgb >= 0.0) & (rgb <= 1.0))

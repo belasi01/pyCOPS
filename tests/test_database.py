@@ -10,6 +10,7 @@ from pycops.processing.database import (
     aggregate_station,
     assemble_mission_database,
     build_mission_database,
+    trim_unused_wavelengths,
 )
 
 WAVES = np.array([443.0, 555.0])
@@ -32,18 +33,19 @@ def _write_fake_nc(
     kd_par_1pct=None,
     kd_par_10pct=None,
     kd_par_pd=None,
+    pd_depth=None,
 ):
     """A minimal, hand-built .nc matching just the fields aggregate_station() reads -- avoids
     needing a full synthetic radiometric profile through process_cast() for every test case,
     and lets each test assert exact, hand-computed mean/sd values."""
     time = time if time is not None else pd.date_range("2019-08-17T12:00:00", periods=3, freq="s")
-    ds = xr.Dataset(
-        {
-            "rrs_0p_recommended": ("wavelength", np.asarray(rrs, dtype=float)),
-            "ed0_value_at_0": ("wavelength", np.asarray(ed0, dtype=float)),
-        },
-        coords={"wavelength": waves, "time": time},
-    )
+    data_vars = {
+        "rrs_0p_recommended": ("wavelength", np.asarray(rrs, dtype=float)),
+        "ed0_value_at_0": ("wavelength", np.asarray(ed0, dtype=float)),
+    }
+    if pd_depth is not None:
+        data_vars["pd_depth"] = ("wavelength", np.asarray(pd_depth, dtype=float))
+    ds = xr.Dataset(data_vars, coords={"wavelength": waves, "time": time})
     fu_label = "linear" if method == "Rrs.0p.linear" else "loess"
     ds.attrs["rrs_method"] = method
     ds.attrs[f"qwip_{fu_label}_fu"] = fu
@@ -94,6 +96,29 @@ def test_aggregate_station_mean_sd_matches_manual_computation(tmp_path):
     np.testing.assert_allclose(result.rrs.sd[[i443, i555]], [np.std([1.0, 2.0], ddof=1), np.std([10.0, 20.0], ddof=1)])
     np.testing.assert_allclose(result.ed0_0p.mean[[i443, i555]], [105.0, 205.0])
     assert result.station_id == "ABC"
+
+
+def test_aggregate_station_computes_pd_depth_mean_sd(tmp_path):
+    """pd_depth (the penetration-depth crossing depth itself, meters -- distinct from kd_pd's
+    derived attenuation coefficient) is aggregated the same way as every other per-wavelength
+    metric."""
+    directory = tmp_path / "20200101_StationPD" / "cops"
+    _make_station(
+        directory,
+        {
+            "CAST_001": dict(rrs=[1.0, 10.0], ed0=[100.0, 200.0], pd_depth=[2.0, 3.0]),
+            "CAST_002": dict(rrs=[2.0, 20.0], ed0=[110.0, 210.0], pd_depth=[2.4, 3.6]),
+        },
+    )
+
+    result = aggregate_station(directory)
+
+    i443 = list(STANDARD_WAVELENGTHS).index(443)
+    i555 = list(STANDARD_WAVELENGTHS).index(555)
+    np.testing.assert_allclose(result.pd_depth.mean[[i443, i555]], [2.2, 3.3])
+    np.testing.assert_allclose(
+        result.pd_depth.sd[[i443, i555]], [np.std([2.0, 2.4], ddof=1), np.std([3.0, 3.6], ddof=1)]
+    )
 
 
 def test_aggregate_station_computes_scalar_par_kd_par_mean_sd(tmp_path):
@@ -220,6 +245,45 @@ def test_build_mission_database_drops_wavelengths_missing_everywhere(tmp_path):
     assert 555.0 not in db.waves
     assert 443.0 in db.waves
     assert db.stations[0].rrs.mean.shape == db.waves.shape
+
+
+def test_trim_unused_wavelengths_keeps_a_band_present_in_only_one_station(tmp_path):
+    """Regression test: two real COPS instrument systems carry genuinely different fixed
+    wavelength sets (confirmed on real WISEMan vs. AlgaeWISE data -- one has 395/560 nm but not
+    555/875, the other has 555/875 but not 395/560). A band must be kept in the shared comparison
+    grid as long as *any* selected station has real data there -- dropping it just because one
+    station lacks it would silently erase that station's own real spectrum."""
+    station_with_443 = tmp_path / "20200101_StationA" / "cops"
+    _make_station(station_with_443, {"CAST_001": dict(rrs=[1.0, np.nan], ed0=[100.0, np.nan])})
+    station_with_555 = tmp_path / "20200101_StationB" / "cops"
+    _make_station(station_with_555, {"CAST_001": dict(rrs=[np.nan, 2.0], ed0=[np.nan, 100.0])})
+    stations = [aggregate_station(station_with_443), aggregate_station(station_with_555)]
+
+    waves, trimmed = trim_unused_wavelengths(stations)
+
+    assert 443.0 in waves
+    assert 555.0 in waves
+    for station in trimmed:
+        assert station.rrs.mean.shape == waves.shape
+
+
+def test_trim_unused_wavelengths_drops_a_band_absent_from_every_station(tmp_path):
+    directory = tmp_path / "20200101_StationOneBand" / "cops"
+    _make_station(directory, {"CAST_001": dict(rrs=[1.0, np.nan], ed0=[100.0, np.nan])})
+    stations = [aggregate_station(directory)]
+
+    waves, trimmed = trim_unused_wavelengths(stations)
+
+    assert 443.0 in waves
+    assert 555.0 not in waves
+    assert trimmed[0].rrs.mean.shape == waves.shape
+
+
+def test_trim_unused_wavelengths_empty_list_returns_full_grid_untouched():
+    waves, stations = trim_unused_wavelengths([])
+
+    np.testing.assert_array_equal(waves, np.asarray(STANDARD_WAVELENGTHS, dtype=float))
+    assert stations == []
 
 
 def test_assemble_mission_database_used_by_ui_for_a_filtered_station_subset(tmp_path):

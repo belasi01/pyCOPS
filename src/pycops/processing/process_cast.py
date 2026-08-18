@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from pycops.processing.attenuation import compute_K, kd_at_light_fraction
+from pycops.processing.attenuation import compute_K, depth_at_light_fraction, kd_at_light_fraction
 from pycops.processing.bioshade import BioShadeResult
 from pycops.processing.bottom import BottomReflectanceResult, compute_bottom_depth, compute_bottom_reflectance
 from pycops.processing.cast_fit import InstrumentFit, fit_cast, fit_ed0_for_cast
@@ -103,6 +103,7 @@ class CastResult:
     kd_1pct: np.ndarray | None  # mean Kd from surface to the 1% light level, EdZ only
     kd_10pct: np.ndarray | None  # mean Kd from surface to the 10% light level
     kd_pd: np.ndarray | None  # mean Kd from surface to the penetration depth (1/e light level)
+    pd_depth: np.ndarray | None  # penetration depth itself (m, the 1/e crossing depth), not Kd
     par_0: float | None  # broadband PAR (uEin.m-2.s-1) of Ed0's smoothed surface reference
     par_d_profile: np.ndarray | None  # PAR(z), one value per EdZ depth-grid point
     par_u_profile: np.ndarray | None  # PAR(z) from EuZ (or LuZ*Q.sun.nadir), aligned onto EdZ's grid
@@ -530,7 +531,7 @@ def process_cast(
         r0m_loess = ed0_sub.r0m_loess
         r0m_linear = ed0_sub.r0m_linear
 
-    kd_1pct = kd_10pct = kd_pd = None
+    kd_1pct = kd_10pct = kd_pd = pd_depth = None
     if "EdZ" in instrument_fits:
         edz_fit = instrument_fits["EdZ"]
         # R's generate.cops.DB.R always uses Ed0.0m (subsurface, diffuse/direct-decomposed); that
@@ -541,6 +542,10 @@ def process_cast(
         kd_1pct = kd_at_light_fraction(edz_fit.aop_fitted, edz_fit.depth_grid, ed0_subsurface, 0.01)
         kd_10pct = kd_at_light_fraction(edz_fit.aop_fitted, edz_fit.depth_grid, ed0_subsurface, 0.1)
         kd_pd = kd_at_light_fraction(edz_fit.aop_fitted, edz_fit.depth_grid, ed0_subsurface, 1 / np.e)
+        # the penetration depth itself (m) -- kd_pd's own crossing depth, not the derived
+        # attenuation coefficient -- for the "what does the satellite see, by color" diagnostic
+        # (build_penetration_depth_figure).
+        pd_depth = depth_at_light_fraction(edz_fit.aop_fitted, edz_fit.depth_grid, ed0_subsurface, 1 / np.e)
 
     par_0 = par_d_profile = par_u_profile = kz_par = k0_par = None
     kd_par_1pct = kd_par_10pct = kd_par_pd = None
@@ -621,6 +626,7 @@ def process_cast(
         kd_1pct=kd_1pct,
         kd_10pct=kd_10pct,
         kd_pd=kd_pd,
+        pd_depth=pd_depth,
         par_0=par_0,
         par_d_profile=par_d_profile,
         par_u_profile=par_u_profile,

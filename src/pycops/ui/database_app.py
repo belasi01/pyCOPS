@@ -16,10 +16,20 @@ import matplotlib.pyplot as plt
 import streamlit as st
 
 from pycops.io.database import write_mission_database_csv, write_mission_database_netcdf
-from pycops.io.database_report import KD_METRIC_LABELS, build_kd_comparison_figure, build_rrs_comparison_figure
+from pycops.io.database_report import (
+    KD_METRIC_LABELS,
+    build_kd_comparison_figure,
+    build_pd_depth_comparison_figure,
+    build_rrs_comparison_figure,
+)
 from pycops.io.discovery import FLAG_BIOSHADE, FLAG_NORMAL, FLAG_UNDER_ICE, find_deployment_folders, read_select_cops
 from pycops.io.seabass import SeaBASSHeaderFields, write_seabass_station_file
-from pycops.processing.database import StationAggregate, aggregate_station, assemble_mission_database
+from pycops.processing.database import (
+    StationAggregate,
+    aggregate_station,
+    assemble_mission_database,
+    trim_unused_wavelengths,
+)
 from pycops.ui._common import _directory_input
 
 _KEPT_FLAGS = (FLAG_NORMAL, FLAG_BIOSHADE, FLAG_UNDER_ICE)
@@ -67,17 +77,21 @@ def _render_station_comparison(checked: list[Path]) -> None:
         st.info("Check at least one station above to compare.")
         return
 
-    kd_label = st.selectbox(
-        "Kd metric", list(KD_METRIC_LABELS.values()), key="database_compare_kd_metric"
-    )
-    kd_metric = next(k for k, label in KD_METRIC_LABELS.items() if label == kd_label)
-
     if st.button(f"Compare {len(checked)} station(s)", key="database_compare_run"):
         stations, failures = _aggregate_checked_stations(checked)
+        # Different COPS instrument systems carry genuinely different fixed wavelength sets --
+        # drop standard-grid bands none of the *selected* stations ever populate (matching R's
+        # own ix.to.remove step, generate.cops.DB.R), rather than showing every comparison figure
+        # with spurious permanently-empty slots. A real gap where some, but not all, selected
+        # stations lack a band still shows as a break in that station's own line -- honest, not
+        # a bug -- see _plot_mean_sd_band.
+        waves, stations = trim_unused_wavelengths(stations)
         st.session_state["database_compare_stations"] = stations
+        st.session_state["database_compare_waves"] = waves
         st.session_state["database_compare_failures"] = failures
 
     stations = st.session_state.get("database_compare_stations")
+    waves = st.session_state.get("database_compare_waves")
     if stations is None:
         return
 
@@ -97,19 +111,30 @@ def _render_station_comparison(checked: list[Path]) -> None:
         hide_index=True,
     )
 
-    rrs_fig = build_rrs_comparison_figure(stations)
+    rrs_fig = build_rrs_comparison_figure(stations, waves=waves)
     if rrs_fig is not None:
         st.subheader("Rrs comparison")
         _show(rrs_fig)
     else:
         st.info("No Rrs data available across the selected stations.")
 
-    kd_fig = build_kd_comparison_figure(stations, metric=kd_metric)
-    if kd_fig is not None:
-        st.subheader(f"{kd_label} comparison")
-        _show(kd_fig)
+    # Always show all three Kd metrics rather than letting the researcher pick just one --
+    # Simon's request, so a station's near-surface vs. deeper-reaching attenuation is never
+    # hidden behind a selector.
+    for metric, label in KD_METRIC_LABELS.items():
+        kd_fig = build_kd_comparison_figure(stations, metric=metric, waves=waves)
+        if kd_fig is not None:
+            st.subheader(f"{label} comparison")
+            _show(kd_fig)
+        else:
+            st.info(f"No {label.lower()} data available across the selected stations.")
+
+    pd_depth_fig = build_pd_depth_comparison_figure(stations, waves=waves)
+    if pd_depth_fig is not None:
+        st.subheader("Penetration depth comparison")
+        _show(pd_depth_fig)
     else:
-        st.info(f"No {kd_label.lower()} data available across the selected stations.")
+        st.info("No penetration depth data available across the selected stations.")
 
 
 def render_database_tab() -> None:

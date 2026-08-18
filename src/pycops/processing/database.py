@@ -82,6 +82,7 @@ class StationAggregate:
     kd_1pct: MeanSd
     kd_10pct: MeanSd
     kd_pd: MeanSd
+    pd_depth: MeanSd  # penetration depth itself (m, the 1/e crossing depth) -- distinct from kd_pd
     ed0_0p: MeanSd
     par_0: ScalarMeanSd  # broadband PAR of Ed0's surface reference (see pycops.processing.par)
     kd_par_1pct: ScalarMeanSd
@@ -174,6 +175,7 @@ def aggregate_station(directory: str | Path) -> StationAggregate:
     kd1_rows: list[np.ndarray] = []
     kd10_rows: list[np.ndarray] = []
     kdpd_rows: list[np.ndarray] = []
+    pd_depth_rows: list[np.ndarray] = []
     ed0_rows: list[np.ndarray] = []
     ed0_diffuse_rows: list[np.ndarray] = []
     dates: list[pd.Timestamp | None] = []
@@ -204,6 +206,9 @@ def aggregate_station(directory: str | Path) -> StationAggregate:
             kd1_rows.append(_match_to_standard_grid(waves_cast, nc["kd_1pct"].values if "kd_1pct" in nc else None))
             kd10_rows.append(_match_to_standard_grid(waves_cast, nc["kd_10pct"].values if "kd_10pct" in nc else None))
             kdpd_rows.append(_match_to_standard_grid(waves_cast, nc["kd_pd"].values if "kd_pd" in nc else None))
+            pd_depth_rows.append(
+                _match_to_standard_grid(waves_cast, nc["pd_depth"].values if "pd_depth" in nc else None)
+            )
 
             rb_values = None
             bottom_depth = None
@@ -263,6 +268,7 @@ def aggregate_station(directory: str | Path) -> StationAggregate:
         kd_1pct = _mean_sd(kd1_rows)
         kd_10pct = _mean_sd(kd10_rows)
         kd_pd = _mean_sd(kdpd_rows)
+        pd_depth = _mean_sd(pd_depth_rows)
         ed0_0p = _mean_sd(ed0_rows)
         par_0 = _scalar_mean_sd(par_0_values)
         kd_par_1pct = _scalar_mean_sd(kd_par_1pct_values)
@@ -287,6 +293,7 @@ def aggregate_station(directory: str | Path) -> StationAggregate:
         kd_1pct=kd_1pct,
         kd_10pct=kd_10pct,
         kd_pd=kd_pd,
+        pd_depth=pd_depth,
         ed0_0p=ed0_0p,
         par_0=par_0,
         kd_par_1pct=kd_par_1pct,
@@ -307,6 +314,7 @@ def _trim_station_waves(station: StationAggregate, keep_mask: np.ndarray) -> Sta
         kd_1pct=_trim(station.kd_1pct),
         kd_10pct=_trim(station.kd_10pct),
         kd_pd=_trim(station.kd_pd),
+        pd_depth=_trim(station.pd_depth),
         ed0_0p=_trim(station.ed0_0p),
         ed0_diffuse_fraction=(
             station.ed0_diffuse_fraction[keep_mask] if station.ed0_diffuse_fraction is not None else None
@@ -314,23 +322,46 @@ def _trim_station_waves(station: StationAggregate, keep_mask: np.ndarray) -> Sta
     )
 
 
+def trim_unused_wavelengths(stations: list[StationAggregate]) -> tuple[np.ndarray, list[StationAggregate]]:
+    """Drop :data:`STANDARD_WAVELENGTHS` bands where every given station's ``Ed0.0p`` is entirely
+    missing (matching ``generate.cops.DB.R``'s own ``ix.to.remove`` step -- ``apply(is.na(Ed0.0p.m),
+    2, all)``, confirmed by reading that R source directly).
+
+    ``Ed0.0p`` (the above-water reference channel) is used as the trim criterion, not Rrs/Kd
+    themselves, because it's present on every COPS deployment regardless of which underwater
+    instruments (EdZ/LuZ/EuZ) that specific instrument system carries -- it's the one metric every
+    station always has *some* value for whenever a wavelength is real for that station's own
+    instrument.
+
+    Different COPS instrument systems carry genuinely different fixed wavelength sets (confirmed
+    on two real deployments: one lacks 395/560 nm but has 555/875 nm, another has 395/560 but not
+    555/875) -- :data:`STANDARD_WAVELENGTHS` is a superset spanning many systems across ~15 years,
+    so *no single* comparison ever populates every band. Only trimming bands unused by *every*
+    station in the current comparison (rather than assuming the full superset is always
+    meaningful) is what keeps a station's own spectrum from showing spurious permanently-empty
+    slots -- a real gap where the *selected* stations simply never share that band still shows as
+    a break in the line (honest, not a bug), but a column no station in the whole mission ever
+    populates is dropped outright rather than cluttering every figure with it.
+    """
+    waves = np.asarray(STANDARD_WAVELENGTHS, dtype=float)
+    if not stations:
+        return waves, stations
+    all_ed0 = np.asarray([s.ed0_0p.mean for s in stations])
+    keep_mask = ~np.all(np.isnan(all_ed0), axis=0)
+    if keep_mask.all():
+        return waves, stations
+    return waves[keep_mask], [_trim_station_waves(s, keep_mask) for s in stations]
+
+
 def assemble_mission_database(
     mission: str, stations: list[StationAggregate], skipped: list[tuple[Path, str]] | None = None
 ) -> MissionDatabase:
-    """Build a :class:`MissionDatabase` from already-aggregated stations, dropping wavelengths
-    where every station's ``Ed0.0p`` is entirely missing (matching ``generate.cops.DB.R``'s own
-    ``ix.to.remove`` step). Shared by :func:`build_mission_database` and the "Generate database"
-    UI tab, which aggregates only the researcher-checked subset of discovered stations rather
-    than every station :func:`~pycops.io.discovery.find_deployment_folders` finds.
+    """Build a :class:`MissionDatabase` from already-aggregated stations, via
+    :func:`trim_unused_wavelengths`. Shared by :func:`build_mission_database` and the "Generate
+    database" UI tab, which aggregates only the researcher-checked subset of discovered stations
+    rather than every station :func:`~pycops.io.discovery.find_deployment_folders` finds.
     """
-    waves = np.asarray(STANDARD_WAVELENGTHS, dtype=float)
-    if stations:
-        all_ed0 = np.asarray([s.ed0_0p.mean for s in stations])
-        keep_mask = ~np.all(np.isnan(all_ed0), axis=0)
-        if not keep_mask.all():
-            waves = waves[keep_mask]
-            stations = [_trim_station_waves(s, keep_mask) for s in stations]
-
+    waves, stations = trim_unused_wavelengths(stations)
     return MissionDatabase(mission=mission, waves=waves, stations=stations, skipped=skipped or [])
 
 

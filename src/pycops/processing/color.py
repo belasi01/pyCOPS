@@ -91,3 +91,54 @@ def forel_ule_class(waves: np.ndarray, rrs: np.ndarray) -> ForelUleResult:
         fu = next(i + 2 for i in range(19) if alpha_m <= _FU_ALPHA_T[i] and alpha_m > _FU_ALPHA_T[i + 1])
 
     return ForelUleResult(x=x, y=y, fu=fu)
+
+
+# CIE XYZ (D65 white point) -> linear sRGB, the standard 3x3 matrix (IEC 61966-2-1).
+_XYZ_TO_LINEAR_SRGB = np.array(
+    [
+        [3.2406, -1.5372, -0.4986],
+        [-0.9689, 1.8758, 0.0415],
+        [0.0557, -0.2040, 1.0570],
+    ]
+)
+_NOT_VISIBLE_GRAY = 0.6  # neutral swatch for wavelengths outside the CIE table's own domain
+
+
+def _srgb_gamma(linear: np.ndarray) -> np.ndarray:
+    linear = np.clip(linear, 0.0, 1.0)
+    return np.where(linear <= 0.0031308, 12.92 * linear, 1.055 * linear ** (1 / 2.4) - 0.055)
+
+
+def wavelength_to_rgb(waves_nm: np.ndarray) -> np.ndarray:
+    """Approximate true display color for each wavelength (nm), via the same bundled CIE 1931
+    color-matching functions used for :func:`forel_ule_class` -- a monochromatic "spectrum" is
+    just a delta function, so its own (x, y, z) color-matching values *are* its CIE XYZ tristimulus
+    (up to a scale factor); converting to sRGB gives a physically grounded approximation of the
+    perceived color, rather than a hand-tuned visible-spectrum palette.
+
+    Wavelengths outside the CIE table's own domain (360-830 nm -- i.e. genuinely outside what a
+    human eye perceives; some COPS deployments carry UV/NIR bands beyond that) get a neutral gray
+    swatch, since assigning them a fake hue would misrepresent them as visible colors.
+
+    Returns an ``(n, 3)`` array of RGB values in ``[0, 1]``, gamma-corrected for display.
+    Out-of-gamut monochromatic colors (a well-known real limitation of sRGB, especially near
+    380-480 nm) are clipped rather than reproduced exactly. Each wavelength's own brightness is
+    normalized to its own peak channel -- the human eye's hugely uneven photopic sensitivity
+    across the spectrum would otherwise render the violet/red edges almost black relative to the
+    555 nm green peak, which isn't the point of a "what color is this band" swatch.
+    """
+    waves_nm = np.asarray(waves_nm, dtype=float)
+    cie = _cie()
+    cie_waves = cie["waves"].to_numpy(dtype=float)
+    in_range = (waves_nm >= cie_waves.min()) & (waves_nm <= cie_waves.max())
+
+    xyz = np.stack(
+        [np.interp(waves_nm, cie_waves, cie[c].to_numpy(dtype=float)) for c in ("x", "y", "z")], axis=-1
+    )
+    linear_rgb = np.clip(xyz @ _XYZ_TO_LINEAR_SRGB.T, 0.0, None)
+    peak = linear_rgb.max(axis=-1, keepdims=True)
+    linear_rgb = linear_rgb / np.where(peak == 0, 1.0, peak)
+
+    rgb = _srgb_gamma(linear_rgb)
+    rgb[~in_range] = _NOT_VISIBLE_GRAY
+    return rgb

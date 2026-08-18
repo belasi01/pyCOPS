@@ -161,6 +161,7 @@ def test_write_cast_result_round_trips_through_netcdf(tmp_path):
         assert reloaded.attrs["chl_flag"] == 999.0
         np.testing.assert_allclose(reloaded["kd_1pct"].values, result.kd_1pct, equal_nan=True)
         np.testing.assert_allclose(reloaded["kd_pd"].values, result.kd_pd, equal_nan=True)
+        np.testing.assert_allclose(reloaded["pd_depth"].values, result.pd_depth, equal_nan=True)
         np.testing.assert_allclose(reloaded["par_d_profile"].values, result.par_d_profile)
         np.testing.assert_allclose(reloaded["par_u_profile"].values, result.par_u_profile, equal_nan=True)
         np.testing.assert_allclose(reloaded["k0_par"].values[1:], result.k0_par, equal_nan=True)

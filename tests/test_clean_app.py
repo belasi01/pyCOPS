@@ -829,6 +829,32 @@ def test_process_tab_batch_isolates_a_broken_deployment(tmp_path, monkeypatch):
     assert any("1 ok, 0 with warnings, 1 failed" in m.value for m in at.markdown)
 
 
+def test_process_tab_batch_warns_about_a_previously_interrupted_run(tmp_path, monkeypatch):
+    """Regression test for a real report: Simon switched tabs while an 11-station batch was
+    running; Streamlit cancelled the in-progress script run partway through (``st.tabs(...,
+    on_change="rerun")`` explicitly requests a rerun on every tab switch, which -- per Streamlit's
+    own execution model -- aborts whatever script run was still in flight), silently stopping the
+    batch after 6/11 stations with no error shown. Simulates the leftover session_state left
+    behind by such an interrupted run (rather than actually reproducing the cancellation, which
+    AppTest has no hook for), and confirms the next render surfaces it instead of staying silent.
+    """
+    _patch_successful_processing(monkeypatch)
+    parent = tmp_path / "L2"
+    (parent / "StationA" / "cops").mkdir(parents=True)
+    (parent / "StationA" / "cops" / "init.cops.dat").write_text("")
+
+    at = AppTest.from_file(_APP_PATH)
+    at.session_state["process_batch_process_progress"] = {"done": 6, "total": 11}
+    at.run(timeout=30)
+    at.radio(key="process_mode").set_value("Batch (multiple deployments)").run(timeout=30)
+    at.text_input(key="process_parent").set_value(str(parent)).run(timeout=30)
+
+    assert not at.exception
+    assert any("interrupted after 6/11 deployment" in w.value for w in at.warning)
+    # shown once -- cleared after being reported, so it doesn't reappear on the next rerun.
+    assert "process_batch_process_progress" not in at.session_state
+
+
 # -- Tab 5: "Generate database" ---------------------------------------------------------------
 
 
@@ -953,15 +979,17 @@ def test_database_tab_isolates_a_station_missing_nc_folder(tmp_path):
     assert any("Skipped 1 station" in e.label for e in at.expander)
 
 
-def _write_fake_station_with_kd(directory, cast_specs, select_rows=None):
+def _write_fake_station_with_kd(directory, cast_specs, select_rows=None, waves=None):
     """Like ``_write_fake_station``, but also writes ``kd_1pct``/``kd_10pct``/``kd_pd`` so the
     Kd comparison figure (tab 5's new "Compare stations" tool) has real data to plot, not just
-    Rrs."""
+    Rrs. ``waves`` defaults to a fixed 2-band grid shared by every caller that doesn't pass its
+    own -- pass a distinct grid per station to simulate two different real COPS instrument
+    systems (see the trim_unused_wavelengths regression test below)."""
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "init.cops.dat").write_text("")
     nc_dir = directory / "nc"
     nc_dir.mkdir()
-    waves = np.array([443.0, 555.0])
+    waves = np.array([443.0, 555.0]) if waves is None else np.asarray(waves, dtype=float)
     for stem, (rrs, kd_pd) in cast_specs.items():
         ds = xr.Dataset(
             {
@@ -970,6 +998,7 @@ def _write_fake_station_with_kd(directory, cast_specs, select_rows=None):
                 "kd_1pct": ("wavelength", np.asarray(kd_pd, dtype=float) * 2),
                 "kd_10pct": ("wavelength", np.asarray(kd_pd, dtype=float) * 1.5),
                 "kd_pd": ("wavelength", np.asarray(kd_pd, dtype=float)),
+                "pd_depth": ("wavelength", np.asarray(kd_pd, dtype=float)),
             },
             coords={"wavelength": waves, "time": pd.date_range("2019-08-17T12:00:00", periods=2, freq="s")},
         )
@@ -1010,10 +1039,13 @@ def test_database_tab_compare_stations_shows_rrs_and_kd_figures(tmp_path):
     assert not at.exception
     assert any("Rrs comparison" in s.value for s in at.subheader)
     assert any("Kd at penetration depth" in s.value for s in at.subheader)
+    assert any("Penetration depth comparison" in s.value for s in at.subheader)
     assert len(at.dataframe) >= 1
 
 
-def test_database_tab_compare_stations_kd_metric_selectbox_switches_metric(tmp_path):
+def test_database_tab_compare_stations_shows_all_three_kd_metrics_always(tmp_path):
+    """Simon's request: all 3 Kd estimates (penetration depth, 10%, 1%) should always be shown
+    together, not hidden behind a one-at-a-time selector."""
     parent = tmp_path / "L2"
     _write_fake_station_with_kd(
         parent / "20200101_StationA" / "cops", {"CAST_001": ([1.0, 2.0], [0.5, 0.6])}
@@ -1024,12 +1056,45 @@ def test_database_tab_compare_stations_kd_metric_selectbox_switches_metric(tmp_p
     at.radio(key="database_tool").set_value("Compare stations (Rrs & Kd)").run(timeout=30)
     at.text_input(key="database_parent").set_value(str(parent)).run(timeout=30)
     at.button(key="database_compare_run").click().run(timeout=30)
-    assert any("Kd at penetration depth" in s.value for s in at.subheader)
-
-    at.selectbox(key="database_compare_kd_metric").set_value("Kd at 1% light level").run(timeout=30)
 
     assert not at.exception
+    assert any("Kd at penetration depth" in s.value for s in at.subheader)
     assert any("Kd at 1% light level" in s.value for s in at.subheader)
+    assert any("Kd at 10% light level" in s.value for s in at.subheader)
+
+
+def test_database_tab_compare_stations_keeps_bands_unique_to_one_station(tmp_path):
+    """Regression test: Simon reported every comparison figure's lines breaking at the same
+    handful of wavelengths -- traced to different real COPS instrument systems carrying
+    different fixed band sets, with no per-selection trimming applied before plotting. A band
+    must survive as long as *any* checked station has it, even if the others don't."""
+    parent = tmp_path / "L2"
+    # StationA's own real, calibrated bands are 443/395 -- StationB's are 443/555. Neither
+    # dataset uses NaN to fake a missing band: the coordinate array itself simply doesn't
+    # include the wavelength the other station has, matching how two different real COPS
+    # instrument systems (confirmed on real WISEMan vs. AlgaeWISE data) genuinely differ.
+    _write_fake_station_with_kd(
+        parent / "20200101_StationA" / "cops",
+        {"CAST_001": ([1.0, 3.0], [0.5, 0.55])},
+        waves=[443.0, 395.0],
+    )
+    _write_fake_station_with_kd(
+        parent / "20200101_StationB" / "cops",
+        {"CAST_001": ([2.0, 4.0], [0.6, 0.65])},
+        waves=[443.0, 555.0],
+    )
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.radio(key="database_tool").set_value("Compare stations (Rrs & Kd)").run(timeout=30)
+    at.text_input(key="database_parent").set_value(str(parent)).run(timeout=30)
+    at.button(key="database_compare_run").click().run(timeout=30)
+
+    assert not at.exception
+    assert any("Rrs comparison" in s.value for s in at.subheader)
+    waves = at.session_state["database_compare_waves"]
+    assert 395.0 in waves  # StationA-only band -- must survive despite StationB lacking it
+    assert 555.0 in waves  # StationB-only band -- must survive despite StationA lacking it
 
 
 def test_database_tab_compare_stations_requires_at_least_one_checked(tmp_path):

@@ -33,6 +33,7 @@ def _make_station(station_id, rrs_mean, ed0_mean, n_casts=2):
         kd_1pct=zeros,
         kd_10pct=zeros,
         kd_pd=zeros,
+        pd_depth=zeros,
         ed0_0p=MeanSd(mean=np.asarray(ed0_mean, dtype=float), sd=np.array([1.0, 2.0])),
         par_0=ScalarMeanSd(mean=500.0, sd=10.0),
         kd_par_1pct=ScalarMeanSd(mean=0.5, sd=0.05),

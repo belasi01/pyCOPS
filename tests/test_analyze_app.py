@@ -178,6 +178,7 @@ def test_analyze_tab_full_cast_renders_every_section(tmp_path):
         assert f"{instrument} attenuation (K)" in expander_labels
 
     assert any("Spectral Kd" in s.value for s in at.subheader)  # EdZ present in this fixture
+    assert any("Penetration depth by wavelength" in s.value for s in at.subheader)
 
     # Exercise the wavelength drill-down (raw-scan overlay code path) on LuZ -- also confirms the
     # EdZ raw-scan overlay fix (both LuZ and EdZ use depth_is_on's own depth column, not
@@ -598,7 +599,7 @@ def test_analyze_tab_station_comparison_shows_par_table_and_figures(tmp_path):
     # deep enough to guarantee a crossing.
 
 
-def test_analyze_tab_station_comparison_shows_qfactor_when_luz_and_euz_present(tmp_path):
+def test_analyze_tab_station_comparison_shows_qfactor_and_penetration_depth(tmp_path):
     second_stem = "WISE_CAST_002_190817_221224_URC"
     _write_nc(tmp_path, _make_full_dataset(), _make_full_init(), stem=_CAST_STEM)
     _write_nc(tmp_path, _make_full_dataset(), _make_full_init(), stem=second_stem)
@@ -610,6 +611,7 @@ def test_analyze_tab_station_comparison_shows_qfactor_when_luz_and_euz_present(t
 
     assert not at.exception
     assert any("Q-factor" in s.value for s in at.subheader)
+    assert any("Penetration depth by wavelength, by cast" in s.value for s in at.subheader)
 
 
 def test_analyze_tab_station_comparison_warns_when_all_discarded(tmp_path):

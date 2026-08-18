@@ -48,6 +48,8 @@ from pycops.io.pdf_report import (
     build_depth_vs_time_figure,
     build_ed0_stability_figure,
     build_par_kd_par_figures,
+    build_penetration_depth_comparison_figure,
+    build_penetration_depth_figure,
     build_qfactor_figure,
     build_qwip_figure,
     build_rrs_figure,
@@ -177,6 +179,19 @@ def _render_spectral_kd(nc: xr.Dataset) -> None:
         "Mean diffuse attenuation from the surface down to the 1%, 10%, and penetration-depth "
         "(1/e) light levels, one line per level vs. wavelength -- distinct from the K attenuation "
         "panels above, which plot Kd vs. depth for one instrument at a time."
+    )
+    _show(fig)
+
+
+def _render_penetration_depth(nc: xr.Dataset) -> None:
+    fig = build_penetration_depth_figure(nc)
+    if fig is None:
+        return
+    st.subheader("Penetration depth by wavelength")
+    st.caption(
+        "Depth (1/e light level) at which each band's own surface signal has attenuated to 1/e -- "
+        "0 at the top, markers colored by each wavelength's own approximate true color, to "
+        "visualize what a satellite actually \"sees\" per color."
     )
     _show(fig)
 
@@ -684,6 +699,15 @@ def _render_station_comparison(directory: Path) -> None:
         st.subheader("Spectral Kd at penetration depth, by cast")
         _show(kd_penetration_depth_figure)
 
+    penetration_depth_figure = build_penetration_depth_comparison_figure(directory)
+    if penetration_depth_figure is not None:
+        st.subheader("Penetration depth by wavelength, by cast")
+        st.caption(
+            "Markers colored by each wavelength's own approximate true color; line style "
+            "distinguishes casts (color is already used for wavelength)."
+        )
+        _show(penetration_depth_figure)
+
     qfactor_figure = build_station_qfactor_figure(directory)
     if qfactor_figure is not None:
         st.subheader("Empirical Q-factor, by cast (Eu(0-) / Lu(0-))")
@@ -812,6 +836,7 @@ def _render_single_cast(directory: Path) -> None:
             _render_attenuation(nc, instrument)
 
     _render_spectral_kd(nc)
+    _render_penetration_depth(nc)
 
     if "par_d_profile" in nc.data_vars:
         with st.expander("PAR & Kd(PAR)"):

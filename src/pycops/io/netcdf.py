@@ -26,8 +26,9 @@ when available; nLw (``nlw_0p_loess``/``nlw_0p_linear``/``nlw_0p_recommended``),
 ``ed0_0m``/``r0m_loess``/``r0m_linear`` (see
 :mod:`pycops.processing.ed0_0m`), ``q_factor_loess``/``q_factor_linear`` (empirical Q-factor,
 ``EuZ.0m / LuZ.0m``, only when a cast has both instruments -- see
-:func:`pycops.processing.process_cast._empirical_q_factor`), ``kd_1pct``/``kd_10pct``/``kd_pd`` (see
-:mod:`pycops.processing.attenuation`), ``par_d_profile``/``par_u_profile``/``kz_par``/``k0_par``
+:func:`pycops.processing.process_cast._empirical_q_factor`), ``kd_1pct``/``kd_10pct``/``kd_pd``/
+``pd_depth`` (the penetration-depth *crossing depth itself*, in meters, distinct from ``kd_pd``'s
+attenuation coefficient -- see :mod:`pycops.processing.attenuation`), ``par_d_profile``/``par_u_profile``/``kz_par``/``k0_par``
 (``EdZ_depth``-dimensioned; ``kz_par``/``k0_par`` leading-NaN-padded like ``KZ``/``K0``) plus the
 scalar attrs ``par_0``/``kd_par_1pct``/``kd_par_10pct``/``kd_par_pd`` (see
 :mod:`pycops.processing.par`), and ``<instrument>_rb``/``_rb_extrapolated``
@@ -158,6 +159,8 @@ def cast_result_to_dataset(cast_result: CastResult, ds: xr.Dataset | None = None
         data_vars["kd_10pct"] = ("wavelength", cast_result.kd_10pct)
     if cast_result.kd_pd is not None:
         data_vars["kd_pd"] = ("wavelength", cast_result.kd_pd)
+    if cast_result.pd_depth is not None:
+        data_vars["pd_depth"] = ("wavelength", cast_result.pd_depth)
 
     if cast_result.par_d_profile is not None:
         data_vars["par_d_profile"] = ("EdZ_depth", cast_result.par_d_profile)

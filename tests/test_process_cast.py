@@ -137,6 +137,11 @@ def test_process_cast_computes_kd_light_level_metrics_when_edz_present():
     assert np.isfinite(result.kd_1pct[1])
     assert np.isfinite(result.kd_10pct[1])
     assert np.isfinite(result.kd_pd[1])
+    assert result.pd_depth is not None
+    assert np.isfinite(result.pd_depth[1])
+    # kd_pd = -ln(1/e) / pd_depth = 1 / pd_depth -- the two are the same crossing depth search,
+    # just reported as an attenuation coefficient vs. the raw depth itself.
+    np.testing.assert_allclose(result.kd_pd, 1.0 / result.pd_depth, equal_nan=True)
 
 
 def test_process_cast_kd_light_level_metrics_none_without_edz():
@@ -146,6 +151,7 @@ def test_process_cast_kd_light_level_metrics_none_without_edz():
     assert result.kd_1pct is None
     assert result.kd_10pct is None
     assert result.kd_pd is None
+    assert result.pd_depth is None
 
 
 def test_process_cast_computes_par_and_kd_par_when_edz_present():

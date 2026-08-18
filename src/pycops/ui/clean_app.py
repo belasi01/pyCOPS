@@ -882,6 +882,31 @@ def _render_pdf_only_summary(label: str, summary: _PdfOnlySummary, *, expanded: 
             st.warning(message)
 
 
+def _batch_progress_key(kind: str) -> str:
+    return f"process_batch_{kind}_progress"
+
+
+def _warn_if_batch_was_interrupted(kind: str, label: str) -> None:
+    """Report (once) a previous batch run of ``kind`` that never reached its own "Done" line --
+    real bug, found by Simon: Streamlit cancels an in-progress script run and starts a fresh one
+    whenever new widget input arrives (``st.tabs(..., on_change="rerun")`` explicitly requests
+    this on every tab switch), which silently aborts a synchronous batch ``for`` loop like this
+    one partway through -- his own 11-station batch stopped after 6 when he switched tabs while
+    it was running, with no error, just what looked like a normal completed run. Whatever
+    deployments the loop *did* reach before being cut off are genuinely processed (real files
+    already written to disk) -- only the ones after the cutoff point were never touched.
+    """
+    progress = st.session_state.pop(_batch_progress_key(kind), None)
+    if progress is not None:
+        st.warning(
+            f"The previous {label} run was interrupted after {progress['done']}/{progress['total']} "
+            "deployment(s) -- most likely because the browser tab was switched (including tabs "
+            "within this app) while it was still running, which stops the run partway through "
+            "with no error message. The deployment(s) already reached were genuinely processed, "
+            "but any after that point were not -- re-run to cover the rest."
+        )
+
+
 def _render_process_tab() -> None:
     mode = st.radio(
         "Mode", ("Single deployment", "Batch (multiple deployments)"), key="process_mode"
@@ -961,6 +986,9 @@ def _render_process_tab() -> None:
         st.warning(f"No deployment folder (with init.cops.dat) found under {parent}.")
         return
 
+    _warn_if_batch_was_interrupted("process", "batch processing")
+    _warn_if_batch_was_interrupted("pdf_only", "batch PDF regeneration")
+
     st.write(f"{len(folders)} deployment folder(s) found -- uncheck any to exclude them:")
     checked: list[Path] = []
     for folder in folders:
@@ -969,6 +997,11 @@ def _render_process_tab() -> None:
             checked.append(folder)
 
     if action == "Process casts":
+        st.caption(
+            "Avoid switching tabs (in this app or your browser) while this runs -- Streamlit "
+            "cancels the run partway through when new input arrives, silently skipping "
+            "whichever deployments hadn't been reached yet."
+        )
         if st.button(f"Process checked deployments ({len(checked)})", key="process_batch_run"):
             if not checked:
                 st.error("Select at least one deployment.")
@@ -976,6 +1009,7 @@ def _render_process_tab() -> None:
             progress = st.progress(0.0)
             status = st.empty()
             n_ok = n_warn = n_failed = 0
+            st.session_state[_batch_progress_key("process")] = {"done": 0, "total": len(checked)}
             for i, folder in enumerate(checked):
                 rel = folder.relative_to(parent)
                 status.write(f"Processing {rel} ({i + 1}/{len(checked)})...")
@@ -990,11 +1024,18 @@ def _render_process_tab() -> None:
                 else:
                     n_ok += 1
                 progress.progress((i + 1) / len(checked))
+                st.session_state[_batch_progress_key("process")]["done"] = i + 1
+            st.session_state.pop(_batch_progress_key("process"), None)
             status.write(
                 f"Done: {n_ok} ok, {n_warn} with warnings, {n_failed} failed "
                 f"(of {len(checked)} processed)."
             )
     else:
+        st.caption(
+            "Avoid switching tabs (in this app or your browser) while this runs -- Streamlit "
+            "cancels the run partway through when new input arrives, silently skipping "
+            "whichever deployments hadn't been reached yet."
+        )
         if st.button(f"Regenerate PDF reports for checked deployments ({len(checked)})", key="process_batch_pdf_only"):
             if not checked:
                 st.error("Select at least one deployment.")
@@ -1002,16 +1043,19 @@ def _render_process_tab() -> None:
             progress = st.progress(0.0)
             status = st.empty()
             n_ok = n_warn = 0
+            st.session_state[_batch_progress_key("pdf_only")] = {"done": 0, "total": len(checked)}
             for i, folder in enumerate(checked):
                 rel = folder.relative_to(parent)
                 status.write(f"Regenerating PDF reports for {rel} ({i + 1}/{len(checked)})...")
                 written, failures = write_station_pdf_reports(folder)
                 _render_pdf_only_summary(str(rel), _PdfOnlySummary(folder, written, failures), expanded=False)
+                st.session_state[_batch_progress_key("pdf_only")]["done"] = i + 1
                 if failures:
                     n_warn += 1
                 else:
                     n_ok += 1
                 progress.progress((i + 1) / len(checked))
+            st.session_state.pop(_batch_progress_key("pdf_only"), None)
             status.write(f"Done: {n_ok} ok, {n_warn} with warnings (of {len(checked)} processed).")
 
 

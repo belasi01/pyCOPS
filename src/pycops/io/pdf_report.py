@@ -38,6 +38,7 @@ from pycops.io.discovery import kept_nc_files
 from pycops.io.raw import read_cast
 from pycops.io.scaffold import discover_l1_casts
 from pycops.processing.attenuation import depth_at_light_fraction
+from pycops.processing.color import wavelength_to_rgb
 from pycops.processing.depth import time_window_mask
 from pycops.processing.par import percent_par_at_depth
 from pycops.processing.qwip import _qwip_polynomial
@@ -548,6 +549,68 @@ def build_spectral_kd_figure(nc: xr.Dataset) -> Figure | None:
     return fig
 
 
+def build_penetration_depth_figure(nc: xr.Dataset) -> Figure | None:
+    """Penetration depth (``pd_depth``, meters -- the 1/e-light-level crossing depth itself, not
+    ``kd_pd``'s derived attenuation coefficient) vs. wavelength, depth 0 at the top. Simon's
+    request: markers colored by each band's own approximate true display color
+    (:func:`pycops.processing.color.wavelength_to_rgb`) rather than an arbitrary colormap, to
+    directly visualize "what a satellite sees" -- how deep each visible color actually
+    penetrates before being reduced to 1/e of its surface value.
+
+    Deliberately plotted over the *full* wavelength grid (not pre-filtered to finite values) --
+    a band that never reaches the penetration-depth light level within the cast's own measured
+    range is a real gap, not something to silently connect across (see
+    :func:`pycops.io.database_report._plot_mean_sd_band` for the same reasoning, found from a
+    real report of exactly this kind of fabricated connecting line).
+    """
+    if "pd_depth" not in nc.data_vars:
+        return None
+    waves = nc["wavelength"].values
+    depth = nc["pd_depth"].values
+    if not np.isfinite(depth).any():
+        return None
+
+    fig, ax = _new_fig((8, 5))
+    ax.plot(waves, depth, "-", color="lightgray", lw=1, zorder=1)
+    ax.scatter(waves, depth, c=wavelength_to_rgb(waves), s=70, edgecolors="black", linewidths=0.5, zorder=2)
+    ax.invert_yaxis()
+    ax.set_xlabel("Wavelength (nm)")
+    ax.set_ylabel("Penetration depth (m)")
+    ax.set_title("Penetration depth (1/e light level) by wavelength")
+    return fig
+
+
+def build_penetration_depth_comparison_figure(directory: Path) -> Figure | None:
+    """:func:`build_penetration_depth_figure`, overlaid for every currently-kept cast in a
+    station. Color is already used for wavelength (the whole point of the figure), so casts are
+    distinguished by line style instead (solid/dashed/dash-dot/dotted, cycling), with the
+    per-wavelength true-color markers layered on top of every cast's line."""
+    nc_dir = directory / "nc"
+    if not nc_dir.is_dir():
+        return None
+    kept_files = kept_nc_files(directory, nc_dir)
+    applicable = []
+    for nc_path in kept_files:
+        with xr.open_dataset(nc_path) as opened:
+            nc = opened.load()
+        if "pd_depth" in nc.data_vars and np.isfinite(nc["pd_depth"].values).any():
+            applicable.append((nc_path.stem, nc["wavelength"].values, nc["pd_depth"].values))
+    if not applicable:
+        return None
+
+    linestyles = ("-", "--", "-.", ":")
+    fig, ax = _new_fig((9, 5.5))
+    for i, (label, waves, depth) in enumerate(applicable):
+        ax.plot(waves, depth, linestyles[i % len(linestyles)], color="black", lw=1.2, label=label, zorder=1)
+        ax.scatter(waves, depth, c=wavelength_to_rgb(waves), s=50, edgecolors="black", linewidths=0.4, zorder=2)
+    ax.invert_yaxis()
+    ax.set_xlabel("Wavelength (nm)")
+    ax.set_ylabel("Penetration depth (m)")
+    ax.set_title("Penetration depth (1/e light level) by wavelength, by cast")
+    ax.legend(fontsize="small")
+    return fig
+
+
 def build_par_kd_par_figures(nc: xr.Dataset) -> list[Figure]:
     depth = nc["EdZ_depth"].values
     par_d = nc["par_d_profile"].values
@@ -1036,6 +1099,10 @@ def build_cast_report_figures(
     if fig is not None:
         figures.append(fig)
 
+    fig = build_penetration_depth_figure(nc)
+    if fig is not None:
+        figures.append(fig)
+
     if "par_d_profile" in nc.data_vars:
         figures.extend(build_par_kd_par_figures(nc))
 
@@ -1099,11 +1166,12 @@ def write_cast_pdf_report(
 
 def write_station_summary_pdf(directory: Path, path: str | Path) -> int:
     """Write the station-wide comparison (Rrs/K0, PAR penetration-depth table, PAR profile
-    overlay, spectral Kd-at-penetration-depth comparison, and empirical Q-factor comparison) to a
-    PDF at ``path``. Returns the number of pages actually written (0 if every section came back
-    ``None`` -- e.g. no kept cast has Rrs/K0/PAR/Kd/Q-factor data -- in which case ``path`` still
-    exists but is a valid, page-less PDF; callers that want to flag this rather than silently
-    produce an empty-looking file should check the return value)."""
+    overlay, spectral Kd-at-penetration-depth comparison, penetration-depth-by-wavelength
+    comparison, and empirical Q-factor comparison) to a PDF at ``path``. Returns the number of
+    pages actually written (0 if every section came back ``None`` -- e.g. no kept cast has
+    Rrs/K0/PAR/Kd/Q-factor data -- in which case ``path`` still exists but is a valid, page-less
+    PDF; callers that want to flag this rather than silently produce an empty-looking file should
+    check the return value)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     figures = [
@@ -1111,6 +1179,7 @@ def write_station_summary_pdf(directory: Path, path: str | Path) -> int:
         build_station_par_depth_table_figure(directory),
         build_station_par_profile_figure(directory),
         build_station_kd_penetration_depth_figure(directory),
+        build_penetration_depth_comparison_figure(directory),
         build_station_qfactor_figure(directory),
     ]
     n_pages = 0
