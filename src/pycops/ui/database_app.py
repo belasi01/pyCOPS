@@ -220,9 +220,14 @@ def render_database_tab() -> None:
             st.error("No station could be aggregated -- nothing to write.")
             return
 
-        write_mission_database_netcdf(db, parent / f"{mission}.nc")
-        write_mission_database_csv(db, parent / f"{mission}.csv")
-        seabass_dir = parent / "seabass"
+        # Simon's request: mission-database output goes in a sibling L3/cops/ folder (matching the
+        # existing L1/L2 layout convention -- see io/scaffold.py), not directly inside the L2
+        # parent folder searched for stations above.
+        output_dir = parent.parent / "L3" / "cops"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        write_mission_database_netcdf(db, output_dir / f"{mission}.nc")
+        write_mission_database_csv(db, output_dir / f"{mission}.csv")
+        seabass_dir = output_dir / "seabass"
         seabass_dir.mkdir(exist_ok=True)
         header = SeaBASSHeaderFields(
             investigators=investigators,
@@ -239,7 +244,7 @@ def render_database_tab() -> None:
             write_seabass_station_file(station, header, db.waves, seabass_dir / filename)
 
         st.success(
-            f"Wrote {mission}.nc / {mission}.csv to {parent}, and {len(db.stations)} SeaBASS "
+            f"Wrote {mission}.nc / {mission}.csv to {output_dir}, and {len(db.stations)} SeaBASS "
             f".sb file(s) to {seabass_dir}."
         )
         st.dataframe(

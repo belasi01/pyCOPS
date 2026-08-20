@@ -994,9 +994,10 @@ def test_database_tab_generate_writes_netcdf_csv_and_seabass_files(tmp_path):
     at.button(key="database_generate").click().run(timeout=30)
 
     assert not at.exception
-    assert (parent / "TestMission.nc").exists()
-    assert (parent / "TestMission.csv").exists()
-    assert (parent / "seabass" / "A_cops.sb").exists()
+    output_dir = tmp_path / "L3" / "cops"
+    assert (output_dir / "TestMission.nc").exists()
+    assert (output_dir / "TestMission.csv").exists()
+    assert (output_dir / "seabass" / "A_cops.sb").exists()
     assert any("Wrote TestMission.nc" in s.value for s in at.success)
 
 
@@ -1020,9 +1021,10 @@ def test_database_tab_seabass_filenames_dont_collide_for_same_station_id(tmp_pat
     at.button(key="database_generate").click().run(timeout=30)
 
     assert not at.exception
-    sb_files = sorted(p.name for p in (parent / "seabass").glob("*.sb"))
+    output_dir = tmp_path / "L3" / "cops"
+    sb_files = sorted(p.name for p in (output_dir / "seabass").glob("*.sb"))
     assert sb_files == ["BDA-01_COPS_FJSaucier.sb", "BDA-01_COPS_Kildir.sb"]
-    df = pd.read_csv(parent / "TestMission.csv")
+    df = pd.read_csv(output_dir / "TestMission.csv")
     assert len(df) == 2  # both stations still contribute a distinct row to the CSV/NetCDF
 
 
@@ -1040,7 +1042,7 @@ def test_database_tab_unchecking_excludes_station(tmp_path):
     at.button(key="database_generate").click().run(timeout=30)
 
     assert not at.exception
-    df = pd.read_csv(parent / "TestMission.csv")
+    df = pd.read_csv(tmp_path / "L3" / "cops" / "TestMission.csv")
     assert list(df["station_id"]) == ["A"]
 
 
@@ -1084,7 +1086,7 @@ def test_database_tab_isolates_a_station_missing_nc_folder(tmp_path):
     at.button(key="database_generate").click().run(timeout=30)
 
     assert not at.exception
-    df = pd.read_csv(parent / "TestMission.csv")
+    df = pd.read_csv(tmp_path / "L3" / "cops" / "TestMission.csv")
     assert list(df["station_id"]) == ["Good"]
     assert any("Skipped 1 station" in e.label for e in at.expander)
 
