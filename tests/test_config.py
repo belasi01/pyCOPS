@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -8,6 +10,7 @@ from pycops.io.config import (
     absorption_for_cast,
     default_init_cops_params,
     format_init_cops_dat,
+    migrate_init_cops_dat,
     read_absorption_cops,
     read_info_cops,
     read_init_cops,
@@ -136,6 +139,159 @@ def test_format_init_cops_dat_writes_ed0_correction_method_line(tmp_path):
     text = format_init_cops_dat(params)
 
     assert "ed0.correction.method;character;smoothed" in text
+
+
+def test_format_init_cops_dat_round_trips_legacy_time_interval_field(tmp_path):
+    """A still-unmigrated legacy init.cops.dat (time.interval.for.smoothing.optics, no
+    depth.interval.for.smoothing.optics) read directly with read_init_cops() -- bypassing
+    migrate_init_cops_dat() -- must still round-trip both fields through
+    format_init_cops_dat/write_init_cops rather than silently dropping the legacy one; depth.
+    interval.for.smoothing.optics is now also present, in-memory, with its own standard default
+    (matching every other backfilled parameter -- see _PER_INSTRUMENT_DEFAULTS)."""
+    content = INIT_COPS_DAT.replace(
+        "depth.interval.for.smoothing.optics;numeric; 10, 4,4,4\n",
+        "time.interval.for.smoothing.optics;numeric; 40, 40, 20,20\n",
+    )
+    path = tmp_path / "init.cops.dat"
+    path.write_text(content)
+    params = read_init_cops(path)
+    assert params["time.interval.for.smoothing.optics"] == {"Ed0": 40.0, "EdZ": 40.0, "LuZ": 20.0, "EuZ": 20.0}
+    assert params["depth.interval.for.smoothing.optics"] == {"Ed0": 10.0, "EdZ": 5.0, "LuZ": 5.0, "EuZ": 5.0}
+
+    text = format_init_cops_dat(params)
+
+    assert "time.interval.for.smoothing.optics;numeric;40,40,20,20" in text
+    assert "depth.interval.for.smoothing.optics;numeric;10,5,5,5" in text
+
+    reread_path = tmp_path / "init_rewritten.cops.dat"
+    reread_path.write_text(text, newline="")
+    reread = read_init_cops(reread_path)
+    assert reread["time.interval.for.smoothing.optics"] == {"Ed0": 40.0, "EdZ": 40.0, "LuZ": 20.0, "EuZ": 20.0}
+
+
+# ---- migrate_init_cops_dat: persisting legacy-file default injection to disk ----
+
+
+def test_migrate_init_cops_dat_appends_missing_fields_and_reports_them(tmp_path):
+    # INIT_COPS_DAT (see conftest.py) has bandwidth but is missing linear.fit.Rsquared.threshold
+    # .optics/linear.fit.max.delta.depth.optics/windspeed_ms/ed0.correction.method -- exactly the
+    # real-world GreenEdge 2016 shape this feature was built for.
+    path = tmp_path / "init.cops.dat"
+    path.write_text(INIT_COPS_DAT)
+
+    with pytest.warns(UserWarning):  # read_init_cops's own warnings still fire underneath
+        changes = migrate_init_cops_dat(path)
+
+    assert len(changes) == 4
+    assert any("linear.fit.Rsquared.threshold.optics" in c for c in changes)
+    assert any("linear.fit.max.delta.depth.optics" in c for c in changes)
+    assert any("windspeed_ms" in c for c in changes)
+    assert any("ed0.correction.method" in c for c in changes)
+
+    text = path.read_text()
+    assert "linear.fit.Rsquared.threshold.optics;numeric;" in text
+    assert "windspeed_ms;numeric;4" in text
+    assert "ed0.correction.method;character;raw" in text
+    # the original content must round-trip untouched, not just the new lines
+    assert "instruments.optics;character;Ed0,EdZ,LuZ,EuZ" in text
+
+    # any write also backs up the pre-migration file, matching Simon's general request that no
+    # legacy init.cops.dat is ever edited without a preserved original copy.
+    backup = tmp_path / "legacy.init.cops.dat"
+    assert backup.exists()
+    assert backup.read_text() == INIT_COPS_DAT
+
+
+def test_migrate_init_cops_dat_backup_created_only_once(tmp_path):
+    """A second, later migration (e.g. once a genuinely new field is added to
+    _PER_INSTRUMENT_DEFAULTS/_SCALAR_DEFAULTS down the road) must not overwrite an existing
+    legacy.init.cops.dat with an already-partially-migrated version -- the backup should always
+    hold the oldest, truly original file."""
+    path = tmp_path / "init.cops.dat"
+    path.write_text(INIT_COPS_DAT)
+    migrate_init_cops_dat(path)
+    backup = tmp_path / "legacy.init.cops.dat"
+    assert backup.read_text() == INIT_COPS_DAT
+
+    # simulate the file being hand-edited after its first migration, then losing a field again
+    path.write_text(path.read_text().replace("windspeed_ms;numeric;4\n", ""))
+    migrate_init_cops_dat(path)
+
+    assert backup.read_text() == INIT_COPS_DAT  # still the very first backup, untouched
+
+
+def test_migrate_init_cops_dat_replaces_legacy_time_interval_with_default_depth_values(tmp_path):
+    """Simon's explicit follow-up (2026-08-19): don't derive depth.interval.for.smoothing.optics
+    from the old per-cast time.interval.for.smoothing.optics values at all -- comment out the
+    legacy field and use the same standard default values as every other backfilled parameter."""
+    content = INIT_COPS_DAT.replace(
+        "depth.interval.for.smoothing.optics;numeric; 10, 4,4,4\n",
+        "time.interval.for.smoothing.optics;numeric; 40, 40, 20,20\n",
+    )
+    path = tmp_path / "init.cops.dat"
+    path.write_text(content)
+
+    changes = migrate_init_cops_dat(path)
+
+    assert any(
+        "time.interval.for.smoothing.optics" in c and "depth.interval.for.smoothing.optics" in c
+        for c in changes
+    )
+    text = path.read_text()
+    assert "# time.interval.for.smoothing.optics;numeric; 40, 40, 20,20" in text
+    assert "depth.interval.for.smoothing.optics;numeric;10,5,5,5" in text  # standard defaults, not 40/40/20-derived
+
+    reread = read_init_cops(path)
+    assert reread["depth.interval.for.smoothing.optics"] == {"Ed0": 10.0, "EdZ": 5.0, "LuZ": 5.0, "EuZ": 5.0}
+    assert "time.interval.for.smoothing.optics" not in reread  # the commented-out line isn't parsed
+
+    backup = tmp_path / "legacy.init.cops.dat"
+    assert backup.read_text() == content  # original, uncommented time.interval line preserved
+
+
+def test_migrate_init_cops_dat_is_idempotent(tmp_path):
+    path = tmp_path / "init.cops.dat"
+    path.write_text(INIT_COPS_DAT)
+    migrate_init_cops_dat(path)
+
+    second_pass = migrate_init_cops_dat(path)
+
+    assert second_pass == []
+
+
+def test_migrate_init_cops_dat_leaves_read_init_cops_warning_free_afterward(tmp_path):
+    path = tmp_path / "init.cops.dat"
+    path.write_text(INIT_COPS_DAT)
+    migrate_init_cops_dat(path)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any warnings.warn() now fails the test
+        params = read_init_cops(path)
+
+    assert params["windspeed_ms"] == 4.0
+    assert params["ed0.correction.method"] == "raw"
+
+
+def test_migrate_init_cops_dat_no_op_on_a_complete_file(tmp_path):
+    params = default_init_cops_params(["Ed0", "EdZ", "LuZ", "EuZ"])
+    path = tmp_path / "init.cops.dat"
+    write_init_cops(path, params)
+
+    changes = migrate_init_cops_dat(path)
+
+    assert changes == []
+
+
+def test_migrate_init_cops_dat_preserves_crlf_terminator(tmp_path):
+    path = tmp_path / "init.cops.dat"
+    path.write_bytes(INIT_COPS_DAT.replace("\n", "\r\n").encode())
+
+    migrate_init_cops_dat(path)
+
+    data = path.read_bytes()
+    assert b"\r\n" in data
+    # every line in the file (original + newly appended) uses the same CRLF convention
+    assert data.count(b"\n") == data.count(b"\r\n")
 
 
 def test_read_info_cops(tmp_path):

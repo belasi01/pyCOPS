@@ -38,6 +38,14 @@ from pycops.processing.solar import sun_position
 _DEPTH_PROFILED_INSTRUMENTS = ("EdZ", "LuZ", "EuZ")
 _SHADOWABLE_INSTRUMENTS = ("LuZ", "EuZ")
 
+# Simon's own thresholds (2026-08-19): a spectral Kd (kd_1pct/kd_10pct/kd_pd) above this is
+# essentially never a real natural-water value -- a LOESS-fit artifact, not signal -- so it's
+# NaN'd out unconditionally, independent of the manual excluded_kd_wavelengths override. Values in
+# [_KD_WARN_THRESHOLD_PER_M, _KD_HARD_NAN_THRESHOLD_PER_M) are plausible but unusual enough to flag
+# for review (CastResult.kd_warn_wavelengths) rather than silently trust or silently drop.
+_KD_HARD_NAN_THRESHOLD_PER_M = 20.0
+_KD_WARN_THRESHOLD_PER_M = 10.0
+
 # select.cops.dat's "method" column names which Rrs a researcher already vetted
 # as the right one for a given cast (see discovery.CastSelection.method) --
 # some casts fit better with the LOESS surface value, others with the linear
@@ -103,6 +111,8 @@ class CastResult:
     kd_1pct: np.ndarray | None  # mean Kd from surface to the 1% light level, EdZ only
     kd_10pct: np.ndarray | None  # mean Kd from surface to the 10% light level
     kd_pd: np.ndarray | None  # mean Kd from surface to the penetration depth (1/e light level)
+    kd_hard_excluded_wavelengths: tuple[float, ...]  # bands auto-NaN'd for exceeding 20/m (any metric)
+    kd_warn_wavelengths: tuple[float, ...]  # bands in [10, 20)/m -- flagged, not auto-excluded
     pd_depth: np.ndarray | None  # penetration depth itself (m, the 1/e crossing depth), not Kd
     par_0: float | None  # broadband PAR (uEin.m-2.s-1) of Ed0's smoothed surface reference
     par_d_profile: np.ndarray | None  # PAR(z), one value per EdZ depth-grid point
@@ -118,6 +128,7 @@ class CastResult:
     resolved_latitude: float | None  # (may differ from ds.attrs -- e.g. a position_override or GPS file)
     resolved_sun_zenith_deg: float | None  # sun zenith angle (degrees) at the cast's mean time/position
     excluded_wavelengths: tuple[float, ...] = ()  # final-Rrs bands manually NaN'd out (see io.exclusions)
+    excluded_kd_wavelengths: tuple[float, ...] = ()  # kd_1pct/kd_10pct/kd_pd bands manually NaN'd out
     ed0_correction_method: str = "raw"  # "raw" (matches R) or "smoothed" (pycops-only) -- see ed0.py
 
 
@@ -132,6 +143,19 @@ def _mask_rrs_wavelengths(rrs: RrsResult, mask: np.ndarray) -> RrsResult:
     rrs_0p = np.where(mask, np.nan, rrs.rrs_0p)
     nlw_0p = np.where(mask, np.nan, rrs.nlw_0p) if rrs.nlw_0p is not None else None
     return replace(rrs, lw_0p=lw_0p, rrs_0p=rrs_0p, nlw_0p=nlw_0p)
+
+
+def _auto_flag_kd(kd: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Automatic QC for one spectral Kd array (``kd_1pct``/``kd_10pct``/``kd_pd``): values above
+    ``_KD_HARD_NAN_THRESHOLD_PER_M`` are NaN'd out unconditionally (Simon: essentially never a
+    real natural-water value, so not worth a manual review step); values in
+    ``[_KD_WARN_THRESHOLD_PER_M, _KD_HARD_NAN_THRESHOLD_PER_M)`` are left as-is but flagged via the
+    returned ``warn`` mask, for the researcher to review and manually exclude (see
+    :mod:`pycops.io.exclusions`) if they agree it's bad. Returns ``(kd, hard_mask, warn_mask)``.
+    """
+    hard_mask = kd > _KD_HARD_NAN_THRESHOLD_PER_M
+    warn_mask = (kd >= _KD_WARN_THRESHOLD_PER_M) & (kd <= _KD_HARD_NAN_THRESHOLD_PER_M)
+    return np.where(hard_mask, np.nan, kd), hard_mask, warn_mask
 
 
 def _cast_sun_geometry(
@@ -275,6 +299,7 @@ def process_cast(
     bioshade: BioShadeResult | None = None,
     position_override: PositionOverride | None = None,
     excluded_wavelengths: Sequence[float] | None = None,
+    excluded_kd_wavelengths: Sequence[float] | None = None,
     ed0_correction_method: str | None = None,
 ) -> CastResult:
     """Fit Ed0 plus every depth-profiled instrument present in ``ds``, shadow-correct, and Rrs/Lw.
@@ -357,6 +382,14 @@ def process_cast(
     ends up picking, matching within ``waves`` to 1e-6 nm. Recorded verbatim
     on ``CastResult.excluded_wavelengths`` for display/export.
 
+    ``excluded_kd_wavelengths`` is the same idea applied to the spectral Kd outputs
+    (``kd_1pct``/``kd_10pct``/``kd_pd`` below) instead of Rrs -- a separate list, since a band can
+    look fine for Rrs (LuZ/EuZ) but still show an occasional LOESS-fit artifact specific to EdZ's
+    own near-surface extrapolation (Simon's report, 2026-08-19), or vice versa. Read from its own
+    sidecar file (see :mod:`pycops.io.exclusions`, the same reader/writer functions, just a
+    different file name -- ``kd_wavelength_exclusions.cops.dat``, not
+    ``rrs_wavelength_exclusions.cops.dat``). Recorded on ``CastResult.excluded_kd_wavelengths``.
+
     ``ed0_correction_method``, if given, overrides ``init["ed0.correction.method"]``
     (``init.cops.dat``'s station-wide default, itself defaulting to ``"raw"`` for
     older files that predate this field -- see :func:`pycops.io.config.read_init_cops`)
@@ -394,6 +427,13 @@ def process_cast(
     Uses ``ed0_0m`` (subsurface Ed0) as the reference when available, matching R exactly;
     otherwise falls back to ``Ed0.0p`` (``ed0_fit.value_at_0``) rather than leaving these ``None``
     for every EuZ-less cast -- a documented deviation, since R always requires ``Ed0.0m``.
+
+    Each of the three, independently per wavelength, then goes through automatic QC (Simon,
+    2026-08-19 -- these values were sometimes physically implausible even after passing the
+    normal fit-quality gates): a value over ``20/m`` is NaN'd out unconditionally
+    (``CastResult.kd_hard_excluded_wavelengths`` records which bands), and a value in ``[10,
+    20)/m`` is left as-is but recorded on ``CastResult.kd_warn_wavelengths`` for the researcher to
+    review and manually exclude (see ``excluded_kd_wavelengths`` below) if they agree.
 
     The same ``EdZ``-present gate also computes broadband PAR (port of
     ``compute.PAR.fitted.R``, see :mod:`pycops.processing.par`): ``par_0`` (a single scalar, from
@@ -532,6 +572,8 @@ def process_cast(
         r0m_linear = ed0_sub.r0m_linear
 
     kd_1pct = kd_10pct = kd_pd = pd_depth = None
+    kd_hard_excluded_wavelengths: tuple[float, ...] = ()
+    kd_warn_wavelengths: tuple[float, ...] = ()
     if "EdZ" in instrument_fits:
         edz_fit = instrument_fits["EdZ"]
         # R's generate.cops.DB.R always uses Ed0.0m (subsurface, diffuse/direct-decomposed); that
@@ -542,6 +584,25 @@ def process_cast(
         kd_1pct = kd_at_light_fraction(edz_fit.aop_fitted, edz_fit.depth_grid, ed0_subsurface, 0.01)
         kd_10pct = kd_at_light_fraction(edz_fit.aop_fitted, edz_fit.depth_grid, ed0_subsurface, 0.1)
         kd_pd = kd_at_light_fraction(edz_fit.aop_fitted, edz_fit.depth_grid, ed0_subsurface, 1 / np.e)
+
+        # Auto-QC (Simon, 2026-08-19), applied per metric independently -- kd_1pct/kd_10pct/kd_pd
+        # integrate to three different depths, so one being a fit artifact doesn't imply the
+        # others are too. Hard cutoff first (unconditional), then flag the gray zone from
+        # whatever's left finite.
+        kd_1pct, hard_1pct, warn_1pct = _auto_flag_kd(kd_1pct)
+        kd_10pct, hard_10pct, warn_10pct = _auto_flag_kd(kd_10pct)
+        kd_pd, hard_pd, warn_pd = _auto_flag_kd(kd_pd)
+        kd_hard_excluded_wavelengths = tuple(waves[hard_1pct | hard_10pct | hard_pd])
+        kd_warn_wavelengths = tuple(waves[warn_1pct | warn_10pct | warn_pd])
+
+        if excluded_kd_wavelengths:
+            kd_exclude_mask = np.any(
+                np.isclose(waves[:, None], np.asarray(excluded_kd_wavelengths, dtype=float)[None, :], atol=1e-6),
+                axis=1,
+            )
+            kd_1pct = np.where(kd_exclude_mask, np.nan, kd_1pct)
+            kd_10pct = np.where(kd_exclude_mask, np.nan, kd_10pct)
+            kd_pd = np.where(kd_exclude_mask, np.nan, kd_pd)
         # the penetration depth itself (m) -- kd_pd's own crossing depth, not the derived
         # attenuation coefficient -- for the "what does the satellite see, by color" diagnostic
         # (build_penetration_depth_figure).
@@ -559,9 +620,15 @@ def process_cast(
             par_u_fitted = instrument_fits["EuZ"].aop_fitted
             par_u_depth_grid = instrument_fits["EuZ"].depth_grid
         elif "LuZ" in instrument_fits:
-            luz_fit = instrument_fits["LuZ"]
-            par_u_fitted = luz_fit.aop_fitted * compute_q_factor(ds.attrs.get("chl_flag"), len(waves))[None, :]
-            par_u_depth_grid = luz_fit.depth_grid
+            try:
+                q_factor = compute_q_factor(ds.attrs.get("chl_flag"), len(waves))
+            except NotImplementedError:
+                pass  # chl > 0 Q factor not yet ported -- skip PAR_u/Kd(PAR) rather than crash,
+                # matching the Rrs path's own fallback for the same not-yet-ported case above.
+            else:
+                luz_fit = instrument_fits["LuZ"]
+                par_u_fitted = luz_fit.aop_fitted * q_factor[None, :]
+                par_u_depth_grid = luz_fit.depth_grid
         if par_u_fitted is not None:
             # LuZ/EuZ have their own depth grid, separate from EdZ's -- align onto EdZ's grid the
             # same way compute_bottom_reflectance() already does (bottom.py), rather than assuming
@@ -626,6 +693,8 @@ def process_cast(
         kd_1pct=kd_1pct,
         kd_10pct=kd_10pct,
         kd_pd=kd_pd,
+        kd_hard_excluded_wavelengths=kd_hard_excluded_wavelengths,
+        kd_warn_wavelengths=kd_warn_wavelengths,
         pd_depth=pd_depth,
         par_0=par_0,
         par_d_profile=par_d_profile,
@@ -641,5 +710,6 @@ def process_cast(
         resolved_latitude=lat,
         resolved_sun_zenith_deg=sun_zenith_deg,
         excluded_wavelengths=tuple(excluded_wavelengths) if excluded_wavelengths else (),
+        excluded_kd_wavelengths=tuple(excluded_kd_wavelengths) if excluded_kd_wavelengths else (),
         ed0_correction_method=resolved_ed0_correction_method,
     )

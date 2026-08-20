@@ -8,8 +8,10 @@ import xarray as xr
 from pycops.io.config import CastInfo
 from pycops.io.netcdf import cast_result_to_dataset
 from pycops.io.pdf_report import (
+    EXTRAPOLATION_DEPTH_LIMIT_M,
     _effective_tiltmax,
     _effective_time_window,
+    _extrapolation_x_lower_bound,
     _k0_at_adaptive_depth,
     _kept_mask,
     _mask_negligible_rb,
@@ -251,6 +253,82 @@ def test_build_extrapolation_grid_figure_only_plots_kept_scans():
     plotted_depths = scatter_line.get_ydata()
     assert 0.3 not in plotted_depths  # the excluded scan's own depth
     assert len(plotted_depths) == n - 1
+    plt.close(fig)
+
+
+def test_extrapolation_x_lower_bound_takes_min_of_loess_and_linear():
+    depth = np.linspace(0.0, 10.0, 101)  # 0.1 m steps
+    fitted = 10.0 * np.exp(-1.0 * depth)  # loess value at z=3 -> 10*exp(-3) ~ 0.4979
+    # linear curve reaches z=3 too (z_interval >= 3), with a steeper decay -> smaller value there
+    value_at_surface, k_surf, z_interval = 10.0, 1.5, 5.0  # 10*exp(-4.5) ~ 0.1111
+
+    bound = _extrapolation_x_lower_bound(depth, fitted, value_at_surface, k_surf, z_interval)
+
+    linear_value_at_3m = value_at_surface * np.exp(-k_surf * 3.0)
+    loess_value_at_3m = float(np.interp(3.0, depth, fitted))
+    assert linear_value_at_3m < loess_value_at_3m  # sanity-check the fixture's own premise
+    np.testing.assert_allclose(bound, linear_value_at_3m, rtol=1e-6)
+
+
+def test_extrapolation_x_lower_bound_uses_loess_only_when_linear_fit_shallower_than_limit():
+    depth = np.linspace(0.0, 10.0, 101)
+    fitted = 10.0 * np.exp(-1.0 * depth)
+    value_at_surface, k_surf, z_interval = 10.0, 1.5, 1.0  # linear fit doesn't reach z=3
+
+    bound = _extrapolation_x_lower_bound(depth, fitted, value_at_surface, k_surf, z_interval)
+
+    np.testing.assert_allclose(bound, float(np.interp(3.0, depth, fitted)), rtol=1e-6)
+
+
+def test_extrapolation_x_lower_bound_none_when_cast_never_reaches_depth_limit():
+    depth = np.linspace(0.0, 1.0, 11)  # shallow cast, never reaches 3 m
+    fitted = 10.0 * np.exp(-1.0 * depth)
+
+    bound = _extrapolation_x_lower_bound(depth, fitted, np.nan, np.nan, np.nan)
+
+    assert bound is None
+
+
+def test_build_extrapolation_grid_figure_fixes_depth_window_to_0_3m_and_sets_xlim():
+    """Simon's request: the LuZ/EuZ near-surface extrapolation figures (PDF + interactive tab)
+    must always show depth 0-3 m, with the x-axis lower bound set to the extrapolated value at
+    z=3 m rather than autoscaling down to noisy near-detection-limit points beyond that window."""
+    n = 20
+    depth = np.linspace(0.05, 10.0, n)
+    raw_ds = xr.Dataset(
+        {
+            "LuZ": (("time", "wavelength"), np.tile(10.0 * np.exp(-1.0 * depth)[:, None], (1, 1))),
+            "LuZ_Depth": ("time", depth),
+        },
+        coords={"time": np.arange(n), "wavelength": [340.0]},
+    )
+    depth_grid = np.linspace(0.0, 10.0, 51)
+    fitted = 10.0 * np.exp(-1.0 * depth_grid)
+    nc = xr.Dataset(
+        {
+            "LuZ_fitted": (("LuZ_depth", "wavelength"), fitted[:, None]),
+            "LuZ_surface_value_at_surface": ("wavelength", np.array([10.0])),
+            "LuZ_surface_k_surf": ("wavelength", np.array([1.5])),
+            "LuZ_surface_z_interval": ("wavelength", np.array([5.0])),
+            "LuZ_kept": ("time", np.ones(n, dtype=np.int8)),
+        },
+        coords={"time": np.arange(n), "wavelength": [340.0], "LuZ_depth": depth_grid},
+    )
+
+    fig = build_extrapolation_grid_figure(nc, raw_ds, "LuZ", None, "LuZ")
+
+    ax = fig.axes[0]
+    ymax, ymin = ax.get_ylim()  # inverted axis -- top value is the deeper bound
+    assert ymax == EXTRAPOLATION_DEPTH_LIMIT_M
+    assert ymin == 0
+
+    linear_value_at_3m = 10.0 * np.exp(-1.5 * 3.0)
+    xmin, _ = ax.get_xlim()
+    np.testing.assert_allclose(xmin, linear_value_at_3m, rtol=1e-3)
+
+    # only scans within the fixed 0-3 m window are plotted, not the full 0-10 m raw profile
+    scatter_line = ax.lines[0]
+    assert scatter_line.get_ydata().max() <= EXTRAPOLATION_DEPTH_LIMIT_M
     plt.close(fig)
 
 

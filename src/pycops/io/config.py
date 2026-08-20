@@ -9,6 +9,7 @@ position and any per-cast overrides. Ports ``read.init.R`` from the
 
 from __future__ import annotations
 
+import shutil
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,9 +54,20 @@ _INIT_COPS_DAT_INSTRUMENT_DEFAULTS: dict[str, dict[str, float]] = {
 # init.cops.dat files were already written (read.init.R warns and injects
 # these same values -- and rewrites the file -- the first time it hits an
 # older file missing them).
+#
+# depth.interval.for.smoothing.optics: Simon's explicit call (2026-08-19), overriding an earlier
+# per-cast dynamic-conversion design (see migrate_init_cops_dat's docstring) -- a legacy
+# time.interval.for.smoothing.optics-based file (pre-~2018, e.g. GreenEdge 2016) gets this
+# standard default value in memory too, exactly like every other backfilled parameter, rather than
+# a value derived from the old time-based one (which would vary per cast and complicate things for
+# no benefit Simon wanted).
 _PER_INSTRUMENT_DEFAULTS = {
     name: _INIT_COPS_DAT_INSTRUMENT_DEFAULTS[name]
-    for name in ("linear.fit.Rsquared.threshold.optics", "linear.fit.max.delta.depth.optics")
+    for name in (
+        "linear.fit.Rsquared.threshold.optics",
+        "linear.fit.max.delta.depth.optics",
+        "depth.interval.for.smoothing.optics",
+    )
 }
 _SCALAR_DEFAULTS = {
     "bandwidth": 10.0,
@@ -95,6 +107,19 @@ _CASTERS = {
 }
 
 
+def _parse_init_cops_raw(path: Path) -> dict[str, list[object]]:
+    raw: dict[str, list[object]] = {}
+    with path.open() as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            name, kind, value = (part.strip() for part in line.split(";", 2))
+            values = _CASTERS[kind]([v for v in value.split(",")])
+            raw[name] = values
+    return raw
+
+
 def read_init_cops(path: str | Path) -> dict[str, object]:
     """Parse an ``init.cops.dat`` file into a dict of processing parameters.
 
@@ -104,17 +129,7 @@ def read_init_cops(path: str | Path) -> dict[str, object]:
     ``instruments.optics``.
     """
     path = Path(path)
-    raw: dict[str, list[object]] = {}
-
-    with path.open() as f:
-        for line in f:
-            line = line.split("#", 1)[0].strip()
-            if not line:
-                continue
-            name, kind, value = (part.strip() for part in line.split(";", 2))
-            values = _CASTERS[kind]([v for v in value.split(",")])
-            raw[name] = values
-
+    raw = _parse_init_cops_raw(path)
     instruments = raw.get("instruments.optics", [])
 
     params: dict[str, object] = {}
@@ -195,6 +210,10 @@ INIT_COPS_DAT_HELP: dict[str, str] = {
     "instrument; adjust per station or per cast if known.",
     "tiltmax.optics": "Maximum tilt (degrees) beyond which a scan is rejected.",
     "depth.interval.for.smoothing.optics": "Depth interval (m) used for profile smoothing.",
+    "time.interval.for.smoothing.optics": "Legacy smoothing interval (seconds) -- pre-dates "
+    "depth.interval.for.smoothing.optics. Automatically commented out and replaced by "
+    "depth.interval.for.smoothing.optics (standard default values) the first time this file is "
+    "processed or opened in the clean tab; the original file is preserved as legacy.init.cops.dat.",
     "sub.surface.removed.layer.optics": "Thickness (m) of the sub-surface layer excluded from "
     "fitting (turbulence/wake near the boat).",
     "delta.capteur.optics": "Depth offset (m) between this sensor and the reference sensor -- a "
@@ -253,6 +272,11 @@ _INIT_COPS_DAT_LAYOUT = [
     ("instruments.optics", "character", "optics description"),
     ("tiltmax.optics", "numeric", None),
     ("depth.interval.for.smoothing.optics", "numeric", None),
+    # legacy field, pre-dates depth.interval.for.smoothing.optics -- a real file has one or the
+    # other, never both (see migrate_init_cops_dat's docstring); listed here too so a params dict
+    # that still carries it (an unmigrated legacy file's own read_init_cops() output) round-trips
+    # through format_init_cops_dat/write_init_cops instead of silently being dropped on save.
+    ("time.interval.for.smoothing.optics", "numeric", None),
     ("sub.surface.removed.layer.optics", "numeric", None),
     ("delta.capteur.optics", "numeric", None),
     ("radius.instrument.optics", "numeric", None),
@@ -303,6 +327,95 @@ def write_init_cops(path: str | Path, params: dict[str, object], *, overwrite: b
     if path.exists() and not overwrite:
         raise FileExistsError(f"{path} already exists; pass overwrite=True to replace it")
     path.write_text(format_init_cops_dat(params), newline="")
+
+
+_INIT_LAYOUT_KIND = {name: kind for name, kind, _ in _INIT_COPS_DAT_LAYOUT}
+
+
+def migrate_init_cops_dat(path: str | Path) -> list[str]:
+    """Append any of ``_PER_INSTRUMENT_DEFAULTS``/``_SCALAR_DEFAULTS``'s fields missing from an
+    ``init.cops.dat`` file, persisting them to disk; also comments out a legacy
+    ``time.interval.for.smoothing.optics`` line, now that ``depth.interval.for.smoothing.optics``
+    (in ``_PER_INSTRUMENT_DEFAULTS``) gets the same standard default value as every other
+    backfilled parameter (Simon, 2026-08-19: he didn't want the old per-cast dynamic-conversion
+    behavior an earlier version of this feature had -- see ``git log`` -- since it meant a
+    different depth value per cast instead of one predictable deployment-wide default).
+
+    Ports ``read.init.R``'s own behavior for these exact fields: it doesn't just warn and inject
+    an in-memory default (like :func:`read_init_cops` already does, unconditionally, for every
+    caller), it also ``write.table(..., append=TRUE, ...)``s the missing line onto the file
+    itself, so a legacy file only ever needs migrating once. :func:`read_init_cops` stays a plain,
+    side-effect-free read (used from many places -- the cast-cleaning UI's init editor, tests,
+    every other read site) on purpose; this is a separate, opt-in step called once by the actual
+    processing entry points (:func:`pycops.processing.deployment.process_deployment`/
+    ``reprocess_single_cast``) and the clean tab's own init editor (``ui/clean_app.py``) before
+    the file is otherwise used.
+
+    Preserves whatever line ending the file already uses (CRLF and LF-only files both seen in
+    real deployments -- see :func:`update_cast_info`'s own docstring), matching that surgical
+    writer's approach rather than normalizing the whole file.
+
+    Before writing anything, backs up the file's current on-disk content to ``legacy.init.cops.dat``
+    in the same directory (only if that backup doesn't already exist -- so it always holds the
+    oldest, truly-original version, not a since-migrated one) -- Simon's explicit request, so the
+    exact original file is never lost even though this now edits (not just appends to) the file.
+
+    Returns one human-readable string per change actually made (empty if the file was already up
+    to date) -- for a caller to log/display as a persistent "this file was updated" notice, rather
+    than relying on the easy-to-miss ``UserWarning`` :func:`read_init_cops` also still emits for
+    the same fields.
+    """
+    path = Path(path)
+    raw = _parse_init_cops_raw(path)
+    replace_time_interval = (
+        "time.interval.for.smoothing.optics" in raw and "depth.interval.for.smoothing.optics" not in raw
+    )
+    missing = [name for name in (*_PER_INSTRUMENT_DEFAULTS, *_SCALAR_DEFAULTS) if name not in raw]
+    if not missing:
+        return []
+
+    params = read_init_cops(path)  # same in-memory default injection/warnings as any other read
+    instruments = tuple(params["instruments.optics"])
+
+    backup_path = path.parent / "legacy.init.cops.dat"
+    if not backup_path.exists():
+        shutil.copy2(path, backup_path)
+
+    with path.open(newline="") as f:
+        lines = f.read().splitlines(keepends=True)
+    terminator = _dominant_terminator(lines)
+
+    changes = []
+    if replace_time_interval:
+        for i, line in enumerate(lines):
+            content = line.split("#", 1)[0].strip()
+            if content.startswith("time.interval.for.smoothing.optics;"):
+                lines[i] = "# " + line
+                break
+
+    new_lines = []
+    for name in missing:
+        kind = _INIT_LAYOUT_KIND[name]
+        formatted = _format_init_value(name, kind, params[name], instruments)
+        new_lines.append(f"{name};{kind};{formatted}")
+        if name == "depth.interval.for.smoothing.optics" and replace_time_interval:
+            changes.append(
+                f"time.interval.for.smoothing.optics commented out (see legacy.init.cops.dat for "
+                f"the original); depth.interval.for.smoothing.optics = {formatted} (standard "
+                f"default values)"
+            )
+        else:
+            changes.append(f"{name} = {formatted}")
+
+    if lines and not lines[-1].endswith(("\r\n", "\n", "\r")):
+        lines[-1] += terminator
+    for line in new_lines:
+        lines.append(line + terminator)
+
+    with path.open("w", newline="") as f:
+        f.writelines(lines)
+
+    return changes
 
 
 @dataclass(frozen=True)

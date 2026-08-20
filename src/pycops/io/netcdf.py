@@ -199,6 +199,9 @@ def cast_result_to_dataset(cast_result: CastResult, ds: xr.Dataset | None = None
     attrs["shadow_correction_note"] = cast_result.shadow_correction_note or ""
     attrs["bottom_note"] = cast_result.bottom_note or ""
     attrs["excluded_wavelengths"] = ",".join(f"{w:.10g}" for w in cast_result.excluded_wavelengths)
+    attrs["excluded_kd_wavelengths"] = ",".join(f"{w:.10g}" for w in cast_result.excluded_kd_wavelengths)
+    attrs["kd_hard_excluded_wavelengths"] = ",".join(f"{w:.10g}" for w in cast_result.kd_hard_excluded_wavelengths)
+    attrs["kd_warn_wavelengths"] = ",".join(f"{w:.10g}" for w in cast_result.kd_warn_wavelengths)
     attrs["ed0_correction_method"] = cast_result.ed0_correction_method
 
     if ds is not None:

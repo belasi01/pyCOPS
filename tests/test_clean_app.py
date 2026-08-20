@@ -82,7 +82,7 @@ def _make_init_for_processing():
     }
 
 
-def _make_deployment_result_and_datasets():
+def _make_deployment_result_and_datasets(config_migrations=None):
     init = _make_init_for_processing()
     ds = _make_processable_dataset()
     return (
@@ -92,6 +92,7 @@ def _make_deployment_result_and_datasets():
             bioshade_used=None,
             read_failures=[],
             processing_failures=[],
+            config_migrations=config_migrations or [],
         ),
         {CAST_1: ds},
     )
@@ -462,6 +463,47 @@ def test_clean_tab_init_cops_dat_editor_ed0_correction_method_prefills_and_saves
     assert read_init_cops(tmp_path / "init.cops.dat")["ed0.correction.method"] == "smoothed"
 
 
+def test_clean_tab_init_cops_dat_editor_migrates_legacy_time_interval_field(tmp_path):
+    """Real-world regression: GreenEdge 2016 station G300's init.cops.dat has
+    time.interval.for.smoothing.optics instead of depth.interval.for.smoothing.optics -- opening
+    the clean tab used to crash with KeyError('depth.interval.for.smoothing.optics'). Simon's
+    follow-up request (2026-08-19): don't derive per-cast depth values from the old seconds-based
+    field at all -- just migrate.init.cops.dat.'s deployment-wide default value in, comment out
+    the legacy field, and back up the original file, exactly as happens for the other backfilled
+    parameters -- and do this as soon as the clean tab opens the file, not only during processing."""
+    from pycops.io.config import read_init_cops
+
+    write_deployment(tmp_path)
+    init_path = tmp_path / "init.cops.dat"
+    original_text = init_path.read_text().replace(
+        "depth.interval.for.smoothing.optics;numeric; 10, 4,4,4\n",
+        "time.interval.for.smoothing.optics;numeric; 40, 40, 20,20\n",
+    )
+    init_path.write_text(original_text)
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="clean_dir").set_value(str(tmp_path)).run(timeout=30)
+
+    assert not at.exception
+    # depth.interval.for.smoothing.optics now shows the standard default (5.0 for EdZ), not
+    # anything derived from the old 40/40/20 seconds values.
+    assert at.number_input(key="clean_init_depth.interval.for.smoothing.optics_EdZ").value == 5.0
+    assert any("time.interval.for.smoothing.optics" in i.value for i in at.info)
+
+    backup_path = tmp_path / "legacy.init.cops.dat"
+    assert backup_path.exists()
+    assert backup_path.read_text() == original_text  # untouched original, byte-for-byte
+
+    migrated_text = init_path.read_text()
+    assert "# time.interval.for.smoothing.optics;numeric; 40, 40, 20,20" in migrated_text
+    assert "depth.interval.for.smoothing.optics;numeric;10,5,5,5" in migrated_text
+
+    saved = read_init_cops(init_path)
+    assert saved["depth.interval.for.smoothing.optics"] == {"Ed0": 10.0, "EdZ": 5.0, "LuZ": 5.0, "EuZ": 5.0}
+    assert "time.interval.for.smoothing.optics" not in saved
+
+
 def test_clean_tab_next_to_process_appears_only_once_all_casts_cleaned(tmp_path):
     """Fixture: select.cops.dat only covers casts 1/2, so cast 3 starts out not-yet-cleaned --
     the "Next -> Process casts" button shouldn't appear until it is."""
@@ -629,6 +671,48 @@ def test_process_tab_single_deployment_writes_nc_files(tmp_path, monkeypatch):
     assert not at.exception
     assert (tmp_path / "nc" / f"{Path(CAST_1).stem}.nc").exists()
     assert any("1 cast(s) processed" in m.value for m in at.markdown)
+
+
+def test_process_tab_shows_config_migrations_notice(tmp_path, monkeypatch):
+    """Simon's request: when a legacy init.cops.dat gets missing fields filled in and written back
+    to disk during processing, the UI must say so explicitly rather than only warning to a log."""
+    result, datasets = _make_deployment_result_and_datasets(
+        config_migrations=["windspeed_ms = 4", "ed0.correction.method = raw"]
+    )
+    monkeypatch.setattr(discovery_module, "discover_deployment", lambda directory: directory)
+    monkeypatch.setattr(
+        discovery_module,
+        "read_deployment_casts",
+        lambda deployment: DeploymentCastsResult(datasets=datasets, failures=[]),
+    )
+    monkeypatch.setattr(deployment_module, "process_deployment", lambda directory: result)
+    (tmp_path / "init.cops.dat").write_text("")
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="process_dir").set_value(str(tmp_path)).run(timeout=30)
+    at.button(key="process_single_run").click().run(timeout=30)
+
+    assert not at.exception
+    assert any(
+        "windspeed_ms = 4" in i.value and "ed0.correction.method = raw" in i.value for i in at.info
+    )
+
+
+def test_process_tab_no_config_migrations_notice_when_nothing_changed(tmp_path, monkeypatch):
+    _patch_successful_processing(monkeypatch)
+    (tmp_path / "init.cops.dat").write_text("")
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="process_dir").set_value(str(tmp_path)).run(timeout=30)
+    at.button(key="process_single_run").click().run(timeout=30)
+
+    assert not at.exception
+    # other tabs render their own unrelated "enter a folder" st.info placeholders on every rerun
+    # (every tab's body runs regardless of which one is visible) -- check for the absence of this
+    # specific notice, not a bare zero count.
+    assert not any("init.cops.dat was missing" in i.value for i in at.info)
 
 
 def test_process_tab_single_deployment_generates_pdf_reports_by_default(tmp_path, monkeypatch):
@@ -958,6 +1042,32 @@ def test_database_tab_unchecking_excludes_station(tmp_path):
     assert not at.exception
     df = pd.read_csv(parent / "TestMission.csv")
     assert list(df["station_id"]) == ["A"]
+
+
+def test_database_tab_select_all_and_unselect_all_buttons(tmp_path):
+    parent = tmp_path / "L2"
+    _write_fake_station(parent / "20200101_StationA" / "cops", {"CAST_001": ([1.0, 2.0], [100.0, 100.0])})
+    _write_fake_station(parent / "20200101_StationB" / "cops", {"CAST_001": ([3.0, 4.0], [200.0, 200.0])})
+    rel_a = Path("20200101_StationA") / "cops"
+    rel_b = Path("20200101_StationB") / "cops"
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="database_parent").set_value(str(parent)).run(timeout=30)
+
+    # both checked by default
+    assert at.checkbox(key=f"database_station_{rel_a}").value is True
+    assert at.checkbox(key=f"database_station_{rel_b}").value is True
+
+    at.button(key="database_unselect_all").click().run(timeout=30)
+    assert not at.exception
+    assert at.checkbox(key=f"database_station_{rel_a}").value is False
+    assert at.checkbox(key=f"database_station_{rel_b}").value is False
+
+    at.button(key="database_select_all").click().run(timeout=30)
+    assert not at.exception
+    assert at.checkbox(key=f"database_station_{rel_a}").value is True
+    assert at.checkbox(key=f"database_station_{rel_b}").value is True
 
 
 def test_database_tab_isolates_a_station_missing_nc_folder(tmp_path):

@@ -264,6 +264,109 @@ def test_process_cast_no_excluded_wavelengths_by_default():
     assert np.all(np.isfinite(result.rrs_loess.rrs_0p[2:]))
 
 
+def test_process_cast_excludes_specified_wavelengths_from_spectral_kd():
+    """Simon's follow-up request (2026-08-19): the same kind of final QC exclusion, but for the
+    spectral Kd outputs (kd_1pct/kd_10pct/kd_pd), independent of any Rrs exclusion -- a band can
+    show an occasional LOESS-fit artifact specific to EdZ's own near-surface extrapolation."""
+    ds = _make_dataset()  # include_edz=True by default
+    result = process_cast(ds, _make_init(), excluded_kd_wavelengths=[380.0])
+
+    assert np.isnan(result.kd_1pct[1])  # WAVES[1] == 380.0
+    assert np.isnan(result.kd_10pct[1])
+    assert np.isnan(result.kd_pd[1])
+    # untouched wavelengths, and the Rrs exclusion list, are unaffected
+    assert np.isfinite(result.kd_1pct[0])  # WAVES[0] == 340.0
+    assert result.excluded_kd_wavelengths == (380.0,)
+    assert result.excluded_wavelengths == ()
+
+
+def test_process_cast_excluded_kd_wavelengths_independent_of_rrs_exclusions():
+    ds = _make_dataset()
+    result = process_cast(ds, _make_init(), excluded_wavelengths=[340.0], excluded_kd_wavelengths=[380.0])
+
+    assert np.isnan(result.rrs_loess.rrs_0p[0])  # WAVES[0] == 340.0, Rrs-excluded only
+    assert np.isfinite(result.kd_1pct[0])  # not Kd-excluded
+    assert np.isnan(result.kd_1pct[1])  # WAVES[1] == 380.0, Kd-excluded only
+    assert np.isfinite(result.rrs_loess.rrs_0p[1])
+
+
+def test_process_cast_no_excluded_kd_wavelengths_by_default():
+    ds = _make_dataset()
+    result = process_cast(ds, _make_init())
+
+    assert result.excluded_kd_wavelengths == ()
+    assert np.all(np.isfinite(result.kd_1pct[:2]))
+
+
+def test_auto_flag_kd_hard_threshold_nans_values_over_20():
+    from pycops.processing.process_cast import _auto_flag_kd
+
+    kd = np.array([5.0, 20.0, 20.0001, 25.0, np.nan])
+
+    flagged, hard_mask, warn_mask = _auto_flag_kd(kd)
+
+    np.testing.assert_array_equal(hard_mask, [False, False, True, True, False])
+    assert np.isnan(flagged[2]) and np.isnan(flagged[3])
+    assert flagged[0] == 5.0 and flagged[1] == 20.0  # exactly 20 is not "over" 20
+    assert np.all(~warn_mask[2:4])  # hard-excluded values aren't also in the warn zone
+
+
+def test_auto_flag_kd_warn_zone_flags_without_excluding():
+    from pycops.processing.process_cast import _auto_flag_kd
+
+    kd = np.array([5.0, 10.0, 15.0, 19.9999, 20.0001])
+
+    flagged, hard_mask, warn_mask = _auto_flag_kd(kd)
+
+    np.testing.assert_array_equal(warn_mask, [False, True, True, True, False])
+    assert np.all(~hard_mask[:4])  # nothing in the warn zone is also hard-excluded
+    np.testing.assert_allclose(flagged[:4], kd[:4])  # warn-zone values are left untouched
+
+
+def test_auto_flag_kd_normal_values_untouched():
+    from pycops.processing.process_cast import _auto_flag_kd
+
+    kd = np.array([0.1, 2.0, 5.0, 9.9999])
+
+    flagged, hard_mask, warn_mask = _auto_flag_kd(kd)
+
+    np.testing.assert_allclose(flagged, kd)
+    assert not np.any(hard_mask)
+    assert not np.any(warn_mask)
+
+
+def test_process_cast_auto_excludes_kd_values_over_20_per_m(monkeypatch):
+    """Simon's request (2026-08-19): a Kd value over 20/m is essentially never real -- auto-NaN it
+    at the point of computation, regardless of the manual excluded_kd_wavelengths override."""
+    import pycops.processing.process_cast as process_cast_module
+
+    ds = _make_dataset()
+    # WAVES has 4 bands -- give kd_1pct an aberrant value at index 1 (380 nm), normal elsewhere.
+    fake_kd_1pct = np.array([2.0, 25.0, 3.0, 4.0])
+    monkeypatch.setattr(process_cast_module, "kd_at_light_fraction", lambda *a, **k: fake_kd_1pct.copy())
+
+    result = process_cast(ds, _make_init())
+
+    assert np.isnan(result.kd_1pct[1])
+    assert result.kd_1pct[0] == 2.0
+    assert result.kd_hard_excluded_wavelengths == (380.0,)  # WAVES[1] == 380.0
+    assert result.kd_warn_wavelengths == ()
+
+
+def test_process_cast_flags_kd_gray_zone_without_excluding(monkeypatch):
+    import pycops.processing.process_cast as process_cast_module
+
+    ds = _make_dataset()
+    fake_kd_1pct = np.array([2.0, 15.0, 3.0, 4.0])
+    monkeypatch.setattr(process_cast_module, "kd_at_light_fraction", lambda *a, **k: fake_kd_1pct.copy())
+
+    result = process_cast(ds, _make_init())
+
+    assert result.kd_1pct[1] == 15.0  # not auto-excluded, just flagged
+    assert result.kd_warn_wavelengths == (380.0,)
+    assert result.kd_hard_excluded_wavelengths == ()
+
+
 def test_process_cast_ed0_correction_method_defaults_to_raw():
     ds = _make_dataset()
     result = process_cast(ds, _make_init())
@@ -697,6 +800,22 @@ def test_process_cast_euz_only_positive_chl_leaves_rrs_none():
     assert result.rrs_loess is None
     assert result.rrs_linear is None
     assert set(result.instrument_fits) == {"EdZ", "EuZ"}  # fitting itself is unaffected
+
+
+def test_process_cast_luz_only_positive_chl_skips_par_u_instead_of_crashing():
+    """Real-world regression: GreenEdge G300 CAST_001 has chl=98 (a real chlorophyll value) and
+    only LuZ (no EuZ) -- the PAR_u/Kd(PAR) block's LuZ*Q.sun.nadir fallback (process_cast.py,
+    the ``elif "LuZ" in instrument_fits`` branch inside the PAR section) called compute_q_factor()
+    unguarded and crashed with NotImplementedError, unlike the otherwise-identical Rrs path just
+    above it which already handles this not-yet-ported case gracefully."""
+    ds = _make_dataset()  # LuZ + EdZ, no EuZ
+    ds.attrs["chl_flag"] = 98.0  # real chlorophyll concentration -- Q factor not ported
+
+    result = process_cast(ds, _make_init())  # must not raise
+
+    assert result.par_u_profile is None
+    assert result.par_0 is not None  # PAR_0/PAR_d don't depend on Q factor -- still computed
+    assert result.par_d_profile is not None
 
 
 def test_process_cast_computes_nlw_when_bandwidth_present():

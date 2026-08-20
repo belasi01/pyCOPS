@@ -38,7 +38,9 @@ from pycops.io.exclusions import read_wavelength_exclusions, update_wavelength_e
 from pycops.io.netcdf import write_cast_result
 from pycops.io.pdf_report import (
     _KD_PAR_MIN_DEPTH_M,
+    EXTRAPOLATION_DEPTH_LIMIT_M,
     _effective_time_window,
+    _extrapolation_x_lower_bound,
     _instruments_present,
     _kept_mask,
     _raw_scan_values,
@@ -121,6 +123,22 @@ def _render_overview(nc: xr.Dataset) -> None:
         st.warning(
             f"Wavelength(s) manually excluded from the final Rrs (set to NaN): "
             f"{nc.attrs['excluded_wavelengths']} nm."
+        )
+    if nc.attrs.get("excluded_kd_wavelengths"):
+        st.warning(
+            f"Wavelength(s) manually excluded from the spectral Kd (kd_1pct/kd_10pct/kd_pd set to "
+            f"NaN): {nc.attrs['excluded_kd_wavelengths']} nm."
+        )
+    if nc.attrs.get("kd_hard_excluded_wavelengths"):
+        st.warning(
+            f"Wavelength(s) automatically excluded from the spectral Kd (a value exceeded 20/m, "
+            f"essentially never a real natural-water value): {nc.attrs['kd_hard_excluded_wavelengths']} nm."
+        )
+    if nc.attrs.get("kd_warn_wavelengths"):
+        st.info(
+            f"Wavelength(s) with a spectral Kd value in the 10-20/m gray zone (not "
+            f"auto-excluded): {nc.attrs['kd_warn_wavelengths']} nm. Review in 'Adjust & reprocess' "
+            f"below and check the box there if you agree it should be excluded."
         )
 
 
@@ -269,8 +287,7 @@ def _render_extrapolation_comparison(
     if raw is not None:
         raw_values, corrected_values, raw_depth = raw
         kept = _kept_mask(nc, raw_ds, instrument, raw_depth)
-        near_surface = raw_depth <= max(z_interval[wi] * 1.5, 1.0) if np.isfinite(z_interval[wi]) else np.ones_like(raw_depth, dtype=bool)
-        show = kept & near_surface
+        show = kept & (raw_depth <= EXTRAPOLATION_DEPTH_LIMIT_M)
         plot_values = corrected_values if corrected_values is not None else raw_values
         label = "kept scans (Ed0-corrected)" if corrected_values is not None else "kept scans"
         ax.plot(plot_values[show], raw_depth[show], ".", markersize=4, color="tab:blue", label=label)
@@ -283,8 +300,12 @@ def _render_extrapolation_comparison(
         st.caption(f"No linear fit available at {w:g} nm (R² below threshold or too few points).")
     ax.set_xscale("log")
     ax.invert_yaxis()
-    if np.isfinite(z_interval[wi]):
-        ax.set_ylim(max(z_interval[wi] * 1.5, 1.0), 0)
+    ax.set_ylim(EXTRAPOLATION_DEPTH_LIMIT_M, 0)
+    x_lower = _extrapolation_x_lower_bound(
+        depth, fitted.isel(wavelength=wi).values, value_at_surface[wi], k_surf[wi], z_interval[wi]
+    )
+    if x_lower is not None and x_lower > 0:
+        ax.set_xlim(left=x_lower)
     ax.set_xlabel(f"{instrument} (log scale)")
     ax.set_ylabel("Depth (m)")
     ax.legend(loc="best", fontsize="small")
@@ -442,6 +463,34 @@ def _wavelength_exclusion_editor(nc: xr.Dataset, existing: list[float], *, key: 
     return [float(w) for w in edited.loc[edited["Exclude (set to NaN)"], "Wavelength (nm)"]]
 
 
+def _kd_wavelength_exclusion_table(nc: xr.Dataset, existing: list[float]) -> pd.DataFrame:
+    """Same idea as :func:`_wavelength_exclusion_table`, but for the spectral Kd outputs
+    (Simon, 2026-08-19: a band can pass validation but still show an occasional LOESS-fit
+    artifact specific to EdZ's own near-surface extrapolation, independent of any Rrs exclusion).
+    Kd has no loess-vs-linear method choice the way Rrs does -- kd_1pct/kd_10pct/kd_pd are always
+    derived from EdZ's LOESS-fitted profile -- so all three light-level fractions are shown for
+    context instead of two methods."""
+    waves = nc["wavelength"].values
+    columns = {"Wavelength (nm)": waves}
+    for label, var in (("Kd 1%", "kd_1pct"), ("Kd 10%", "kd_10pct"), ("Kd pd", "kd_pd")):
+        columns[label] = nc[var].values if var in nc.data_vars else np.full(waves.shape, np.nan)
+    warn_waves = [float(w) for w in nc.attrs.get("kd_warn_wavelengths", "").split(",") if w.strip()]
+    columns["Flagged (10-20/m)"] = [any(abs(w - warn_w) < 1e-6 for warn_w in warn_waves) for w in waves]
+    columns["Exclude (set to NaN)"] = [any(abs(w - existing_w) < 1e-6 for existing_w in existing) for w in waves]
+    return pd.DataFrame(columns)
+
+
+def _kd_wavelength_exclusion_editor(nc: xr.Dataset, existing: list[float], *, key: str) -> list[float]:
+    edited = st.data_editor(
+        _kd_wavelength_exclusion_table(nc, existing),
+        key=key,
+        hide_index=True,
+        disabled=("Wavelength (nm)", "Kd 1%", "Kd 10%", "Kd pd", "Flagged (10-20/m)"),
+        use_container_width=True,
+    )
+    return [float(w) for w in edited.loc[edited["Exclude (set to NaN)"], "Wavelength (nm)"]]
+
+
 def _render_qc_actions(
     directory: Path,
     nc_dir: Path,
@@ -472,6 +521,7 @@ def _render_qc_actions(
     info_path = directory / "info.cops.dat"
     select_path = directory / "select.cops.dat"
     exclusions_path = directory / "rrs_wavelength_exclusions.cops.dat"
+    kd_exclusions_path = directory / "kd_wavelength_exclusions.cops.dat"
     ed0_method_path = directory / "ed0_correction_method.cops.dat"
     cast_file = raw_path.name
 
@@ -528,6 +578,11 @@ def _render_qc_actions(
         excluded_waves = _wavelength_exclusion_editor(
             nc, existing_exclusions, key=f"analyze_exclude_waves::{selected}"
         )
+        st.caption("Spectral Kd wavelength exclusions -- checked bands are set to NaN in kd_1pct/kd_10pct/kd_pd.")
+        existing_kd_exclusions = read_wavelength_exclusions(kd_exclusions_path).get(cast_file, [])
+        excluded_kd_waves = _kd_wavelength_exclusion_editor(
+            nc, existing_kd_exclusions, key=f"analyze_exclude_kd_waves::{selected}"
+        )
         override_texts = render_override_fields_editor(
             info, instruments, key_prefix=f"analyze_override::{selected}"
         )
@@ -555,6 +610,7 @@ def _render_qc_actions(
         method != default_method
         or ed0_method != default_ed0_method
         or sorted(excluded_waves) != sorted(existing_exclusions)
+        or sorted(excluded_kd_waves) != sorted(existing_kd_exclusions)
         or (round(start, 6), round(end, 6)) != (round(saved_start, 6), round(saved_end, 6))
         or override_texts != saved_overrides
     )
@@ -581,6 +637,7 @@ def _render_qc_actions(
                 return
             update_cast_selection(select_path, cast_file, flag, method, shallow=shallow)
             update_wavelength_exclusions(exclusions_path, cast_file, excluded_waves)
+            update_wavelength_exclusions(kd_exclusions_path, cast_file, excluded_kd_waves)
             update_ed0_correction_method(ed0_method_path, cast_file, ed0_method)
             try:
                 reprocessed = reprocess_single_cast(directory, cast_file)
@@ -588,17 +645,24 @@ def _render_qc_actions(
                 st.error(f"Reprocessing failed: {exc}")
                 return
             write_cast_result(reprocessed.result, nc_dir / f"{selected}.nc", ds=reprocessed.ds)
-            st.session_state["analyze_action_message"] = (
+            message = (
                 f"Reprocessed {cast_file} -- select.cops.dat, info.cops.dat, "
                 "ed0_correction_method.cops.dat, and the .nc file have all been saved with your "
                 "new parameters (the diagnostics below already reflect them). Click 'Validate and "
                 "next' whenever you're satisfied with this cast."
             )
+            if reprocessed.config_migrations:
+                message += (
+                    " init.cops.dat was also missing some parameters, filled in with defaults "
+                    "and saved: " + "; ".join(reprocessed.config_migrations) + "."
+                )
+            st.session_state["analyze_action_message"] = message
             # st.data_editor keeps its own cached grid state across reruns under the same key --
             # without this, the wavelength-exclusion table's Rrs (loess)/Rrs (linear) preview
             # columns would keep showing pre-reprocess values even though the underlying .nc (and
             # every other plot on the page) is already correctly updated.
             st.session_state.pop(f"analyze_exclude_waves::{selected}", None)
+            st.session_state.pop(f"analyze_exclude_kd_waves::{selected}", None)
             st.toast(f"Reprocessed {cast_file}")
             st.rerun()
     with col2:

@@ -131,10 +131,10 @@ def _make_minimal_init():
     }
 
 
-def _write_nc(tmp_path, ds, init, filename=_CAST_FILE, stem=_CAST_STEM):
+def _write_nc(tmp_path, ds, init, filename=_CAST_FILE, stem=_CAST_STEM, **process_cast_kwargs):
     nc_dir = tmp_path / "nc"
     nc_dir.mkdir(parents=True, exist_ok=True)
-    result = process_cast(ds, init)
+    result = process_cast(ds, init, **process_cast_kwargs)
     write_cast_result(result, nc_dir / f"{stem}.nc", ds=ds)
 
     # A real init.cops.dat on disk too (not just the in-memory `init` dict process_cast() took),
@@ -537,6 +537,98 @@ def test_analyze_tab_wavelength_exclusion_editor_renders(tmp_path):
     assert any("wavelength exclusions" in c.value for c in at.caption)
 
 
+def test_kd_wavelength_exclusion_table_prechecks_existing_exclusions():
+    from pycops.ui.analyze_app import _kd_wavelength_exclusion_table
+
+    nc = xr.Dataset(
+        {
+            "kd_1pct": ("wavelength", [1.0, 2.0, 3.0]),
+            "kd_10pct": ("wavelength", [1.1, 2.1, 3.1]),
+            "kd_pd": ("wavelength", [1.2, 2.2, 3.2]),
+        },
+        coords={"wavelength": [340.0, 380.0, 443.0]},
+    )
+
+    table = _kd_wavelength_exclusion_table(nc, existing=[380.0])
+
+    assert list(table["Exclude (set to NaN)"]) == [False, True, False]
+    assert list(table["Wavelength (nm)"]) == [340.0, 380.0, 443.0]
+
+
+def test_kd_wavelength_exclusion_table_no_existing_exclusions_all_unchecked():
+    from pycops.ui.analyze_app import _kd_wavelength_exclusion_table
+
+    nc = xr.Dataset(
+        {"kd_1pct": ("wavelength", [1.0, 2.0])},
+        coords={"wavelength": [340.0, 380.0]},
+    )
+
+    table = _kd_wavelength_exclusion_table(nc, existing=[])
+
+    assert list(table["Exclude (set to NaN)"]) == [False, False]
+
+
+def test_kd_wavelength_exclusion_table_flags_gray_zone_wavelengths():
+    from pycops.ui.analyze_app import _kd_wavelength_exclusion_table
+
+    nc = xr.Dataset(
+        {"kd_1pct": ("wavelength", [1.0, 15.0, 3.0])},
+        coords={"wavelength": [340.0, 380.0, 443.0]},
+    )
+    nc.attrs["kd_warn_wavelengths"] = "380"
+
+    table = _kd_wavelength_exclusion_table(nc, existing=[])
+
+    assert list(table["Flagged (10-20/m)"]) == [False, True, False]
+    assert list(table["Exclude (set to NaN)"]) == [False, False, False]  # flagged != auto-checked
+
+
+def test_analyze_tab_overview_warns_about_kd_hard_excluded_and_gray_zone(tmp_path, monkeypatch):
+    import pycops.processing.process_cast as process_cast_module
+
+    monkeypatch.setattr(
+        process_cast_module, "kd_at_light_fraction", lambda *a, **k: np.array([2.0, 25.0, 15.0, 4.0])
+    )
+    _write_nc(tmp_path, _make_full_dataset(), _make_full_init())
+    _write_cast_file(tmp_path, _CAST_FILE)
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="analyze_dir").set_value(str(tmp_path)).run(timeout=30)
+
+    assert not at.exception
+    assert any("automatically excluded from the spectral Kd" in w.value for w in at.warning)
+    assert any("10-20/m gray zone" in i.value for i in at.info)
+
+
+def test_analyze_tab_kd_wavelength_exclusion_editor_renders(tmp_path):
+    """Smoke test only, same caveat as the Rrs exclusion editor's own test above."""
+    from pycops.io.exclusions import update_wavelength_exclusions
+
+    _write_nc(tmp_path, _make_full_dataset(), _make_full_init())  # needs EdZ for kd_1pct/etc.
+    _write_cast_file(tmp_path, _CAST_FILE)
+    update_wavelength_exclusions(tmp_path / "kd_wavelength_exclusions.cops.dat", _CAST_FILE, [380.0])
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="analyze_dir").set_value(str(tmp_path)).run(timeout=30)
+
+    assert not at.exception
+    assert any("Spectral Kd wavelength exclusions" in c.value for c in at.caption)
+
+
+def test_analyze_tab_overview_warns_about_excluded_kd_wavelengths(tmp_path):
+    _write_nc(tmp_path, _make_full_dataset(), _make_full_init(), excluded_kd_wavelengths=[380.0])
+    _write_cast_file(tmp_path, _CAST_FILE)
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="analyze_dir").set_value(str(tmp_path)).run(timeout=30)
+
+    assert not at.exception
+    assert any("excluded from the spectral Kd" in w.value for w in at.warning)
+
+
 def test_analyze_tab_qwip_shallow_water_shows_note_instead_of_failed(tmp_path):
     """A shallow cast whose QWIP score fails (|score|>=0.1) and is negative should read as
     expected/informational, not as a quality-control failure -- Simon's own domain-knowledge
@@ -671,6 +763,38 @@ def test_analyze_tab_reprocess_shows_success_banner_after_rerun(tmp_path, monkey
     assert "select.cops.dat" in banner
     assert "info.cops.dat" in banner
     assert ".nc" in banner
+
+
+def test_analyze_tab_reprocess_banner_mentions_config_migrations(tmp_path, monkeypatch):
+    """When reprocess_single_cast() reports that init.cops.dat had missing fields filled in and
+    saved (see deployment.py's config_migrations), the success banner must say so -- otherwise a
+    real on-disk file change happens invisibly to the researcher."""
+    import pycops.ui.analyze_app as analyze_app_module
+    from pycops.processing.deployment import ReprocessedCast
+
+    _write_nc(tmp_path, _make_minimal_dataset(), _make_minimal_init())
+    _write_cast_file(tmp_path, _CAST_FILE)
+
+    fake_result = process_cast(_make_minimal_dataset(), _make_minimal_init())
+    monkeypatch.setattr(
+        analyze_app_module,
+        "reprocess_single_cast",
+        lambda directory, file, position_overrides=None: ReprocessedCast(
+            result=fake_result,
+            ds=_make_minimal_dataset(),
+            config_migrations=["windspeed_ms = 4"],
+        ),
+    )
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="analyze_dir").set_value(str(tmp_path)).run(timeout=30)
+    at.button(key="analyze_reprocess").click().run(timeout=30)
+
+    assert not at.exception
+    banner = next((s.value for s in at.success if f"Reprocessed {_CAST_FILE}" in s.value), None)
+    assert banner is not None
+    assert "windspeed_ms = 4" in banner
     assert "Validate and next" in banner
 
 

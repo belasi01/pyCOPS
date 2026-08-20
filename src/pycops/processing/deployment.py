@@ -27,7 +27,7 @@ from pathlib import Path
 import pandas as pd
 import xarray as xr
 
-from pycops.io.config import absorption_for_cast, read_absorption_cops
+from pycops.io.config import absorption_for_cast, migrate_init_cops_dat, read_absorption_cops
 from pycops.io.discovery import (
     CastReadFailure,
     Deployment,
@@ -104,6 +104,7 @@ class DeploymentProcessingResult:
     bioshade_used: BioShadeResult | None  # the one passed to every cast_results entry, if any
     read_failures: list[CastReadFailure] = field(default_factory=list)
     processing_failures: list[CastProcessingFailure] = field(default_factory=list)
+    config_migrations: list[str] = field(default_factory=list)  # init.cops.dat fields added on disk
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,22 @@ class ReprocessedCast:
 
     result: CastResult
     ds: xr.Dataset
+    config_migrations: list[str] = field(default_factory=list)  # init.cops.dat fields added on disk
+
+
+def _migrate_init_cops_dat(directory: Path) -> list[str]:
+    """Persist any missing init.cops.dat fields to disk (see
+    :func:`pycops.io.config.migrate_init_cops_dat`) and log what changed, once per processing
+    entry point -- so a legacy file only ever needs this the first time it's processed, and every
+    later read (including PDF report generation, which reads init.cops.dat outside this module's
+    own warnings-capturing context) sees an already-complete file with nothing left to default."""
+    init_path = directory / "init.cops.dat"
+    if not init_path.exists():
+        return []
+    changes = migrate_init_cops_dat(init_path)
+    for change in changes:
+        logger.info("init.cops.dat: added missing %s", change)
+    return changes
 
 
 def _load_absorption_table(directory: Path) -> pd.DataFrame | None:
@@ -124,6 +141,10 @@ def _load_absorption_table(directory: Path) -> pd.DataFrame | None:
 
 def _load_wavelength_exclusions(directory: Path) -> dict[str, list[float]]:
     return read_wavelength_exclusions(directory / "rrs_wavelength_exclusions.cops.dat")
+
+
+def _load_kd_wavelength_exclusions(directory: Path) -> dict[str, list[float]]:
+    return read_wavelength_exclusions(directory / "kd_wavelength_exclusions.cops.dat")
 
 
 def _load_ed0_correction_methods(directory: Path) -> dict[str, str]:
@@ -169,6 +190,7 @@ def _process_kept_cast(
     position_overrides: dict[str, PositionOverride] | None,
     excluded_wavelengths: list[float] | None = None,
     ed0_correction_method: str | None = None,
+    excluded_kd_wavelengths: list[float] | None = None,
 ) -> CastResult:
     """The per-cast body shared by :func:`process_deployment`'s loop and
     :func:`reprocess_single_cast`, so both always process one cast exactly the same way."""
@@ -189,6 +211,7 @@ def _process_kept_cast(
         bioshade=bioshade_used,
         position_override=position_override,
         excluded_wavelengths=excluded_wavelengths,
+        excluded_kd_wavelengths=excluded_kd_wavelengths,
         ed0_correction_method=ed0_correction_method,
     )
 
@@ -244,6 +267,7 @@ def reprocess_single_cast(
     directory = Path(directory)
     with station_log_handler(directory / "nc", mode="a"):
         logger.info("Reprocessing cast %s", file)
+        config_migrations = _migrate_init_cops_dat(directory)
         deployment = discover_deployment(directory)
         record = next((r for r in deployment.casts if r.info.file == file), None)
         if record is None:
@@ -253,6 +277,7 @@ def reprocess_single_cast(
         gps_table = _load_gps_table(directory)
         bioshade_used = _find_bioshade_result(directory, deployment)
         excluded_wavelengths = _load_wavelength_exclusions(directory).get(file)
+        excluded_kd_wavelengths = _load_kd_wavelength_exclusions(directory).get(file)
         ed0_correction_method = _load_ed0_correction_methods(directory).get(file)
 
         ds = read_one_cast(record, deployment.init)
@@ -268,12 +293,13 @@ def reprocess_single_cast(
                 position_overrides,
                 excluded_wavelengths,
                 ed0_correction_method,
+                excluded_kd_wavelengths,
             )
         except Exception:
             logger.exception("%s: reprocessing failed", file)
             raise
         _log_cast_summary(file, result)
-    return ReprocessedCast(result=result, ds=ds)
+    return ReprocessedCast(result=result, ds=ds, config_migrations=config_migrations)
 
 
 def process_deployment(
@@ -321,11 +347,13 @@ def process_deployment(
     directory = Path(directory)
     with station_log_handler(directory / "nc", mode="w"):
         logger.info("Processing deployment %s", directory)
+        config_migrations = _migrate_init_cops_dat(directory)
         deployment: Deployment = discover_deployment(directory)
         read_result = read_deployment_casts(deployment)
         absorption_table = _load_absorption_table(directory)
         gps_table = _load_gps_table(directory)
         wavelength_exclusions = _load_wavelength_exclusions(directory)
+        kd_wavelength_exclusions = _load_kd_wavelength_exclusions(directory)
         ed0_correction_methods = _load_ed0_correction_methods(directory)
         chl_flag_by_file = {record.info.file: record.info.chl_flag for record in deployment.kept_casts()}
 
@@ -379,6 +407,7 @@ def process_deployment(
                     position_overrides,
                     wavelength_exclusions.get(file),
                     ed0_correction_methods.get(file),
+                    kd_wavelength_exclusions.get(file),
                 )
             except Exception as exc:  # noqa: BLE001 -- isolate one bad cast from the rest
                 error = f"{type(exc).__name__}: {exc}"
@@ -402,4 +431,5 @@ def process_deployment(
         bioshade_used=bioshade_used,
         read_failures=read_result.failures,
         processing_failures=processing_failures,
+        config_migrations=config_migrations,
     )

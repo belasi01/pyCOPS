@@ -159,6 +159,18 @@ def render_database_tab() -> None:
         return
 
     st.write(f"{len(folders)} station(s) found -- uncheck any to exclude them:")
+    col_select_all, col_unselect_all, _ = st.columns([1, 1, 4])
+    with col_select_all:
+        if st.button("Select all", key="database_select_all"):
+            for folder in folders:
+                st.session_state[f"database_station_{folder.relative_to(parent)}"] = True
+            st.rerun()
+    with col_unselect_all:
+        if st.button("Unselect all", key="database_unselect_all"):
+            for folder in folders:
+                st.session_state[f"database_station_{folder.relative_to(parent)}"] = False
+            st.rerun()
+
     checked: list[Path] = []
     for folder in folders:
         rel = folder.relative_to(parent)

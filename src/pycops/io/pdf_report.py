@@ -144,6 +144,35 @@ def _kept_mask(nc: xr.Dataset, raw_ds: xr.Dataset | None, instrument: str, raw_d
     return np.ones(raw_depth.shape, dtype=bool)
 
 
+EXTRAPOLATION_DEPTH_LIMIT_M = 3.0  # Simon's request: LuZ/EuZ extrapolation plots always show 0-3 m
+
+
+def _extrapolation_x_lower_bound(
+    depth: np.ndarray,
+    fitted_values: np.ndarray,
+    value_at_surface: float,
+    k_surf: float,
+    z_interval: float,
+    depth_limit: float = EXTRAPOLATION_DEPTH_LIMIT_M,
+) -> float | None:
+    """The LOESS and/or linear extrapolation curve's value at ``depth_limit`` (m), whichever is
+    smaller -- used as the extrapolation-comparison plot's x-axis lower bound (Simon: with the
+    depth axis now fixed to 0-3 m, a few near-detection-limit points beyond that window shouldn't
+    force the x-axis down to near-zero/noisy values).
+
+    ``None`` when neither curve has a usable value at ``depth_limit`` (e.g. the cast/fit never
+    reaches that depth, or both are NaN there) -- the caller should leave the axis auto-scaled in
+    that case rather than clip to nothing.
+    """
+    candidates = []
+    loess_value = np.interp(depth_limit, depth, fitted_values, left=np.nan, right=np.nan)
+    if np.isfinite(loess_value):
+        candidates.append(float(loess_value))
+    if np.isfinite(value_at_surface) and np.isfinite(k_surf) and np.isfinite(z_interval) and z_interval >= depth_limit:
+        candidates.append(float(value_at_surface * np.exp(-k_surf * depth_limit)))
+    return min(candidates) if candidates else None
+
+
 def _effective_time_window(
     init: dict[str, object], info: CastInfo | None
 ) -> tuple[float, float] | None:
@@ -236,7 +265,10 @@ def build_cover_page(
         f"Rrs source: {nc.attrs.get('rrs_source') or '-'}",
         f"shallow: {'yes' if nc.attrs.get('shallow') else 'no'}",
         f"Ed0 correction method: {nc.attrs.get('ed0_correction_method', '-')}",
-        f"excluded wavelengths: {nc.attrs.get('excluded_wavelengths') or '-'}",
+        f"excluded wavelengths (Rrs): {nc.attrs.get('excluded_wavelengths') or '-'}",
+        f"excluded wavelengths (Kd): {nc.attrs.get('excluded_kd_wavelengths') or '-'}",
+        f"auto-excluded Kd wavelengths (>20/m): {nc.attrs.get('kd_hard_excluded_wavelengths') or '-'}",
+        f"Kd wavelengths flagged (10-20/m): {nc.attrs.get('kd_warn_wavelengths') or '-'}",
     ]
     time_window = _effective_time_window(init, info) if init is not None else None
     if time_window is not None:
@@ -690,12 +722,7 @@ def build_extrapolation_grid_figure(
         if raw is not None:
             raw_values, corrected_values, raw_depth = raw
             kept = _kept_mask(nc, raw_ds, instrument, raw_depth)
-            near_surface = (
-                raw_depth <= max(z_interval[wi] * 1.5, 1.0)
-                if np.isfinite(z_interval[wi])
-                else np.ones_like(raw_depth, dtype=bool)
-            )
-            show = kept & near_surface
+            show = kept & (raw_depth <= EXTRAPOLATION_DEPTH_LIMIT_M)
             plot_values = corrected_values if corrected_values is not None else raw_values
             ax.plot(plot_values[show], raw_depth[show], ".", markersize=3, color="tab:blue")
         ax.plot(fitted.isel(wavelength=wi).values, depth, color="tab:red", lw=1.5)
@@ -705,8 +732,12 @@ def build_extrapolation_grid_figure(
             ax.plot(linear_curve, z_line, color="tab:green", lw=1.5, ls="--")
         ax.set_xscale("log")
         ax.invert_yaxis()
-        if np.isfinite(z_interval[wi]):
-            ax.set_ylim(max(z_interval[wi] * 1.5, 1.0), 0)
+        ax.set_ylim(EXTRAPOLATION_DEPTH_LIMIT_M, 0)
+        x_lower = _extrapolation_x_lower_bound(
+            depth, fitted.isel(wavelength=wi).values, value_at_surface[wi], k_surf[wi], z_interval[wi]
+        )
+        if x_lower is not None and x_lower > 0:
+            ax.set_xlim(left=x_lower)
         ax.set_title(f"{w:g} nm", fontsize=9)
         ax.tick_params(labelsize=7)
 

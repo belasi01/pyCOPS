@@ -5,6 +5,8 @@ import pandas as pd
 import pytest
 import xarray as xr
 
+from conftest import INIT_COPS_DAT
+
 import pycops.processing.deployment as deployment_module
 from pycops.io.config import CastInfo
 from pycops.io.discovery import CastRecord, CastReadFailure, CastSelection, Deployment, DeploymentCastsResult
@@ -209,6 +211,63 @@ def test_reprocess_single_cast_matches_process_deployment(tmp_path, monkeypatch)
     assert single.shadow_correction_note == full_result.cast_results[PROFILE_CAST].shadow_correction_note
 
 
+def test_process_deployment_migrates_legacy_init_cops_dat(tmp_path, monkeypatch):
+    """Real-world regression: GreenEdge 2016 init.cops.dat files (and INIT_COPS_DAT here, which
+    mirrors that same shape) predate linear.fit.*/windspeed_ms/ed0.correction.method -- these must
+    get filled in with defaults and persisted to disk, not just injected in memory every run."""
+    (tmp_path / "init.cops.dat").write_text(INIT_COPS_DAT)
+    deployment = _make_deployment(tmp_path)
+    datasets = {
+        PROFILE_CAST: _with_position_attrs(_with_real_time(_make_profile_dataset()), 999.0),
+        BIOSHADE_CAST: _make_bioshade_dataset(),
+    }
+    _patch_discovery(monkeypatch, deployment, datasets)
+
+    result = process_deployment(tmp_path)
+
+    assert any("windspeed_ms" in c for c in result.config_migrations)
+    assert any("ed0.correction.method" in c for c in result.config_migrations)
+    text = (tmp_path / "init.cops.dat").read_text()
+    assert "windspeed_ms;numeric;4" in text
+    assert "ed0.correction.method;character;raw" in text
+
+    # a second run against the now-migrated file has nothing left to add
+    result_again = process_deployment(tmp_path)
+    assert result_again.config_migrations == []
+
+
+def test_reprocess_single_cast_migrates_legacy_init_cops_dat(tmp_path, monkeypatch):
+    (tmp_path / "init.cops.dat").write_text(INIT_COPS_DAT)
+    deployment = _make_deployment(tmp_path)
+    datasets = {
+        PROFILE_CAST: _with_position_attrs(_with_real_time(_make_profile_dataset()), 999.0),
+        BIOSHADE_CAST: _make_bioshade_dataset(),
+    }
+    monkeypatch.setattr(deployment_module, "discover_deployment", lambda directory: deployment)
+    monkeypatch.setattr(deployment_module, "read_one_cast", lambda record, init: datasets[record.info.file])
+
+    reprocessed = reprocess_single_cast(tmp_path, PROFILE_CAST)
+
+    assert any("windspeed_ms" in c for c in reprocessed.config_migrations)
+    assert "windspeed_ms;numeric;4" in (tmp_path / "init.cops.dat").read_text()
+
+
+def test_process_deployment_config_migrations_empty_when_no_init_cops_dat_file(tmp_path, monkeypatch):
+    # the usual test fixture in this file never writes a real init.cops.dat to disk (Deployment's
+    # init dict is supplied directly to the mocked discover_deployment) -- migration must degrade
+    # to a no-op rather than crash on a missing file.
+    deployment = _make_deployment(tmp_path)
+    datasets = {
+        PROFILE_CAST: _with_position_attrs(_with_real_time(_make_profile_dataset()), 999.0),
+        BIOSHADE_CAST: _make_bioshade_dataset(),
+    }
+    _patch_discovery(monkeypatch, deployment, datasets)
+
+    result = process_deployment(tmp_path)
+
+    assert result.config_migrations == []
+
+
 def test_process_deployment_applies_saved_wavelength_exclusions(tmp_path, monkeypatch):
     from pycops.io.exclusions import update_wavelength_exclusions
 
@@ -244,6 +303,44 @@ def test_reprocess_single_cast_applies_saved_wavelength_exclusions(tmp_path, mon
 
     assert reprocessed.result.excluded_wavelengths == (380.0,)
     assert np.isnan(reprocessed.result.rrs_linear.rrs_0p[1])
+
+
+def test_process_deployment_applies_saved_kd_wavelength_exclusions(tmp_path, monkeypatch):
+    from pycops.io.exclusions import update_wavelength_exclusions
+
+    deployment = _make_deployment(tmp_path)
+    datasets = {
+        PROFILE_CAST: _with_position_attrs(_with_real_time(_make_profile_dataset()), 999.0),
+        BIOSHADE_CAST: _make_bioshade_dataset(),
+    }
+    _patch_discovery(monkeypatch, deployment, datasets)
+    update_wavelength_exclusions(tmp_path / "kd_wavelength_exclusions.cops.dat", PROFILE_CAST, [380.0])
+
+    result = process_deployment(tmp_path)
+
+    cast_result = result.cast_results[PROFILE_CAST]
+    assert cast_result.excluded_kd_wavelengths == (380.0,)
+    assert np.isnan(cast_result.kd_1pct[1])  # WAVES[1] == 380.0
+    assert np.isfinite(cast_result.kd_1pct[0])
+    assert cast_result.excluded_wavelengths == ()  # the separate Rrs exclusion list is untouched
+
+
+def test_reprocess_single_cast_applies_saved_kd_wavelength_exclusions(tmp_path, monkeypatch):
+    from pycops.io.exclusions import update_wavelength_exclusions
+
+    deployment = _make_deployment(tmp_path)
+    datasets = {
+        PROFILE_CAST: _with_position_attrs(_with_real_time(_make_profile_dataset()), 999.0),
+        BIOSHADE_CAST: _make_bioshade_dataset(),
+    }
+    monkeypatch.setattr(deployment_module, "discover_deployment", lambda directory: deployment)
+    monkeypatch.setattr(deployment_module, "read_one_cast", lambda record, init: datasets[record.info.file])
+    update_wavelength_exclusions(tmp_path / "kd_wavelength_exclusions.cops.dat", PROFILE_CAST, [380.0])
+
+    reprocessed = reprocess_single_cast(tmp_path, PROFILE_CAST)
+
+    assert reprocessed.result.excluded_kd_wavelengths == (380.0,)
+    assert np.isnan(reprocessed.result.kd_1pct[1])
 
 
 def test_process_deployment_applies_saved_ed0_correction_method(tmp_path, monkeypatch):

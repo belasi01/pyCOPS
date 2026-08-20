@@ -40,6 +40,7 @@ from pycops.io.config import (
     INIT_COPS_DAT_HELP,
     CastInfo,
     default_init_cops_params,
+    migrate_init_cops_dat,
     parse_optional_float,
     read_init_cops,
     update_cast_info,
@@ -239,7 +240,14 @@ def _render_instrument_params_table(
     """One editable row per entry in :data:`_INIT_GEN_INSTRUMENT_PARAMS`, one column per
     instrument -- mutates ``params[name][instr]`` in place from each widget's value. Shared by
     the scaffold tab's brand-new-file generator and the clean tab's existing-file editor (see
-    ``_render_init_cops_dat_editor``) so both present the same table/help text."""
+    ``_render_init_cops_dat_editor``).
+
+    Callers must ensure ``params`` already has every field in ``_INIT_GEN_INSTRUMENT_PARAMS`` --
+    ``default_init_cops_params()`` always does, and ``_render_clean_tab()`` calls
+    :func:`pycops.io.config.migrate_init_cops_dat` before reading an existing file for exactly
+    this reason (a legacy ``time.interval.for.smoothing.optics``-only file, e.g. real GreenEdge
+    2016 stations, gets ``depth.interval.for.smoothing.optics`` backfilled with standard defaults
+    and persisted to disk at that point, not handled here)."""
     header_cols = st.columns([2, *([1] * len(instruments))])
     header_cols[0].write("")
     for col, instr in zip(header_cols[1:], instruments):
@@ -472,6 +480,14 @@ def _render_clean_tab() -> None:
             "exist (it's set up once per instrument system) -- create it before cleaning casts."
         )
         return
+    config_migrations = migrate_init_cops_dat(init_path)
+    if config_migrations:
+        st.info(
+            "init.cops.dat was missing some processing parameters added in a later version of "
+            "pycops -- default values were filled in and written back to the file (the original "
+            "is preserved as legacy.init.cops.dat):\n"
+            + "\n".join(f"- {change}" for change in config_migrations)
+        )
     init = read_init_cops(init_path)
     depth_is_on = init["depth.is.on"]
     instruments = tuple(init["instruments.optics"])
@@ -746,6 +762,7 @@ class _ProcessSummary:
     error: str | None  # deployment-level failure (e.g. missing/malformed config), if any
     pdf_written: int | None = None  # None when PDF generation wasn't requested for this run
     pdf_failures: list[str] = field(default_factory=list)
+    config_migrations: list[str] = field(default_factory=list)  # init.cops.dat fields added on disk
 
 
 def _process_one_deployment(directory: Path, generate_pdfs: bool = False) -> _ProcessSummary:
@@ -797,6 +814,7 @@ def _process_one_deployment(directory: Path, generate_pdfs: bool = False) -> _Pr
         error=None,
         pdf_written=pdf_written,
         pdf_failures=pdf_failures,
+        config_migrations=result.config_migrations,
     )
 
 
@@ -810,6 +828,8 @@ def _render_process_summary(label: str, summary: _ProcessSummary, *, expanded: b
         or summary.pdf_failures
     ):
         icon = "⚠️"
+    elif summary.config_migrations:
+        icon = "ℹ️"
     else:
         icon = "✅"
 
@@ -824,6 +844,12 @@ def _render_process_summary(label: str, summary: _ProcessSummary, *, expanded: b
             f"{len(result.cast_results)} cast(s) processed -> `{summary.output_dir}` "
             f"({summary.n_written} file(s) written)"
         )
+        if summary.config_migrations:
+            st.info(
+                "`init.cops.dat` was missing some processing parameters added in a later version "
+                "of pycops -- default values were filled in and written back to the file:\n"
+                + "\n".join(f"- {change}" for change in summary.config_migrations)
+            )
         if result.read_failures:
             for failure in result.read_failures:
                 st.warning(f"Couldn't read {failure.file}: {failure.error}")

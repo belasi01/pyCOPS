@@ -194,6 +194,44 @@ def test_cast_result_to_dataset_no_excluded_wavelengths_is_empty_string():
     assert out.attrs["excluded_wavelengths"] == ""
 
 
+def test_cast_result_to_dataset_records_excluded_kd_wavelengths(tmp_path):
+    ds = _make_dataset()
+    result = process_cast(ds, _make_init(), excluded_kd_wavelengths=[380.0])
+    path = tmp_path / "cast.nc"
+
+    write_cast_result(result, path, ds=ds)
+    reloaded = xr.open_dataset(path)
+    try:
+        assert reloaded.attrs["excluded_kd_wavelengths"] == "380"
+        assert reloaded.attrs["excluded_wavelengths"] == ""  # separate list, untouched
+    finally:
+        reloaded.close()
+
+
+def test_cast_result_to_dataset_no_excluded_kd_wavelengths_is_empty_string():
+    ds = _make_dataset()
+    result = process_cast(ds, _make_init())
+
+    out = cast_result_to_dataset(result, ds=ds)
+
+    assert out.attrs["excluded_kd_wavelengths"] == ""
+
+
+def test_cast_result_to_dataset_records_kd_hard_excluded_and_warn_wavelengths(monkeypatch):
+    import pycops.processing.process_cast as process_cast_module
+
+    ds = _make_dataset()
+    monkeypatch.setattr(
+        process_cast_module, "kd_at_light_fraction", lambda *a, **k: np.array([2.0, 25.0, 15.0, 4.0])
+    )
+    result = process_cast(ds, _make_init())
+
+    out = cast_result_to_dataset(result, ds=ds)
+
+    assert out.attrs["kd_hard_excluded_wavelengths"] == "380"  # WAVES[1] == 380.0
+    assert out.attrs["kd_warn_wavelengths"] == "443"  # WAVES[2] == 443.0
+
+
 def test_cast_result_to_dataset_writes_ed0_correction_raw_and_smoothed_and_method():
     ds = _make_dataset()
     result = process_cast(ds, _make_init(), ed0_correction_method="smoothed")
