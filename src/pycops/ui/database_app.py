@@ -247,6 +247,21 @@ def render_database_tab() -> None:
             f"Wrote {mission}.nc / {mission}.csv to {output_dir}, and {len(db.stations)} SeaBASS "
             f".sb file(s) to {seabass_dir}."
         )
+
+        # Simon's request: select.cops.dat's method column is re-read fresh at aggregation time
+        # (see aggregate_station/_resolve_recommended_rrs), so a hand-edit made after this
+        # station was last processed still takes effect here without a reprocess -- but flag it,
+        # since it means the .nc file's own rrs_method attr is now out of date with the source of
+        # truth (harmless for this database export, but worth reprocessing eventually for the
+        # single-cast diagnostics in tab 4 to match).
+        stale = [(s.station_id, cast) for s in db.stations for cast in s.stale_method_casts]
+        if stale:
+            lines = "\n".join(f"- {station_id}: {cast}" for station_id, cast in stale)
+            st.warning(
+                "select.cops.dat's Rrs method was changed for the following cast(s) since they "
+                "were last processed -- the current method was used here, but the .nc file itself "
+                "is now stale (reprocess in tab 4 to bring it fully up to date):\n" + lines
+            )
         st.dataframe(
             {
                 "station": [s.station_id for s in db.stations],

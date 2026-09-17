@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from pycops.io.discovery import find_deployment_folders, kept_nc_files
+from pycops.io.discovery import find_deployment_folders, kept_nc_files, read_select_cops
 
 # pycops's own reference grid -- matches generate.cops.DB.R's waves.DB exactly, so a mission
 # combining stations from different instrument systems/years still lands on one shared grid.
@@ -88,6 +88,7 @@ class StationAggregate:
     kd_par_1pct: ScalarMeanSd
     kd_par_10pct: ScalarMeanSd
     kd_par_pd: ScalarMeanSd
+    stale_method_casts: list[str] = field(default_factory=list)  # see _resolve_recommended_rrs
 
 
 @dataclass(frozen=True)
@@ -153,6 +154,37 @@ def _scalar_mean_sd(values: list[float | None]) -> ScalarMeanSd:
     return ScalarMeanSd(mean=mean, sd=sd)
 
 
+def _resolve_recommended_rrs(
+    nc: xr.Dataset, method: str | None
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Pick between ``rrs_0p_loess``/``rrs_0p_linear`` (and their ``nlw_0p_*`` counterparts) using
+    ``method`` (``select.cops.dat``'s method column, read fresh -- see ``aggregate_station``)
+    instead of trusting the ``.nc``'s own cached ``rrs_0p_recommended``/``rrs_method`` attr, which
+    only reflects whatever method was current the *last time this cast was processed*.
+
+    Simon (2026-08-23): editing ``select.cops.dat`` by hand after processing doesn't currently
+    take effect anywhere without a full reprocess -- confirmed a real case (GreenEdge G102) where
+    the method column and the ``.nc`` had drifted apart. Both curves are always fit and stored
+    together (:func:`pycops.io.netcdf.cast_result_to_dataset`), so switching which one counts as
+    "recommended" is a pure selection, not a re-fit -- letting the mission database honor a
+    same-day method edit without reprocessing.
+
+    Fallback logic matches ``process_cast.py``'s own ``CastResult.recommended_rrs`` exactly: if
+    the preferred method's ``rrs_0p`` is missing or entirely non-finite, use the other one instead
+    (whether or not that one is itself usable).
+    """
+    preferred_suffix = "linear" if method == "Rrs.0p.linear" else "loess"
+    fallback_suffix = "loess" if preferred_suffix == "linear" else "linear"
+    preferred_var = f"rrs_0p_{preferred_suffix}"
+    preferred_rrs = nc[preferred_var].values if preferred_var in nc else None
+    preferred_usable = preferred_rrs is not None and np.any(np.isfinite(preferred_rrs))
+    suffix = preferred_suffix if preferred_usable else fallback_suffix
+    rrs_var, nlw_var = f"rrs_0p_{suffix}", f"nlw_0p_{suffix}"
+    rrs = nc[rrs_var].values if rrs_var in nc else None
+    nlw = nc[nlw_var].values if nlw_var in nc else None
+    return rrs, nlw
+
+
 def aggregate_station(directory: str | Path) -> StationAggregate:
     """Aggregate one station folder's kept casts (per ``select.cops.dat``, via
     :func:`pycops.io.discovery.kept_nc_files`) from its already-written ``nc/`` folder.
@@ -168,6 +200,15 @@ def aggregate_station(directory: str | Path) -> StationAggregate:
     nc_paths = kept_nc_files(directory, nc_dir)
     if not nc_paths:
         raise ValueError(f"no kept casts with .nc output in {nc_dir}")
+
+    # Read fresh, not from any .nc's own cached rrs_method attr -- a hand-edit to select.cops.dat
+    # made after this station was last processed must still take effect here (see
+    # _resolve_recommended_rrs). Matches kept_nc_files' own by-stem matching.
+    select_path = directory / "select.cops.dat"
+    selections_by_stem = {}
+    if select_path.exists():
+        selections_by_stem = {Path(s.file).stem: s for s in read_select_cops(select_path)}
+    stale_method_casts: list[str] = []
 
     rrs_rows: list[np.ndarray] = []
     nlw_rows: list[np.ndarray] = []
@@ -194,12 +235,15 @@ def aggregate_station(directory: str | Path) -> StationAggregate:
         with xr.open_dataset(nc_path) as nc:
             waves_cast = nc["wavelength"].values
 
-            rrs_rows.append(
-                _match_to_standard_grid(waves_cast, nc["rrs_0p_recommended"].values if "rrs_0p_recommended" in nc else None)
-            )
-            nlw_rows.append(
-                _match_to_standard_grid(waves_cast, nc["nlw_0p_recommended"].values if "nlw_0p_recommended" in nc else None)
-            )
+            current_selection = selections_by_stem.get(nc_path.stem)
+            current_method = current_selection.method if current_selection is not None else None
+            processed_method = nc.attrs.get("rrs_method")
+            if current_method is not None and current_method != processed_method:
+                stale_method_casts.append(nc_path.name)
+            effective_method = current_method if current_method is not None else processed_method
+            recommended_rrs, recommended_nlw = _resolve_recommended_rrs(nc, effective_method)
+            rrs_rows.append(_match_to_standard_grid(waves_cast, recommended_rrs))
+            nlw_rows.append(_match_to_standard_grid(waves_cast, recommended_nlw))
             ed0_rows.append(
                 _match_to_standard_grid(waves_cast, nc["ed0_value_at_0"].values if "ed0_value_at_0" in nc else None)
             )
@@ -229,8 +273,7 @@ def aggregate_station(directory: str | Path) -> StationAggregate:
             diffuse_fraction = edif / (edif + edir) if edif is not None else None
             ed0_diffuse_rows.append(_match_to_standard_grid(waves_cast, diffuse_fraction))
 
-            method = nc.attrs.get("rrs_method")
-            fu_label = "linear" if method == "Rrs.0p.linear" else "loess"
+            fu_label = "linear" if effective_method == "Rrs.0p.linear" else "loess"
             fus.append(nc.attrs.get(f"qwip_{fu_label}_fu"))
 
             if "time" in nc.coords and nc.sizes.get("time", 0):
@@ -299,6 +342,7 @@ def aggregate_station(directory: str | Path) -> StationAggregate:
         kd_par_1pct=kd_par_1pct,
         kd_par_10pct=kd_par_10pct,
         kd_par_pd=kd_par_pd,
+        stale_method_casts=stale_method_casts,
     )
 
 

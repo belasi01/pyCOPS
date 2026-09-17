@@ -954,7 +954,7 @@ def _write_fake_station(directory, cast_specs, select_rows=None):
     for stem, (rrs, ed0) in cast_specs.items():
         ds = xr.Dataset(
             {
-                "rrs_0p_recommended": ("wavelength", np.asarray(rrs, dtype=float)),
+                "rrs_0p_loess": ("wavelength", np.asarray(rrs, dtype=float)),
                 "ed0_value_at_0": ("wavelength", np.asarray(ed0, dtype=float)),
             },
             coords={"wavelength": waves, "time": pd.date_range("2019-08-17T12:00:00", periods=2, freq="s")},
@@ -1026,6 +1026,46 @@ def test_database_tab_seabass_filenames_dont_collide_for_same_station_id(tmp_pat
     assert sb_files == ["BDA-01_COPS_FJSaucier.sb", "BDA-01_COPS_Kildir.sb"]
     df = pd.read_csv(output_dir / "TestMission.csv")
     assert len(df) == 2  # both stations still contribute a distinct row to the CSV/NetCDF
+
+
+def test_database_tab_warns_about_stale_select_cops_dat_method(tmp_path):
+    """Real-world regression (GreenEdge G102): select.cops.dat can be hand-edited after a station
+    was already processed. Generating the database must still use the current method (verified at
+    the processing_database.py level already) and additionally surface a warning here so the
+    researcher knows the .nc itself is now stale and worth reprocessing."""
+    parent = tmp_path / "L2"
+    directory = parent / "20200101_StationA" / "cops"
+    _write_fake_station(directory, {"CAST_001": ([1.0, 2.0], [100.0, 100.0])})
+    # _write_fake_station always writes rrs_method="Rrs.0p" -- override select.cops.dat's method
+    # to something else, simulating a post-processing hand-edit.
+    (directory / "select.cops.dat").write_text("CAST_001.csv;1;Rrs.0p.linear;NA\n")
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="database_parent").set_value(str(parent)).run(timeout=30)
+    at.text_input(key="database_mission").set_value("TestMission").run(timeout=30)
+    at.button(key="database_generate").click().run(timeout=30)
+
+    assert not at.exception
+    assert any(
+        "select.cops.dat's Rrs method was changed" in w.value and "CAST_001.nc" in w.value for w in at.warning
+    )
+
+
+def test_database_tab_no_stale_warning_when_select_cops_dat_matches(tmp_path):
+    parent = tmp_path / "L2"
+    directory = parent / "20200101_StationA" / "cops"
+    _write_fake_station(directory, {"CAST_001": ([1.0, 2.0], [100.0, 100.0])})
+    (directory / "select.cops.dat").write_text("CAST_001.csv;1;Rrs.0p;NA\n")  # matches the .nc
+
+    at = AppTest.from_file(_APP_PATH)
+    at.run(timeout=30)
+    at.text_input(key="database_parent").set_value(str(parent)).run(timeout=30)
+    at.text_input(key="database_mission").set_value("TestMission").run(timeout=30)
+    at.button(key="database_generate").click().run(timeout=30)
+
+    assert not at.exception
+    assert not any("select.cops.dat's Rrs method was changed" in w.value for w in at.warning)
 
 
 def test_database_tab_unchecking_excludes_station(tmp_path):
@@ -1105,7 +1145,7 @@ def _write_fake_station_with_kd(directory, cast_specs, select_rows=None, waves=N
     for stem, (rrs, kd_pd) in cast_specs.items():
         ds = xr.Dataset(
             {
-                "rrs_0p_recommended": ("wavelength", np.asarray(rrs, dtype=float)),
+                "rrs_0p_loess": ("wavelength", np.asarray(rrs, dtype=float)),
                 "ed0_value_at_0": ("wavelength", np.asarray(rrs, dtype=float) * 100),
                 "kd_1pct": ("wavelength", np.asarray(kd_pd, dtype=float) * 2),
                 "kd_10pct": ("wavelength", np.asarray(kd_pd, dtype=float) * 1.5),

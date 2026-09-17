@@ -39,14 +39,18 @@ def _write_fake_nc(
     needing a full synthetic radiometric profile through process_cast() for every test case,
     and lets each test assert exact, hand-computed mean/sd values."""
     time = time if time is not None else pd.date_range("2019-08-17T12:00:00", periods=3, freq="s")
+    fu_label = "linear" if method == "Rrs.0p.linear" else "loess"
+    # aggregate_station() resolves rrs_0p_{loess,linear} fresh against select.cops.dat's *current*
+    # method (see _resolve_recommended_rrs) rather than trusting a cached "recommended" var -- so
+    # this fixture writes the value under the slot ``method`` actually names, matching what a real
+    # cast_result_to_dataset() output would have.
     data_vars = {
-        "rrs_0p_recommended": ("wavelength", np.asarray(rrs, dtype=float)),
+        f"rrs_0p_{fu_label}": ("wavelength", np.asarray(rrs, dtype=float)),
         "ed0_value_at_0": ("wavelength", np.asarray(ed0, dtype=float)),
     }
     if pd_depth is not None:
         data_vars["pd_depth"] = ("wavelength", np.asarray(pd_depth, dtype=float))
     ds = xr.Dataset(data_vars, coords={"wavelength": waves, "time": time})
-    fu_label = "linear" if method == "Rrs.0p.linear" else "loess"
     ds.attrs["rrs_method"] = method
     ds.attrs[f"qwip_{fu_label}_fu"] = fu
     ds.attrs["sun_zenith_deg"] = sun_zenith if sun_zenith is not None else float("nan")
@@ -173,6 +177,87 @@ def test_aggregate_station_excludes_rejected_cast(tmp_path):
     assert result.n_casts == 1
     i443 = list(STANDARD_WAVELENGTHS).index(443)
     assert result.rrs.mean[i443] == 1.0
+
+
+def _write_nc_with_both_methods(path, *, rrs_loess, rrs_linear, method, waves=WAVES):
+    """Unlike ``_write_fake_nc`` (which only ever writes the one slot ``method`` names, matching
+    a real freshly-processed cast), this writes *both* rrs_0p_loess/rrs_0p_linear with distinct
+    values -- for testing the case where select.cops.dat's method has since diverged from
+    whichever one was actually used when this .nc was last processed."""
+    ds = xr.Dataset(
+        {
+            "rrs_0p_loess": ("wavelength", np.asarray(rrs_loess, dtype=float)),
+            "rrs_0p_linear": ("wavelength", np.asarray(rrs_linear, dtype=float)),
+            "ed0_value_at_0": ("wavelength", np.full(len(waves), 100.0)),
+        },
+        coords={"wavelength": waves, "time": pd.date_range("2019-08-17T12:00:00", periods=3, freq="s")},
+    )
+    ds.attrs["rrs_method"] = method  # the method active when this .nc was last processed
+    ds.attrs["sun_zenith_deg"] = float("nan")
+    ds.attrs["longitude"] = float("nan")
+    ds.attrs["latitude"] = float("nan")
+    ds.attrs["chl_flag"] = float("nan")
+    ds.to_netcdf(path, engine="netcdf4")
+
+
+def test_aggregate_station_resolves_rrs_fresh_from_current_select_cops_dat(tmp_path):
+    """Real-world regression (GreenEdge G102, 2026-08-23): select.cops.dat can be hand-edited
+    after a station was already processed -- aggregate_station() must honor the *current* method
+    column, not the .nc's own cached rrs_method/rrs_0p_recommended from whenever it was last
+    processed, since both curves are already fit and stored."""
+    directory = tmp_path / "20200101_StationG102" / "cops"
+    directory.mkdir(parents=True)
+    (directory / "init.cops.dat").write_text("")
+    nc_dir = directory / "nc"
+    nc_dir.mkdir()
+    # .nc was processed with LOESS recommended; select.cops.dat has since been edited to linear.
+    _write_nc_with_both_methods(
+        nc_dir / "CAST_002.nc", rrs_loess=[1.0, 1.0], rrs_linear=[9.0, 9.0], method="Rrs.0p"
+    )
+    (directory / "select.cops.dat").write_text("CAST_002.csv;1;Rrs.0p.linear;NA\n")
+
+    result = aggregate_station(directory)
+
+    i443 = list(STANDARD_WAVELENGTHS).index(443)
+    assert result.rrs.mean[i443] == 9.0  # the *current* (linear) method's value, not the stale 1.0
+    assert result.stale_method_casts == ["CAST_002.nc"]
+
+
+def test_aggregate_station_no_stale_cast_when_select_cops_dat_matches_processed_method(tmp_path):
+    directory = tmp_path / "20200101_StationOK" / "cops"
+    directory.mkdir(parents=True)
+    (directory / "init.cops.dat").write_text("")
+    nc_dir = directory / "nc"
+    nc_dir.mkdir()
+    _write_nc_with_both_methods(
+        nc_dir / "CAST_001.nc", rrs_loess=[1.0, 1.0], rrs_linear=[9.0, 9.0], method="Rrs.0p"
+    )
+    (directory / "select.cops.dat").write_text("CAST_001.csv;1;Rrs.0p;NA\n")
+
+    result = aggregate_station(directory)
+
+    i443 = list(STANDARD_WAVELENGTHS).index(443)
+    assert result.rrs.mean[i443] == 1.0
+    assert result.stale_method_casts == []
+
+
+def test_aggregate_station_falls_back_to_processed_method_without_select_cops_dat(tmp_path):
+    """No select.cops.dat at all (never written, or deleted) -- must fall back to whatever method
+    the .nc itself recorded, matching the pre-existing behavior, and never flag a false mismatch."""
+    directory = tmp_path / "20200101_StationNoSelect" / "cops"
+    directory.mkdir(parents=True)
+    (directory / "init.cops.dat").write_text("")
+    nc_dir = directory / "nc"
+    nc_dir.mkdir()
+    _write_nc_with_both_methods(
+        nc_dir / "CAST_001.nc", rrs_loess=[1.0, 1.0], rrs_linear=[9.0, 9.0], method="Rrs.0p.linear"
+    )
+
+    result = aggregate_station(directory)
+
+    i443 = list(STANDARD_WAVELENGTHS).index(443)
+    assert result.rrs.mean[i443] == 9.0  # honors the .nc's own recorded (linear) method
+    assert result.stale_method_casts == []
 
 
 def test_aggregate_station_raises_when_no_nc_folder(tmp_path):
